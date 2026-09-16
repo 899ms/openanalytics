@@ -502,8 +502,10 @@ services:
   # S3-compatible object storage, for data import/export. Any S3-compatible
   # provider works; enable this only if you do not already have one.
   #   docker compose --profile object-storage up -d
+  # Pulled from Quay: MinIO's Docker Hub repository stopped resolving on
+  # 2026-09-16 ("pull access denied"); the same tag and digest live on Quay.
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: oa-minio
     restart: unless-stopped
     profiles: ['object-storage']
