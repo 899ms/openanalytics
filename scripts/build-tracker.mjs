@@ -40,6 +40,18 @@ export const GZIP_BUDGET_BYTES = 9_728
 /** Uncompressed bytes. Bounds parse and compile cost, which gzip hides. */
 export const RAW_BUDGET_BYTES = 25_600
 
+/**
+ * The first line of the served bundle. The tracker is MIT while the rest of the
+ * product is AGPL-3.0 (`apps/tracker/LICENSE`), and the file a site owner's
+ * visitors download is the one place that fact has to be readable without
+ * opening the repository. `legalComments: 'none'` strips every comment the
+ * sources carry, so this is the only comment the bundle has, and it is added
+ * after minification. The `!` keeps it through any minifier a customer runs
+ * over their own assets.
+ */
+export const TRACKER_BANNER =
+  '/*! OpenAnalytics tracker. MIT licensed: github.com/OpenLabs-so/openanalytics/blob/main/apps/tracker/LICENSE */'
+
 const result = await build({
   entryPoints: [ENTRY],
   outfile: OUT_FILE,
@@ -50,12 +62,17 @@ const result = await build({
   // dragging in transpiler helpers for syntax we do not write.
   target: ['es2020', 'chrome80', 'firefox78', 'safari14', 'edge88'],
   legalComments: 'none',
+  banner: { js: TRACKER_BANNER },
   write: false,
 })
 
 const output = result.outputFiles[0]
 if (!output) {
   console.error('[tracker] esbuild produced no output')
+  process.exit(1)
+}
+if (!output.text.startsWith(TRACKER_BANNER)) {
+  console.error('[tracker] the bundle does not open with its licence line')
   process.exit(1)
 }
 

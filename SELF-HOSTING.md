@@ -874,6 +874,11 @@ bug. A proxy or CDN in front of Caddy hands over its own address instead; see
 AGPL-3.0. If you run a modified OpenAnalytics as a network service, the license
 requires you to offer your modified source to its users.
 
+One exception: the browser tracker — everything under `apps/tracker/`, and the
+`oa.js` it builds — is [MIT](apps/tracker/LICENSE). It is the file your visitors
+download and the only part of the product that runs on your pages, so it carries
+no copyleft. The bundle says so on its first line.
+
 The "OpenAnalytics" name and the `getopen.so` domain identify the hosted service
 run by its operators and are **not** part of the license grant. Self-hosted
 instances run the software, not the brand.

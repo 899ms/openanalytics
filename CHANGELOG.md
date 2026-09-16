@@ -36,6 +36,12 @@ Releases before 0.6.0 have their notes on the
 
 ### Changed
 
+- **The tracker is MIT.** `apps/tracker/` and the `oa.js` it builds now carry
+  the MIT licence ([`apps/tracker/LICENSE`](apps/tracker/LICENSE)); the rest of
+  the product stays AGPL-3.0. It is the one file that runs on your visitors'
+  browsers rather than on the server, so embedding it should never have raised
+  a copyleft question. The served bundle opens with a `/*! … MIT licensed … */`
+  line saying so; +69 bytes gzipped.
 - The poster's chart is drawn on a smooth curve with the dashboard's own glow,
   and the two brands no longer share one line: the site is the headline, the
   period sits in the corner, and Open Analytics signs on a small tab at the

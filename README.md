@@ -166,6 +166,10 @@ Security reports: [SECURITY.md](SECURITY.md) — please not a public issue.
 Code: [AGPL-3.0](LICENSE). If you run a modified OpenAnalytics as a network
 service, the AGPL requires you to offer your modified source to its users.
 
+The browser tracker is the exception: `apps/tracker/` and the `oa.js` it builds
+are [MIT](apps/tracker/LICENSE), because it is the one file that runs on your
+site, not on the server. Embedding it creates no obligation under the AGPL.
+
 The "OpenAnalytics" name and the hosted service's domain identify the instance
 its authors operate and are **not** part of the license grant. A self-hosted
 instance runs the software, not the brand.

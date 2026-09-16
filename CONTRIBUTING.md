@@ -23,6 +23,10 @@ anywhere else. What it grants is permission to ship your work under terms other
 than the AGPL, which is what lets the hosted service and the open project be one
 codebase. [CLA.md](CLA.md) says so in full, including why.
 
+One directory has its own licence: `apps/tracker/` is MIT, not AGPL, because it
+is the file that runs on other people's sites. A change there is released under
+MIT; the CLA already covers that.
+
 [Discussions](https://github.com/OpenLabs-so/openanalytics/discussions) are for
 questions and for ideas you want to talk through first; issues are for something
 that is wrong or missing.
