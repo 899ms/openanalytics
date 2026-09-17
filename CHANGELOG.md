@@ -52,6 +52,12 @@ Releases before 0.6.0 have their notes on the
 
 ### Fixed
 
+- **MinIO is pulled from Quay.** The `minio/minio` repository stopped
+  resolving on Docker Hub, so `docker compose --profile object-storage up`
+  failed with "pull access denied". The compose file now names
+  `quay.io/minio/minio` at the same pinned tag. Only installs that enable the
+  optional object-storage profile were affected; on 0.6.0 you can change the
+  `image:` line in `infra/selfhost/docker-compose.yml` yourself.
 - The add-site dialog no longer grows a beat after opening.
 - **Sources rows are ranked by the number they show.** Referrers and the utm
   cuts were ordered by pageviews underneath while printing visitors, so a
