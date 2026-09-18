@@ -7,7 +7,7 @@ import {
   toRuntimeConfig,
 } from '../../apps/tracker/src/index.ts'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { createHarness, resetBrowser } from './harness.ts'
+import { createHarness, resetBrowser, settle } from './harness.ts'
 
 /**
  * The tracker's side of the configuration contract (docs snapshot 02 §11).
@@ -265,6 +265,30 @@ describe('applying configuration to a running tracker', () => {
     harness.fireHeartbeatInterval()
     harness.tracker.flush()
     harness.runTimers()
+
+    expect(harness.sent.length).toBe(before)
+    harness.stop()
+  })
+
+  it('disabled also stops the retry queue being drained (ADR-0081, D1)', async () => {
+    // The `emit` gate empties the buffer, but not the queue: an event stranded
+    // by an earlier failure would still be carried out by the next flush — the
+    // unload one included — to a door the tracker now knows is shut. On an
+    // excluded host that would be one last refused batch after the line that
+    // said nothing further would be sent.
+    const harness = createHarness()
+    harness.respondWith(500)
+    harness.tracker.track('signup')
+    harness.runTimers()
+    await settle()
+
+    harness.respondWith(202)
+    harness.tracker.applyConfig({ disabled: true })
+
+    const before = harness.sent.length
+    harness.tracker.flush()
+    harness.runTimers()
+    await settle()
 
     expect(harness.sent.length).toBe(before)
     harness.stop()

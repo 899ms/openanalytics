@@ -74,6 +74,7 @@ export {
 } from './sanitize.ts'
 
 export { IGNORE_KEY, resolveIgnore, showIgnoreNotice, type IgnoreDecision } from './ignore.ts'
+export { isHostAllowed, isLocalHost, unallowedHostMessage } from './origin.ts'
 export { createRetryQueue, createSessionTracker, memoryStorage, safeStorage } from './storage.ts'
 export { INGEST_CONTENT_TYPE, createTransport } from './transport.ts'
 export { createUuidV7, uuidV7 } from './uuid.ts'

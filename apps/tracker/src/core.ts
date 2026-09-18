@@ -48,6 +48,16 @@ import { createWebVitals, type ObserverHost } from './vitals.ts'
  */
 
 export interface TrackerRuntimeConfig {
+  /**
+   * The site's origin allowlist, mirrored from the config response (ADR-0081).
+   *
+   * The runtime does not branch on it — `browser.ts` does, because the check
+   * needs a `location` and this file is deliberately ignorant of one. It lives
+   * here so the value travels with every other piece of configuration, which is
+   * what makes it re-checked on each apply, including the re-fetch a SPA route
+   * change triggers (ADR-0034, D4). Empty means unconfigured: every host counts.
+   */
+  readonly allowedDomains: readonly string[]
   readonly redactQueryKeys: readonly string[]
   readonly interactionSampling: number
   readonly heartbeatIntervalSeconds: number
@@ -64,10 +74,15 @@ export interface TrackerRuntimeConfig {
    */
   readonly attributedRevenue: boolean
   /**
-   * The site no longer exists for this key — deleted, or blocked by expiring
-   * the key — and every event would be refused at the door (ADR-0074). Set from
-   * a config-endpoint 404, never by the site's own configuration; `emit` is the
-   * single gate that honours it, so no signal path can quietly bypass it.
+   * Nothing this page sends would be accepted, so it sends nothing.
+   *
+   * Three sources, all of them a refusal the tracker can see coming: a
+   * config-endpoint 404 — the site is deleted, or blocked by expiring the key
+   * (ADR-0074); the site's own `collection_paused`; and a host the site's
+   * allowlist excludes (ADR-0081, D1). `emit` is the single gate that honours
+   * it, so no signal path can quietly bypass it, and `flush` honours it too so
+   * that events stranded by an earlier page load are not carried to a door that
+   * is now closed.
    */
   readonly disabled: boolean
   readonly features: {
@@ -88,6 +103,7 @@ export type TrackerConfigPatch = Partial<Omit<TrackerRuntimeConfig, 'features'>>
 }
 
 export const DEFAULT_RUNTIME_CONFIG: TrackerRuntimeConfig = {
+  allowedDomains: [],
   redactQueryKeys: [],
   interactionSampling: 1,
   heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
@@ -445,7 +461,13 @@ export function createTracker(options: TrackerOptions): Tracker {
 
     if (config.features.web_vitals) vitals.report()
     collectEngagement()
-    transport.flush({ beacon: true })
+    // Both calls above go through `emit`, so a disabled tracker has buffered
+    // nothing — but the retry queue can still hold events from before it was
+    // disabled, and the unload flush would carry them to a door that is now
+    // known to be shut. "Sends nothing further" (ADR-0081 D1) has to mean the
+    // queue too, or a page on an excluded host ends its life with one last
+    // refused batch.
+    if (!config.disabled) transport.flush({ beacon: true })
   }
 
   const onPageHide = (): void => leave()
@@ -530,6 +552,9 @@ export function createTracker(options: TrackerOptions): Tracker {
     },
 
     flush() {
+      // Same reasoning as the unload flush: the buffer is empty by the `emit`
+      // gate, and the retry queue must not be drained at a closed door either.
+      if (config.disabled) return
       transport.flush()
     },
 

@@ -1,10 +1,10 @@
 "use client";
 
-import { CheckmarkCircle02Icon } from "hugeicons-react";
+import { Alert02Icon, CheckmarkCircle02Icon } from "hugeicons-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useRouter } from "next/navigation";
 import * as React from "react";
-import { cleanDomain, slugify } from "@/components/dashboard/add-site-dialog";
+import { slugify } from "@/components/dashboard/add-site-dialog";
 import { InstallOptions } from "@/components/dashboard/install-options";
 import { Favicon } from "@/components/dashboard/site-favicon";
 import { Logo } from "@/components/ui/logo";
@@ -24,9 +24,18 @@ import {
   sites,
   trackerSnippet,
   type CreatedSite,
+  type SiteSummary,
 } from "@/lib/api";
 import { useSession } from "@/lib/auth-client";
 import { MOCK_CREATED_SITE } from "@/lib/mock";
+import {
+  allowableDomain,
+  cleanDomain,
+  newestSighting,
+  sightingHost,
+  sightingKind,
+  type TagSighting,
+} from "@/lib/site-domain";
 
 /**
  * The mandatory first-run flow, in the order the product wants it
@@ -159,6 +168,19 @@ export function OnboardingFlow() {
 
   /** The verify step: whether the site is accepting events yet. */
   const [siteActive, setSiteActive] = React.useState(!LIVE_API);
+
+  /**
+   * The verify step's second signal: where the tag has been seen fetching its
+   * configuration (ADR-0081, D3). `first_event_at` can only ever say "no", and
+   * says it identically to a page that was never installed and a page whose
+   * origin the allowlist refuses — which is what somebody who did everything
+   * right on `localhost:3000` would otherwise be told. `null` until a poll
+   * carries one, and the copy below is the copy it always was until then. The
+   * whole summary is kept rather than the sighting alone, because allowing a
+   * host appends to the site's own allowlist and the list it appends to has to
+   * be the one the server currently holds.
+   */
+  const [verified, setVerified] = React.useState<SiteSummary | null>(null);
 
   /**
    * Whether the account has been asked what it already has.
@@ -337,6 +359,10 @@ export function OnboardingFlow() {
         const site = await sites.get(created.site_id);
         if (cancelled) return;
         setSiteActive(site.status === "active");
+        // Kept per tick rather than latched: a sighting can change verdict
+        // between polls (the domain is allowed, the tag re-fetches its
+        // configuration), and the newest one is the one worth reporting.
+        setVerified(site);
         if (site.first_event_at !== null) setConnected(true);
       } catch {
         // The next tick retries; the person can leave via Back meanwhile.
@@ -349,6 +375,10 @@ export function OnboardingFlow() {
       clearInterval(timer);
     };
   }, [step, created, connected]);
+
+  // The newest place the tag has been seen, off the poll's own read. Derived
+  // rather than stored, so there is one answer and the poll is its only source.
+  const sighting = newestSighting(verified);
 
   // A settled connection advances by itself: out of the flow, or into the
   // plan step where the build has one. Gated on the step so sitting on the
@@ -609,12 +639,19 @@ export function OnboardingFlow() {
                     </AnimatePresence>
                   </div>
 
-                  <div className="text-center">
+                  {/* The step's own report on itself, and the one part of
+                      this screen that changes without anybody pressing
+                      anything — so it is announced rather than only drawn. */}
+                  <div
+                    aria-live="polite"
+                    className="flex flex-col items-center text-center"
+                  >
                     <p className="text-sm font-medium text-foreground/80">
                       {connected
                         ? "First event received!"
                         : "Waiting for the first event…"}
                     </p>
+                    {connected || !siteActive || sighting === null ? (
                     <p className="mt-1 max-w-64 text-xs leading-5 text-muted-foreground">
                       {connected
                         ? onboardingStep
@@ -629,6 +666,13 @@ export function OnboardingFlow() {
                             "This site isn't open for events yet (a few seconds, usually). We start counting the moment it is."
                           : `Open ${cleanDomain(domain) ?? (domain || "your site")} and browse around. We'll pick up the first pageview within seconds.`}
                     </p>
+                    ) : (
+                      // The site is open, nothing has arrived, and the
+                      // collector has seen the tag somewhere: that "somewhere"
+                      // is the whole answer, so it is said instead of the
+                      // generic instruction (ADR-0081, D4).
+                      <VerifySighting site={verified} sighting={sighting} />
+                    )}
                   </div>
                 </motion.div>
               )}
@@ -709,6 +753,152 @@ export function OnboardingFlow() {
           </div>
         </SquircleSurface>
       </div>
+    </div>
+  );
+}
+
+/**
+ * What the verify step says once the collector has seen the tag (ADR-0081, D4).
+ *
+ * The step waits on an event, and until now it could only describe the waiting.
+ * A sighting turns it into a report: the tag has loaded, here is where, and
+ * here is whether anything from there will ever be counted. The three shapes
+ * are the three answers, and only one of them is a problem somebody can press
+ * a button about.
+ *
+ * `allowed` is the collector's own verdict, recorded when the tag fetched its
+ * configuration. It is never recomputed here, so this step cannot promise data
+ * from an origin the ingest gate refuses.
+ *
+ * `SiteAddressRow` below this fixes the *other* mistake — the site's own
+ * address typed wrong — and the two do not overlap: that one replaces the
+ * allowlist with the address it should always have had, this one appends a
+ * second host that was never meant to be the site's address at all (a preview
+ * deployment, a staging domain).
+ */
+function VerifySighting({
+  site,
+  sighting,
+}: {
+  site: SiteSummary | null;
+  sighting: TagSighting;
+}) {
+  const [busy, setBusy] = React.useState(false);
+  const [failed, setFailed] = React.useState<string | null>(null);
+  /**
+   * Written, and the sighting does not know yet: `allowed` is decided when the
+   * tag next fetches its configuration, which happens on the next page load.
+   * Between the press and that load the only honest thing to say is that the
+   * domain is on the list and the site wants one reload.
+   */
+  const [added, setAdded] = React.useState(false);
+
+  const host = sightingHost(sighting.origin) ?? "";
+  const kind = sightingKind(sighting);
+  const firstDomain = cleanDomain(site?.domains[0] ?? "") ?? "your domain";
+  const domain = allowableDomain(sighting.origin);
+
+  const allow = () => {
+    if (busy || site === null || domain === null) return;
+    setBusy(true);
+    setFailed(null);
+    // The PATCH replaces the whole allowlist, so the site's existing domains
+    // travel with the new one. Deduped: a list carrying the same host twice is
+    // a write nobody meant to make.
+    const domains = site.domains.includes(domain)
+      ? site.domains
+      : [...site.domains, domain];
+    sites.update(site.site_id, { domains }).then(
+      () => {
+        setBusy(false);
+        setAdded(true);
+      },
+      (raised: unknown) => {
+        setBusy(false);
+        setFailed(presentError(raised).body);
+      }
+    );
+  };
+
+  // A callout in the product's warning or success colour rather than a grey
+  // sentence: the first live test read the console line and walked past the
+  // same words set in muted text (same reasoning as the dashboard's gate).
+  const refused = kind !== "allowed";
+  const tone = refused
+    ? "bg-warning/10 text-warning-foreground"
+    : "bg-success/10 text-success-foreground";
+  const Icon = refused ? Alert02Icon : CheckmarkCircle02Icon;
+  const line = "text-sm leading-6";
+  const strong = "font-semibold";
+
+  let body: React.ReactNode;
+  if (kind === "allowed") {
+    body = (
+      <p className={line}>
+        The tag has loaded on <span className={strong}>{host}</span>. The first
+        event is on its way, usually within seconds.
+      </p>
+    );
+  } else if (kind === "local") {
+    body = (
+      <p className={line}>
+        The tag has loaded on <span className={strong}>{host}</span>. Visits
+        from a local host aren&apos;t counted while the site has an allowed
+        domain, and localhost can&apos;t be added. Open the site at{" "}
+        <span className={strong}>{firstDomain}</span> to see data.
+      </p>
+    );
+  } else {
+    body = (
+      <>
+        <p className={line}>
+          {added ? (
+            <>
+              <span className={strong}>{host}</span> is on this site&apos;s
+              allowed domains now.
+            </>
+          ) : (
+            <>
+              The tag has loaded on <span className={strong}>{host}</span>,
+              which isn&apos;t on this site&apos;s allowed domains.
+            </>
+          )}
+        </p>
+        {added || domain === null ? null : (
+          <Button
+            className="mt-2.5"
+            loading={busy}
+            onClick={allow}
+            size="xs"
+            variant="secondary"
+          >
+            Allow this domain
+          </Button>
+        )}
+        {domain === null ? null : (
+          // Same caveat as the dashboard gate: the tag's configuration is
+          // cached for five minutes, so one reload is not a promise.
+          <p className="mt-1.5 text-xs leading-4">
+            Then reload your site. The tag picks the change up within about
+            five minutes.
+          </p>
+        )}
+        {failed !== null ? (
+          <p className="mt-1.5 text-xs leading-4 text-destructive-foreground">
+            {failed}
+          </p>
+        ) : null}
+      </>
+    );
+  }
+
+  return (
+    <div
+      className={`mt-3 flex w-full max-w-80 items-start gap-2.5 rounded-xl px-3.5 py-3 text-left ${tone}`}
+      role="status"
+    >
+      <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+      <div className="flex min-w-0 flex-col items-start">{body}</div>
     </div>
   );
 }

@@ -34,10 +34,22 @@ const OUT_FILE = join(OUT_DIR, 'oa.js')
  * attributed-revenue flag (+37 B). The new number is not the measurement — it is
  * the measurement plus room to work in, which is what a budget has to be if the
  * next change is to be a decision rather than an emergency.
+ *
+ * Raised again from 9,728 by ADR-0081 D1, which measured **9,769 B gzipped**
+ * (from 9,304) — the host check, the wording of the one console line it writes,
+ * and the allowlist it reads. 41 bytes over, against a budget with no room in
+ * it, which is the same way the previous raise arrived. The justification for
+ * each number lives in ADR-0008's size-budget section.
  */
-export const GZIP_BUDGET_BYTES = 9_728
+export const GZIP_BUDGET_BYTES = 10_240
 
-/** Uncompressed bytes. Bounds parse and compile cost, which gzip hides. */
+/**
+ * Uncompressed bytes. Bounds parse and compile cost, which gzip hides.
+ *
+ * Deliberately not raised alongside the gzip budget in 2026-09: ADR-0081 took
+ * raw to 24,811 B, which still fits. It fits with **789 bytes to spare**, so the
+ * next change to this bundle meets this ceiling before it meets the other one.
+ */
 export const RAW_BUDGET_BYTES = 25_600
 
 /**

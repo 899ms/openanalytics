@@ -4960,6 +4960,63 @@ export interface components {
              *     collector has never heard of a reporting timezone.
              */
             reporting_timezone: components["schemas"]["Timezone"];
+            /**
+             * @description Where this site's tag has been seen fetching its configuration in the
+             *     last 24 hours, newest first (ADR-0081, D3). The second, weaker
+             *     install signal, and it exists precisely when `first_event_at` cannot:
+             *     the collector records every `GET /v1/tracker/config` that resolves a
+             *     site, including the ones whose events the origin allowlist then
+             *     refuses.
+             *
+             *     **Written by `GET /v1/sites/{site_id}` only.** `GET /v1/sites` and
+             *     `PATCH /v1/sites/{site_id}` omit the property entirely — neither
+             *     screen that renders them is waiting for an install, and the list is
+             *     loaded on every screen of the product.
+             *
+             *     **`null` and `[]` are different claims and never share a
+             *     representation.** `null` is "not computed for this response": the
+             *     site already has `first_event_at`, this deployment has no realtime
+             *     cache, or the read failed. `[]` is a measurement: the cache was read
+             *     and nothing has loaded the tag from anywhere in 24 hours — the
+             *     "the script is not on the page" case.
+             *
+             *     `origin` is the lowercased `Origin` header of the fetch, or the
+             *     literal `(none)` when the request carried none. `allowed` is the
+             *     collector's own allowlist verdict at the moment of the sighting, so
+             *     a screen never has to recompute it and can never disagree with the
+             *     ingest gate. At most 20 origins are recorded per site; past that, a
+             *     new origin is dropped while the known ones keep refreshing.
+             */
+            tag_sightings?: components["schemas"]["TagSighting"][] | null;
+        };
+        /**
+         * @description One origin the site's tag has been seen fetching its configuration from
+         *     (ADR-0081, D2). A named schema rather than an inline one because
+         *     `SiteSummary` is deliberately open — it is a branch of `SiteListItem`'s
+         *     `allOf` — and a closed object nested inside it reads, textually, like a
+         *     closure of the branch.
+         */
+        TagSighting: {
+            /**
+             * @description The lowercased origin the tag fetched configuration from
+             *     (`https://localhost:3000`), or the literal `(none)` when the request
+             *     carried no `Origin` header — which is what a server-side render or a
+             *     `curl` looks like, and neither would ingest.
+             * @example http://localhost:3000
+             */
+            origin: string;
+            /**
+             * @description The most recent fetch from this origin. Only the newest instant per
+             *     origin is kept, so this is a "last seen", never a first.
+             */
+            seen_at: components["schemas"]["UtcInstant"];
+            /**
+             * @description Whether an event from this origin would be accepted —
+             *     `isOriginAllowed(origin, domains)` as the collector evaluated it when
+             *     the sighting was recorded, so a screen never recomputes it and can
+             *     never disagree with the ingest gate.
+             */
+            allowed: boolean;
         };
         /**
          * @description An uppercase ISO-4217 code from the supported set (ADR-0033, D2c).

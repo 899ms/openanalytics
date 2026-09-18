@@ -3,8 +3,10 @@ import type { Auth, SiteRole } from '@openanalytics/auth'
 import type { Database } from '@openanalytics/postgres'
 import type * as PostgresModule from '@openanalytics/postgres'
 import { createServiceMetadata } from '@openanalytics/observability'
+import type { RealtimeCache } from '@openanalytics/redis'
 import { createCapturedLogger, testEnv } from '@openanalytics/testkit'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { InProcessRateLimiter } from '../../apps/api/src/http/rate-limit.ts'
 
 /**
  * The management routes' own authorization and validation, without Postgres.
@@ -49,6 +51,26 @@ const calls = {
   outbox: [] as string[],
 }
 const revokeResult = { revoked: true }
+/**
+ * The row the site reads answer with. Mutable, because ADR-0081's whole question
+ * is what the single-site read does when `first_event_at` is still null.
+ */
+const siteRow = {
+  value: {
+    siteId: SITE,
+    slug: 'acme',
+    name: 'Acme',
+    status: 'active' as const,
+    role: 'owner' as SiteRole,
+    isBillingOwner: true,
+    domains: ['acme.example.com'],
+    createdAt: new Date('2026-02-03T04:05:06.000Z'),
+    firstEventAt: null as Date | null,
+    suspendedAt: null,
+    reportingCurrency: 'USD',
+    reportingTimezone: 'UTC',
+  },
+}
 /** Set by a test to make the next invite write fail the way the repository would. */
 const inviteViolation: { create: string | null; resend: string | null } = {
   create: null,
@@ -127,6 +149,12 @@ vi.mock('@openanalytics/postgres', async (importOriginal) => {
       name: 'Acme',
       status: 'active' as const,
     }),
+    getSiteForUser: async (_db: unknown, input: { userId: string }) => ({
+      ...siteRow.value,
+      role: memberships.get(input.userId)?.role ?? 'viewer',
+      isBillingOwner: memberships.get(input.userId)?.isBillingOwner ?? false,
+    }),
+    listSitesForUser: async () => [siteRow.value],
     createInvite: async (_db: unknown, input: { email: string; role: SiteRole }) => {
       if (inviteViolation.create !== null) {
         throw new actual.InviteError(
@@ -563,5 +591,132 @@ describe('site invites over HTTP', () => {
     expect((await second.json()) as { error: { code: string } }).toMatchObject({
       error: { code: 'NOT_FOUND' },
     })
+  })
+})
+
+/**
+ * `tag_sightings` on the single-site read (ADR-0081, D3).
+ *
+ * Every case here is about the difference between two answers that look alike on
+ * a screen and are opposite claims about a customer's install: `[]` says the
+ * cache was read and the tag has loaded nowhere in 24 hours — check the script
+ * is on the page — while `null` says this response did not compute the question
+ * at all. A cache outage reported as `[]` would tell a developer their correctly
+ * installed tag is missing.
+ */
+describe('GET /v1/sites/{site_id} tag sightings', () => {
+  const SIGHTINGS = [
+    { origin: 'http://localhost:3000', at: '2026-09-14T10:00:00.000Z', allowed: false },
+    { origin: 'https://acme.example.com', at: '2026-09-14T09:00:00.000Z', allowed: true },
+  ]
+
+  function withCache(cache: Pick<RealtimeCache, 'readTagSightings'>) {
+    const { logger } = createCapturedLogger()
+    return createApp({
+      service: createServiceMetadata({ name: 'api', version: '0.0.0-test', environment: 'test' }),
+      logger,
+      env: loadServiceEnv('api', testEnv()),
+      auth,
+      db: {} as Database,
+      realtime: {
+        cache: cache as RealtimeCache,
+        // The public token endpoint's limiter, unrelated to this read; the
+        // realtime dep carries both members and nothing here touches it.
+        rateLimiter: new InProcessRateLimiter({ requestsPerMinute: 60, burst: 120 }),
+      },
+    })
+  }
+
+  const get = (app: { fetch: (request: Request) => Response | Promise<Response> }) =>
+    app.fetch(
+      new Request(`http://api.test/v1/sites/${SITE}`, { headers: { 'x-test-user': OWNER } }),
+    )
+
+  beforeEach(() => {
+    siteRow.value = { ...siteRow.value, firstEventAt: null }
+  })
+
+  it('carries the cached sightings, newest first, while the site is waiting', async () => {
+    const app = withCache({ readTagSightings: async () => [...SIGHTINGS] })
+    const res = await get(app)
+
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { tag_sightings: unknown }
+    // Renamed on the wire: `seen_at` matches `first_event_at`/`created_at` and
+    // reads as a fact about the tag rather than a field of the cache row.
+    expect(body.tag_sightings).toEqual([
+      { origin: 'http://localhost:3000', seen_at: '2026-09-14T10:00:00.000Z', allowed: false },
+      { origin: 'https://acme.example.com', seen_at: '2026-09-14T09:00:00.000Z', allowed: true },
+    ])
+  })
+
+  it('reports an empty cache as an empty list, which is a measurement', async () => {
+    const app = withCache({ readTagSightings: async () => [] })
+    expect(((await (await get(app)).json()) as { tag_sightings: unknown }).tag_sightings).toEqual(
+      [],
+    )
+  })
+
+  it('does not compute them once the site has a first event', async () => {
+    // The stronger install signal exists (ADR-0027), so this weaker one has
+    // nothing to add — and the cache is not read at all, which is what keeps an
+    // installed site's site read off Valkey forever.
+    let reads = 0
+    siteRow.value = { ...siteRow.value, firstEventAt: new Date('2026-02-03T05:00:00.000Z') }
+    const app = withCache({
+      readTagSightings: async () => {
+        reads += 1
+        return []
+      },
+    })
+
+    const body = (await (await get(app)).json()) as { tag_sightings: unknown }
+    expect(body.tag_sightings).toBeNull()
+    expect(reads).toBe(0)
+  })
+
+  it('is null in a deployment with no realtime cache', async () => {
+    // Nothing was ever recorded there, so nothing can be reported — which is not
+    // the same claim as "the tag has not loaded".
+    const res = await send('GET', `/v1/sites/${SITE}`, OWNER)
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { tag_sightings: unknown }).tag_sightings).toBeNull()
+  })
+
+  it('is null when the cache read fails, never an empty array', async () => {
+    // AGENTS.md: a provider failure is never an empty result. The site read
+    // itself must still answer — the whole dashboard shell loads through it.
+    const app = withCache({
+      readTagSightings: () => Promise.reject(new Error('valkey unreachable')),
+    })
+    const res = await get(app)
+
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { tag_sightings: unknown }).tag_sightings).toBeNull()
+  })
+
+  it('is absent from the list read and from PATCH', async () => {
+    // D3: neither screen that renders them is waiting for an install, and the
+    // list is loaded on every screen of the product — one cache read per site
+    // there would be a per-screen cost for an answer nothing renders.
+    const app = withCache({ readTagSightings: async () => [...SIGHTINGS] })
+
+    const list = (await (
+      await app.fetch(
+        new Request('http://api.test/v1/sites', { headers: { 'x-test-user': OWNER } }),
+      )
+    ).json()) as { items: Record<string, unknown>[] }
+    expect(list.items[0]).not.toHaveProperty('tag_sightings')
+
+    const patched = (await (
+      await app.fetch(
+        new Request(`http://api.test/v1/sites/${SITE}`, {
+          method: 'PATCH',
+          headers: { 'x-test-user': OWNER, 'content-type': 'application/json' },
+          body: JSON.stringify({ name: 'Renamed' }),
+        }),
+      )
+    ).json()) as Record<string, unknown>
+    expect(patched).not.toHaveProperty('tag_sightings')
   })
 })

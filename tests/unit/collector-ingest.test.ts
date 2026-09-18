@@ -24,6 +24,8 @@ import type {
   EventStreamQueue,
   PresenceTouchInput,
   RealtimeCache,
+  RecordTagSightingInput,
+  TagSighting,
 } from '@openanalytics/redis'
 import { beforeEach, describe, expect, it } from 'vitest'
 
@@ -207,6 +209,22 @@ class FakeRealtime implements RealtimeCache {
 
   async countBot(input: { siteId: string; signature: string; cost: number }) {
     this.bots.push(input)
+  }
+
+  /**
+   * The tag-sighting surface (ADR-0081, D2) belongs to the tracker-config route,
+   * not to ingest. The double implements the port so a call from an ingest route
+   * would be visible here rather than a type gap.
+   */
+  readonly sightings: RecordTagSightingInput[] = []
+  async recordTagSighting(input: RecordTagSightingInput) {
+    this.sightings.push(input)
+  }
+
+  sightingReads = 0
+  async readTagSightings(): Promise<TagSighting[]> {
+    this.sightingReads += 1
+    return []
   }
 
   /**

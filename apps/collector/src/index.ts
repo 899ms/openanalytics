@@ -5,6 +5,7 @@ export {
   createTrackerConfigRoutes,
   etagFor,
   type TrackerConfigRecord,
+  type TrackerConfigSightings,
   type TrackerConfigStore,
 } from './tracker-config.ts'
 export {

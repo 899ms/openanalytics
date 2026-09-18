@@ -85,8 +85,20 @@ export function createApp(deps: AppDeps) {
 
   const v1 = new Hono()
 
-  // GET  /v1/tracker/config     — public, ETag-cached tracker configuration (M4)
-  v1.route('/tracker', createTrackerConfigRoutes(deps.trackerConfigStore))
+  // GET  /v1/tracker/config     — public, ETag-cached tracker configuration (M4),
+  //                               recording where the tag was seen (ADR-0081 D2)
+  v1.route(
+    '/tracker',
+    createTrackerConfigRoutes(
+      deps.trackerConfigStore,
+      // The realtime cache travels with the ingest block, so a config-only
+      // deployment records nothing — which the site read reports as "not
+      // computed" rather than as "the tag has not loaded" (ADR-0081, D3).
+      deps.ingest
+        ? { cache: deps.ingest.realtime, logger: deps.logger, metrics: deps.ingest.metrics }
+        : undefined,
+    ),
+  )
 
   if (deps.ingest) {
     const limiter = createIngestLimiter({

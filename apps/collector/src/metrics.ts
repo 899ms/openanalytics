@@ -95,6 +95,12 @@ export const COLLECTOR_METRICS = {
   enrichmentDegraded: 'collector_enrichment_degraded',
   /** The near-realtime usage counter could not be updated after an enqueue. */
   usageCounterDegraded: 'collector_usage_counter_degraded',
+
+  /** A tag sighting could not be recorded (ADR-0081, D2). The config response
+   * was unaffected; what is lost is the dashboard's ability to say where the tag
+   * loaded, on exactly the screen someone is watching because nothing else has
+   * told them. Labelled by `site_id`. */
+  tagSightingFailed: 'collector_tag_sighting_failed',
 } as const
 
 export type CollectorMetric = (typeof COLLECTOR_METRICS)[keyof typeof COLLECTOR_METRICS]

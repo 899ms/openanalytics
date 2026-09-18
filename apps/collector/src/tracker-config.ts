@@ -1,5 +1,9 @@
 import { ApiError, trackerConfigSchema, type TrackerConfig } from '@openanalytics/contracts'
+import { isOriginAllowed } from '@openanalytics/domain'
+import type { Logger, Metrics } from '@openanalytics/observability'
+import { TAG_SIGHTING_ORIGIN_ABSENT, type RealtimeCache } from '@openanalytics/redis'
 import { Hono } from 'hono'
+import { COLLECTOR_METRICS } from './metrics.ts'
 
 /**
  * `GET /v1/tracker/config` — the tracker's own configuration (docs snapshot 02
@@ -48,7 +52,24 @@ export function etagFor(record: TrackerConfigRecord): string {
   return `"oa-${record.siteId}-${record.config.config_version}${paused}"`
 }
 
-export function createTrackerConfigRoutes(store: TrackerConfigStore | undefined) {
+/**
+ * Where the sighting a config fetch produces is written (ADR-0081, D2).
+ *
+ * Optional at the route, because the realtime cache is: a config-only
+ * deployment has no `ingest` block at all, and it answers configuration exactly
+ * as it does today while recording nothing. The dashboard reads the absence as
+ * "not computed", never as "the tag has not loaded" (D3).
+ */
+export interface TrackerConfigSightings {
+  readonly cache: Pick<RealtimeCache, 'recordTagSighting'>
+  readonly logger: Logger
+  readonly metrics: Metrics
+}
+
+export function createTrackerConfigRoutes(
+  store: TrackerConfigStore | undefined,
+  sightings?: TrackerConfigSightings,
+) {
   const routes = new Hono()
 
   routes.get('/config', async (c) => {
@@ -73,6 +94,51 @@ export function createTrackerConfigRoutes(store: TrackerConfigStore | undefined)
     const record = await store.find(key)
     if (!record) {
       throw new ApiError('SITE_NOT_FOUND', 'No site matches this tracking key.')
+    }
+
+    if (sightings) {
+      const rawOrigin = c.req.header('origin')
+      // The gate's own function, on the gate's own input: `isOriginAllowed`
+      // reads a full origin (`https://host:3000`), so the raw header goes in
+      // rather than the `(none)` placeholder the hash field carries. A dashboard
+      // that computed this itself could disagree with the collector about
+      // whether an origin counts, which is the one thing this signal may not do
+      // (ADR-0081, D2).
+      const allowed = isOriginAllowed(rawOrigin, record.config.allowed_domains)
+
+      const failed = (error: unknown): void => {
+        sightings.logger.warn('tag_sighting_write_failed', {
+          err: error,
+          site_id: record.siteId,
+          retryable: true,
+        })
+        sightings.metrics.increment(COLLECTOR_METRICS.tagSightingFailed, {
+          site_id: record.siteId,
+        })
+      }
+
+      // Fire-and-forget on purpose, and before the `304` return so a tracker
+      // whose configuration has not changed is still seen: this is a
+      // diagnostic, and no part of it may delay or fail a config response.
+      //
+      // Both failure shapes are caught. The `.catch` covers a rejected write —
+      // an unreachable cache — and the `try` covers a client that throws
+      // synchronously before returning a promise at all, which is what an
+      // adapter missing this method looks like. Either one uncaught here would
+      // turn a tag sighting into a `500` on the endpoint every installed tracker
+      // in the world polls.
+      try {
+        void sightings.cache
+          .recordTagSighting({
+            siteId: record.siteId,
+            origin: (rawOrigin ?? '').toLowerCase() || TAG_SIGHTING_ORIGIN_ABSENT,
+            allowed,
+            at: new Date(),
+          })
+          .catch(failed)
+      } catch (error) {
+        failed(error)
+      }
     }
 
     const etag = etagFor(record)

@@ -59,6 +59,22 @@ export default defineConfig({
         },
       },
       {
+        // The web app's own pure modules, beside the code they test. The unit
+        // project cannot host them: it compiles imports the Node way and the
+        // app is written for the bundler way (extensionless relative imports,
+        // a CommonJS `package.json`), so a test under `tests/` that reached
+        // into `apps/web` failed the tests typecheck before it ran. Here the
+        // app's `tsc --noEmit` is the typecheck, with the app's resolution, and
+        // `@/` resolves the way `next` resolves it (ADR-0081 D4).
+        resolve: { alias: { '@': resolvePath('./apps/web') } },
+        test: {
+          name: 'web',
+          include: ['apps/web/**/*.test.ts'],
+          exclude: ['**/node_modules/**', '**/.next/**'],
+          environment: 'node',
+        },
+      },
+      {
         resolve: { alias },
         test: {
           name: 'tracker',

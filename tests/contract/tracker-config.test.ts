@@ -5,10 +5,20 @@ import {
   type components,
 } from '@openanalytics/contracts'
 import { loadServiceEnv, MAX_PUBLISHED_RULES_PER_SITE } from '@openanalytics/domain'
-import { createServiceMetadata } from '@openanalytics/observability'
+import {
+  createRecordingMetrics,
+  createServiceMetadata,
+  type Metrics,
+} from '@openanalytics/observability'
+import type { RecordTagSightingInput } from '@openanalytics/redis'
 import { createCapturedLogger, testEnv } from '@openanalytics/testkit'
-import { describe, expect, it } from 'vitest'
-import { createApp, type TrackerConfigRecord } from '../../apps/collector/src/index.ts'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  createApp,
+  COLLECTOR_METRICS,
+  type CollectorDeps,
+  type TrackerConfigRecord,
+} from '../../apps/collector/src/index.ts'
 
 /**
  * `GET /v1/tracker/config` (docs snapshot 02 §11; plan 04 Milestone 4 item 8).
@@ -43,13 +53,46 @@ const CONFIG: TrackerConfigRecord = {
   },
 }
 
-function buildApp(store?: { find(key: string): Promise<TrackerConfigRecord | null> }) {
+/**
+ * The ingest block, reduced to the two members the config route reads.
+ *
+ * `deps.ingest` is where the realtime cache and the metrics sink live, so it is
+ * also where the tag-sighting recorder comes from (ADR-0081, D2) — a
+ * config-only deployment has no ingest block and records nothing. The ingest
+ * *routes* mount beside this one and no case in this file posts to them, so the
+ * rest of the object is deliberately absent rather than faked into existence.
+ */
+function ingestWith(realtime: SightingRecorder, metrics: Metrics): CollectorDeps {
+  return { realtime, metrics } as unknown as CollectorDeps
+}
+
+interface SightingRecorder {
+  readonly calls: RecordTagSightingInput[]
+  recordTagSighting(input: RecordTagSightingInput): Promise<void>
+}
+
+function recorder(options: { fail?: Error } = {}): SightingRecorder {
+  const calls: RecordTagSightingInput[] = []
+  return {
+    calls,
+    recordTagSighting: (input) => {
+      calls.push(input)
+      return options.fail ? Promise.reject(options.fail) : Promise.resolve()
+    },
+  }
+}
+
+function buildApp(
+  store?: { find(key: string): Promise<TrackerConfigRecord | null> },
+  sightings?: { realtime: SightingRecorder; metrics: Metrics },
+) {
   const captured = createCapturedLogger()
   const app = createApp({
     service: createServiceMetadata({ name: 'collector', version: '1.0.0', environment: 'test' }),
     logger: captured.logger,
     env: loadServiceEnv('collector', testEnv()),
     ...(store ? { trackerConfigStore: store } : {}),
+    ...(sightings ? { ingest: ingestWith(sightings.realtime, sightings.metrics) } : {}),
   })
   return { app, captured }
 }
@@ -178,6 +221,131 @@ describe('tracker config endpoint', () => {
     expect(section).toContain('ETag')
     expect(section).toContain("'304'")
     expect(section).toContain('If-None-Match')
+  })
+})
+
+/**
+ * The tag sighting every resolved config fetch records (ADR-0081, D2).
+ *
+ * The developer this exists for is standing on `localhost:3000` watching a
+ * dashboard that says "waiting for the first event", because the collector has
+ * refused every event they sent and said so nowhere. The config fetch is the one
+ * request that does reach us from that host — so it is the only place the fact
+ * can be recorded, and `allowed` has to be the ingest gate's own verdict or the
+ * screen would contradict the server.
+ */
+describe('tag sightings', () => {
+  const KEY = '/v1/tracker/config?key=oa_pub_live_abcdef123456'
+
+  it('records the origin and the gate verdict on a 200', async () => {
+    const sightings = { realtime: recorder(), metrics: createRecordingMetrics() }
+    const { app } = buildApp(workingStore, sightings)
+
+    const response = await app.request(KEY, { headers: { origin: 'https://Shop.Example.com' } })
+
+    expect(response.status).toBe(200)
+    await vi.waitFor(() => expect(sightings.realtime.calls).toHaveLength(1))
+    const call = sightings.realtime.calls[0]
+    expect(call?.siteId).toBe('site_1')
+    // Lowercased, because a hash field is bytes: `Shop.Example.com` and
+    // `shop.example.com` are one origin and must not become two rows.
+    expect(call?.origin).toBe('https://shop.example.com')
+    expect(call?.allowed).toBe(true)
+    expect(call?.at).toBeInstanceOf(Date)
+  })
+
+  it('records a 304 as well, because a tracker that is installed re-validates', async () => {
+    // The sighting is written before the early return. Without that, the one
+    // population this feature exists for — a tag that has been loading for
+    // minutes — would stop being recorded the moment the browser cached the
+    // configuration, which is seconds after the install.
+    const sightings = { realtime: recorder(), metrics: createRecordingMetrics() }
+    const { app } = buildApp(workingStore, sightings)
+
+    const response = await app.request(KEY, {
+      headers: { origin: 'https://shop.example.com', 'If-None-Match': '"oa-site_1-7"' },
+    })
+
+    expect(response.status).toBe(304)
+    await vi.waitFor(() => expect(sightings.realtime.calls).toHaveLength(1))
+    expect(sightings.realtime.calls[0]?.allowed).toBe(true)
+  })
+
+  it('records a local host as seen and not allowed', async () => {
+    const sightings = { realtime: recorder(), metrics: createRecordingMetrics() }
+    const { app } = buildApp(workingStore, sightings)
+
+    await app.request(KEY, { headers: { origin: 'http://localhost:3000' } })
+
+    await vi.waitFor(() => expect(sightings.realtime.calls).toHaveLength(1))
+    // `localhost` cannot be added to the allowlist (the domain rule requires a
+    // dot), so this pair — seen, not allowed — is the whole diagnosis the
+    // waiting screen renders.
+    expect(sightings.realtime.calls[0]).toMatchObject({
+      origin: 'http://localhost:3000',
+      allowed: false,
+    })
+  })
+
+  it('records a request with no Origin header under `(none)`', async () => {
+    const sightings = { realtime: recorder(), metrics: createRecordingMetrics() }
+    const { app } = buildApp(workingStore, sightings)
+
+    await app.request(KEY)
+
+    await vi.waitFor(() => expect(sightings.realtime.calls).toHaveLength(1))
+    // A fetch with no origin is a fact rather than a missing one: it is what a
+    // server-side render or a `curl` looks like, and neither would ingest.
+    expect(sightings.realtime.calls[0]).toMatchObject({ origin: '(none)', allowed: false })
+  })
+
+  it('answers the configuration unchanged when the write fails, and meters it', async () => {
+    const sightings = {
+      realtime: recorder({ fail: new Error('valkey unreachable') }),
+      metrics: createRecordingMetrics(),
+    }
+    const { app } = buildApp(workingStore, sightings)
+
+    const response = await app.request(KEY, { headers: { origin: 'https://shop.example.com' } })
+
+    // Best-effort by contract: a diagnostic may never delay or fail the request
+    // that carries the site's own configuration to a live page.
+    expect(response.status).toBe(200)
+    expect(trackerConfigSchema.parse(await response.json()).config_version).toBe(7)
+    await vi.waitFor(() =>
+      expect(sightings.metrics.countOf(COLLECTOR_METRICS.tagSightingFailed)).toBe(1),
+    )
+  })
+
+  it('survives a recorder that throws instead of rejecting', async () => {
+    // A `.catch` alone covers a rejected write and not a client that throws
+    // before it returns a promise — an adapter without the method looks exactly
+    // like that, and uncaught it would be a 500 on the endpoint every installed
+    // tracker in the world polls.
+    const metrics = createRecordingMetrics()
+    const { app } = buildApp(workingStore, {
+      realtime: {
+        calls: [],
+        recordTagSighting: () => {
+          throw new TypeError('not a function')
+        },
+      },
+      metrics,
+    })
+
+    const response = await app.request(KEY, { headers: { origin: 'https://shop.example.com' } })
+
+    expect(response.status).toBe(200)
+    expect(metrics.countOf(COLLECTOR_METRICS.tagSightingFailed)).toBe(1)
+  })
+
+  it('records nothing in a deployment with no realtime cache', async () => {
+    // A config-only deployment has no ingest block, so there is no cache to
+    // write to. The site read reports that as "not computed" (`null`), never as
+    // "the tag has not loaded" (ADR-0081, D3).
+    const { app } = buildApp(workingStore)
+    const response = await app.request(KEY, { headers: { origin: 'https://shop.example.com' } })
+    expect(response.status).toBe(200)
   })
 })
 

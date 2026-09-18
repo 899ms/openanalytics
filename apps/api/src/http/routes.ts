@@ -201,6 +201,49 @@ async function revokeRealtimeAccess(
   }
 }
 
+/**
+ * Where this site's tag has been seen loading (ADR-0081, D3).
+ *
+ * Three things decide the answer, and only one of them is a cache read:
+ *
+ * - the site already has `first_event_at` — the stronger install signal
+ *   (ADR-0027) exists, so this weaker one has nothing left to say and is not
+ *   computed at all. That is also what keeps the read off every other request:
+ *   an installed site never touches the cache again;
+ * - no realtime cache in this deployment — nothing was ever recorded, so
+ *   nothing can be reported;
+ * - the read itself failed.
+ *
+ * All three answer `null`, and **never `[]`**. An empty array is a measurement
+ * with a meaning of its own here — the cache was read and the tag has not loaded
+ * anywhere in 24 hours, which is the screen's "check that the script is on the
+ * page" case. A failed read reported as `[]` would state that as fact
+ * (AGENTS.md: a provider failure is never an empty result).
+ */
+async function tagSightingsFor(
+  cache: RealtimeCache | undefined,
+  site: SiteForUser,
+  logger: Logger | undefined,
+): Promise<{ origin: string; seen_at: string; allowed: boolean }[] | null> {
+  if (site.firstEventAt !== null || !cache) return null
+
+  try {
+    const sightings = await cache.readTagSightings({ siteId: site.siteId })
+    return sightings.map((sighting) => ({
+      origin: sighting.origin,
+      seen_at: sighting.at,
+      allowed: sighting.allowed,
+    }))
+  } catch (err) {
+    logger?.warn('tag_sightings_read_failed', {
+      err,
+      site_id: site.siteId,
+      retryable: true,
+    })
+    return null
+  }
+}
+
 function siteJson(site: SiteForUser) {
   return {
     site_id: site.siteId,
@@ -811,7 +854,12 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
     const { siteId } = c.get('membership')
     const site = await getSiteForUser(db, { siteId, userId: user.id })
     if (!site) throw new ApiError('SITE_NOT_FOUND', 'No such site')
-    return c.json(siteJson(site))
+    // The single-site read only (ADR-0081, D3): this is what the two waiting
+    // screens poll, and the list is loaded on every screen of the product.
+    return c.json({
+      ...siteJson(site),
+      tag_sightings: await tagSightingsFor(deps.realtime?.cache, site, c.get('logger')),
+    })
   })
 
   /**

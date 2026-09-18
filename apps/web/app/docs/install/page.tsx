@@ -80,8 +80,13 @@ export default function InstallOverviewPage() {
           If your site has domains configured in Settings, events are
           accepted only from those hosts. An empty domain list means
           unconfigured, which accepts any origin; it never means deny all.
-          Adding your first domain silently narrows what is accepted, so if
-          you test from a staging host, add it too.
+          Adding your first domain narrows what is accepted, so if you test
+          from a staging host, add it too. A tag on a host the site does not
+          count says so: the tracker writes one line in the browser console
+          naming the host and the allowed domains, and the dashboard&apos;s
+          waiting screen names the same host and offers{" "}
+          <strong>Allow this domain</strong>. localhost can never be listed,
+          so visits are counted from the site&apos;s own domain.
         </DocNote>
       </DocSection>
 

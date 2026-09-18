@@ -24,7 +24,18 @@ export default function TroubleshootingPage() {
               A key from another site writes to that other site.
             </span>,
             "Check the HTML actually served: a caching layer or CDN can serve pages from before you added the tag. View source in the browser and search for oa.js; purge caches if it is missing.",
-            "Check the origin allowlist: if your site has domains configured in Settings, events are accepted only from those hosts. Testing from staging or localhost? Add that host, or use an empty list while installing.",
+            <span key="origin">
+              Check the origin allowlist: if your site has domains configured
+              in Settings, events are accepted only from those hosts and their
+              subdomains. You do not have to go looking for this one: the
+              tracker writes one line in the browser console naming the host
+              it loaded on and the domains that are allowed, and the
+              dashboard&apos;s waiting screen names the same host. A preview
+              or staging host is one click there (
+              <strong>Allow this domain</strong>). localhost can never be
+              listed, since a single-label host is not a domain: test on the
+              deployed site, or use an empty list while installing.
+            </span>,
             <span key="verify">
               Verify on the realtime view, not the charts: it shows a visit
               within seconds. Add <Code>data-debug=&quot;true&quot;</Code>{" "}

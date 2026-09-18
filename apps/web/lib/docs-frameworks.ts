@@ -41,7 +41,7 @@ export type DocFramework = {
 };
 
 const VERIFY_STEP: FrameworkStep = {
-  text: "Deploy (or run your dev server) and open the site once. The realtime view in your dashboard shows the visit within seconds; historical charts fill moments later.",
+  text: "Deploy and open the site at the address you gave the dashboard. The realtime view shows the visit within seconds; historical charts fill moments later. Loading it on your dev server first still tells you something: the dashboard's waiting screen names the host it saw the tag load on, and the tracker writes one line in the browser console when that host is not one the site counts. Visits themselves are only counted from the site's own domain, because localhost cannot be listed: deploy to see data, or empty the allowed domains list in Settings while you install.",
 };
 
 export const DOC_FRAMEWORKS: DocFramework[] = [

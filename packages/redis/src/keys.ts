@@ -172,6 +172,16 @@ export const BOT_COUNTER_PREFIX = 'sec_bot'
  * other carries a targeted disconnect. `rt_epoch` is the per-subject access epoch
  * a token snapshots and the gateway re-checks.
  */
+/**
+ * Where a site's tag has been seen loading in the last 24 hours (ADR-0081 D2).
+ *
+ * One HASH per site, fields keyed by the lowercased `Origin` of the config
+ * fetch. Deliberately not a realtime-presence key: it counts *installations
+ * asking for configuration*, including the ones the ingest gate then refuses,
+ * which is exactly the population presence cannot contain.
+ */
+export const TAG_SIGHTING_PREFIX = 'tag_sighting'
+
 export const VISITOR_META_PREFIX = 'rt_meta'
 export const VISITOR_PAGES_PREFIX = 'rt_pages'
 export const REALTIME_FEED_PREFIX = 'rt_feed'
@@ -281,6 +291,17 @@ export function realtimeControlChannel(siteId: string): string {
  */
 export function realtimeEpochKey(siteId: string, subject: string): string {
   return `${REALTIME_EPOCH_PREFIX}:${assertSafe('siteId', siteId)}:${assertSafe('subject', subject)}`
+}
+
+/**
+ * The site's tag-sighting HASH (ADR-0081, D2).
+ *
+ * Site-scoped and nothing else: the origins live in its fields, so a pasted key
+ * cannot address another site's record and an unusual origin cannot become part
+ * of a key name.
+ */
+export function tagSightingKey(siteId: string): string {
+  return `${TAG_SIGHTING_PREFIX}:${assertSafe('siteId', siteId)}`
 }
 
 /**

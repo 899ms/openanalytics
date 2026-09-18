@@ -1,5 +1,6 @@
 import type { Redis } from 'ioredis'
 import {
+  DAY_IN_SECONDS,
   RATE_LIMIT_WINDOW_TTL_SECONDS,
   botCounterKey,
   dailyBillableKey,
@@ -12,6 +13,7 @@ import {
   realtimeEpochKey,
   realtimeFeedKey,
   realtimeUpdatesChannel,
+  tagSightingKey,
   usageCounterKey,
   utcDayOf,
   visitorMetaKey,
@@ -85,6 +87,30 @@ export interface RaiseWindowUsageInput extends WindowUsageKey {
   /** `ends_at` of the window; the counter expires with the window it counts. */
   readonly usageWindowEnd: Date
   readonly delta: number
+  readonly at: Date
+}
+
+/**
+ * One origin the site's tag has been seen loading on (ADR-0081, D2).
+ *
+ * `allowed` is the collector's own `isOriginAllowed` verdict against the site's
+ * allowlist at the moment of the sighting, recorded rather than recomputed on
+ * read: the dashboard must never disagree with the gate about whether an origin
+ * counts, and the allowlist can change between the two.
+ */
+export interface TagSighting {
+  /** The lowercased `Origin` header of the config fetch, or `(none)`. */
+  readonly origin: string
+  /** ISO instant of the most recent fetch from this origin. */
+  readonly at: string
+  readonly allowed: boolean
+}
+
+export interface RecordTagSightingInput {
+  readonly siteId: string
+  /** Already lowercased by the caller; `(none)` when the header was absent. */
+  readonly origin: string
+  readonly allowed: boolean
   readonly at: Date
 }
 
@@ -608,6 +634,31 @@ export interface RealtimeCache {
    * counter. The signature name is a rule identifier, never the user agent.
    */
   countBot(input: { siteId: string; signature: string; at: Date; cost: number }): Promise<void>
+
+  /**
+   * Records that the site's tag fetched its configuration from an origin
+   * (ADR-0081, D2).
+   *
+   * The weaker install signal ADR-0027's `first_event_at` cannot be: it exists
+   * precisely when no event has been accepted, which is the case a developer
+   * testing on `localhost` or a preview host is standing in. One field per
+   * origin, last write wins, the whole hash expiring
+   * `TAG_SIGHTING_TTL_SECONDS` after the last one.
+   *
+   * Best-effort by contract, like every other method here: the caller fires it
+   * without awaiting and the config response is unaffected by a failure.
+   */
+  recordTagSighting(input: RecordTagSightingInput): Promise<void>
+
+  /**
+   * The site's sightings, newest first, with malformed entries skipped.
+   *
+   * An empty array is a measurement — the hash was read and nothing has loaded
+   * the tag in 24 hours — and is never how a failed read is reported: this
+   * method throws, and the caller decides what "not computed" looks like on its
+   * own contract (ADR-0081, D3).
+   */
+  readTagSightings(input: { siteId: string }): Promise<TagSighting[]>
 }
 
 /**
@@ -732,6 +783,120 @@ redis.call('PEXPIRE', KEYS[1], ARGV[2])
 redis.call('PUBLISH', KEYS[2], '{"subject":"' .. ARGV[1] .. '","epoch":' .. epoch .. '}')
 return epoch
 `
+
+/**
+ * How long a tag sighting outlives its last fetch (ADR-0081, D2).
+ *
+ * Twenty-four hours, refreshed on every write, because the question it answers
+ * has a short life: "is the tag loading, right now, while I watch this screen".
+ * A day is long enough that an install started on Friday evening still explains
+ * itself on Saturday morning, and short enough that nothing here needs a purge —
+ * which is why this is a cache key and not a Postgres row (ADR-0081, D6).
+ */
+export const TAG_SIGHTING_TTL_SECONDS = DAY_IN_SECONDS
+
+/**
+ * How many distinct origins one site may record (ADR-0081, D2).
+ *
+ * The public tracking key is write-only and can be pasted anywhere, so this hash
+ * is reachable by anyone holding it. Capping the field count keeps it a
+ * diagnostic and not a place to write: past the cap a *new* origin is dropped
+ * while the origins already recorded keep refreshing, so the site's real
+ * installs stay visible rather than being pushed out by noise.
+ */
+export const TAG_SIGHTING_MAX_ORIGINS = 20
+
+/**
+ * The field a sighting with no `Origin` header is recorded under (ADR-0081, D2).
+ *
+ * Not the empty string: a hash field that is empty reads as "unset" on every
+ * screen that renders it, and "the tag fetched configuration from somewhere that
+ * sent no origin" is a fact, not a missing one. Parenthesised so it cannot be
+ * confused with a host — no origin can ever spell it.
+ */
+export const TAG_SIGHTING_ORIGIN_ABSENT = '(none)'
+
+/**
+ * Record a tag sighting under the field cap, as one atomic script.
+ *
+ * KEYS: the site's sighting HASH.
+ * ARGV: [1] origin (the field), [2] JSON value, [3] field cap, [4] TTL seconds.
+ *
+ * `HLEN` and `HSET` have to be one round trip or the cap is decorative: twenty
+ * concurrent config fetches from twenty new origins would each read a length
+ * under the cap and each write.
+ *
+ * The cap applies to *new* fields only. An origin already recorded is always
+ * updated, so a site that reached the cap keeps reporting fresh instants for the
+ * installs it knows about instead of freezing at whichever twenty arrived first.
+ *
+ * The `EXPIRE` is inside the write branch: a refused write must not extend the
+ * life of the hash that refused it, or a stream of unknown origins would keep a
+ * full hash alive forever without adding a single fact to it.
+ */
+export const RECORD_TAG_SIGHTING_SCRIPT = `
+local field = ARGV[1]
+local value = ARGV[2]
+local max_origins = tonumber(ARGV[3])
+local ttl_seconds = tonumber(ARGV[4])
+
+if redis.call('HEXISTS', KEYS[1], field) == 0 and redis.call('HLEN', KEYS[1]) >= max_origins then
+  return 0
+end
+
+redis.call('HSET', KEYS[1], field, value)
+redis.call('EXPIRE', KEYS[1], ttl_seconds)
+return 1
+`
+
+/**
+ * Parses a sighting HASH into the newest-first list the read surface serves.
+ *
+ * A malformed field is skipped rather than failing the whole read: this is a
+ * diagnostic, and one unreadable value must not be able to hide the nineteen
+ * that would have told the developer what they need to know. The instant has to
+ * parse as well as be a string — an unparseable `at` cannot be ordered, and an
+ * entry that cannot be ordered cannot be "the newest sighting", which is the
+ * only thing the screens render.
+ */
+export function parseTagSightings(hash: Record<string, string>): TagSighting[] {
+  const sightings: { sighting: TagSighting; atMs: number }[] = []
+
+  for (const [origin, raw] of Object.entries(hash)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (typeof parsed !== 'object' || parsed === null) continue
+
+    const row = parsed as Record<string, unknown>
+    const at = row['at']
+    const allowed = row['allowed']
+    if (typeof at !== 'string' || typeof allowed !== 'boolean') continue
+
+    const atMs = Date.parse(at)
+    if (!Number.isFinite(atMs)) continue
+
+    sightings.push({ sighting: { origin, at, allowed }, atMs })
+  }
+
+  // Newest first, then by origin: the hash has no order of its own, and two
+  // sightings recorded in the same millisecond must still come back in the same
+  // order on every read or the screen's "newest sighting" would flicker.
+  sightings.sort((a, b) =>
+    b.atMs !== a.atMs
+      ? b.atMs - a.atMs
+      : a.sighting.origin < b.sighting.origin
+        ? -1
+        : a.sighting.origin > b.sighting.origin
+          ? 1
+          : 0,
+  )
+
+  return sightings.map((entry) => entry.sighting)
+}
 
 /** Seconds from an instant to the next UTC midnight, plus `extraDays` of slack. */
 function dailyTtlSeconds(at: Date, extraDays = 1): number {
@@ -1056,6 +1221,23 @@ export function createRealtimeCache(options: RealtimeCacheOptions): RealtimeCach
           ttlSeconds: dailyTtlSeconds(input.at),
         },
       ])
+    },
+
+    async recordTagSighting(input: RecordTagSightingInput): Promise<void> {
+      await client.eval(
+        RECORD_TAG_SIGHTING_SCRIPT,
+        1,
+        key(tagSightingKey(input.siteId)),
+        input.origin,
+        JSON.stringify({ at: input.at.toISOString(), allowed: input.allowed }),
+        String(TAG_SIGHTING_MAX_ORIGINS),
+        String(TAG_SIGHTING_TTL_SECONDS),
+      )
+    },
+
+    async readTagSightings(input: { siteId: string }): Promise<TagSighting[]> {
+      const hash = await client.hgetall(key(tagSightingKey(input.siteId)))
+      return parseTagSightings(hash)
     },
   }
 }

@@ -4,6 +4,7 @@ import { CheckmarkCircle02Icon, PlusSignIcon } from "hugeicons-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useRouter } from "next/navigation";
 import * as React from "react";
+import { cleanDomain } from "@/lib/site-domain";
 import { InstallOptions } from "@/components/dashboard/install-options";
 import { Favicon } from "@/components/dashboard/site-favicon";
 import { Logo } from "@/components/ui/logo";
@@ -51,20 +52,6 @@ export function slugify(value: string): string {
     .slice(0, 63);
 }
 
-/** A bare hostname with at least one dot — what the domains allowlist takes. */
-export function cleanDomain(value: string): string | null {
-  const bare = value
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/.*$/, "")
-    .replace(/\.$/, "");
-  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(
-    bare
-  )
-    ? bare
-    : null;
-}
 
 /**
  * Self-contained trigger + dialog, for the sites overview page.

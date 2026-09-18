@@ -95,6 +95,10 @@ const realtime = {
   recordBillable: () => Promise.resolve(undefined),
   touchVisitor: () => Promise.resolve(undefined),
   countBot: () => Promise.resolve(undefined),
+  // The config route records a tag sighting on every fetch (ADR-0081, D2), so a
+  // CORS harness that omitted it would be exercising the recorder's failure
+  // path rather than the header assertions it is here for.
+  recordTagSighting: () => Promise.resolve(undefined),
 } as unknown as RealtimeCache
 
 function harness() {

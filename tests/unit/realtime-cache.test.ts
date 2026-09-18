@@ -6,8 +6,13 @@ import {
   REALTIME_SITE_EPOCH_SUBJECT,
   QueueConnectionError,
   RATE_LIMIT_WINDOW_TTL_SECONDS,
+  RECORD_TAG_SIGHTING_SCRIPT,
+  TAG_SIGHTING_MAX_ORIGINS,
+  TAG_SIGHTING_ORIGIN_ABSENT,
+  TAG_SIGHTING_TTL_SECONDS,
   botCounterKey,
   buildConnectionOptions,
+  createRealtimeCache,
   dailyBillableKey,
   dailyCeilingKey,
   minuteBucketOf,
@@ -15,8 +20,10 @@ import {
   rateLimitIpKey,
   rateLimitSiteKey,
   realtimeEpochKey,
+  tagSightingKey,
   usageCounterKey,
   visitorPresenceKey,
+  type RealtimeCacheOptions,
 } from '@openanalytics/redis'
 import { describe, expect, it } from 'vitest'
 
@@ -150,5 +157,170 @@ describe('realtime-cache connection (D-206)', () => {
       url: 'rediss://default:secret@cache.example.com:6379',
     })
     expect(options.tls).toEqual({ servername: 'cache.example.com' })
+  })
+})
+
+/**
+ * Tag sightings (ADR-0081, D2).
+ *
+ * The failure modes are the same shape as the rest of this file's: silent. A
+ * hash without a TTL is a permanent record of where a key was pasted; an
+ * uncapped hash is a place anyone holding the write-only tracking key can write
+ * to; and a read that fails on one malformed field hides the nineteen good ones
+ * from the exact screen that exists to explain why nothing is arriving.
+ */
+describe('tag sightings', () => {
+  const SITE = 'site-1'
+  const AT = new Date('2026-09-14T10:00:00.000Z')
+
+  /**
+   * A Valkey stand-in recording the two calls this family makes.
+   *
+   * The script itself is asserted as text below, the way `INCREMENT_WINDOWS_SCRIPT`
+   * and `BUMP_EPOCH_SCRIPT` are: re-implementing `HEXISTS`/`HLEN` in JavaScript
+   * would prove that the re-implementation caps, which is not the claim. What a
+   * double can prove is the other half — that the cap and the TTL reach the
+   * server at all, in one round trip, as that script's own arguments.
+   */
+  function fakeClient(hash: Record<string, string> = {}) {
+    const evals: { script: string; numKeys: number; args: string[] }[] = []
+    const hgetalls: string[] = []
+    const client = {
+      eval: async (script: string, numKeys: number, ...args: string[]) => {
+        evals.push({ script, numKeys, args })
+        return 1
+      },
+      hgetall: async (key: string) => {
+        hgetalls.push(key)
+        return hash
+      },
+    }
+    return {
+      evals,
+      hgetalls,
+      cache: createRealtimeCache({
+        client: client as unknown as RealtimeCacheOptions['client'],
+        eventMaxLatenessHours: 48,
+      }),
+    }
+  }
+
+  it('writes the origin, the instant and the verdict under the site key', async () => {
+    const fake = fakeClient()
+    await fake.cache.recordTagSighting({
+      siteId: SITE,
+      origin: 'http://localhost:3000',
+      allowed: false,
+      at: AT,
+    })
+
+    const call = fake.evals[0]
+    expect(call?.numKeys).toBe(1)
+    expect(call?.args[0]).toBe(tagSightingKey(SITE))
+    expect(call?.args[1]).toBe('http://localhost:3000')
+    // The verdict is stored, not recomputed on read: the allowlist can change
+    // between the sighting and the screen, and the dashboard must never disagree
+    // with the collector about whether an origin counts.
+    expect(JSON.parse(call?.args[2] ?? 'null')).toEqual({
+      at: '2026-09-14T10:00:00.000Z',
+      allowed: false,
+    })
+  })
+
+  it('carries the cap and the TTL into the same round trip as the write', async () => {
+    const fake = fakeClient()
+    await fake.cache.recordTagSighting({
+      siteId: SITE,
+      origin: TAG_SIGHTING_ORIGIN_ABSENT,
+      allowed: true,
+      at: AT,
+    })
+
+    const call = fake.evals[0]
+    expect(call?.script).toBe(RECORD_TAG_SIGHTING_SCRIPT)
+    expect(call?.args[3]).toBe(String(TAG_SIGHTING_MAX_ORIGINS))
+    expect(call?.args[4]).toBe(String(TAG_SIGHTING_TTL_SECONDS))
+    // A day, and one key per site rather than per origin — which is what lets
+    // this be a cache key with no purge behind it (ADR-0081, D6).
+    expect(TAG_SIGHTING_TTL_SECONDS).toBe(86_400)
+    expect(TAG_SIGHTING_MAX_ORIGINS).toBe(20)
+  })
+
+  it('caps new origins inside the script, and only new ones', () => {
+    // `HLEN` and `HSET` in two round trips would make the cap decorative: twenty
+    // concurrent fetches from twenty new origins would each read a length under
+    // the cap and each write.
+    expect(RECORD_TAG_SIGHTING_SCRIPT).toContain(
+      "redis.call('HEXISTS', KEYS[1], field) == 0 and redis.call('HLEN', KEYS[1]) >= max_origins",
+    )
+    // An origin already recorded is always updated, so a site that reached the
+    // cap keeps reporting fresh instants for the installs it knows about.
+    expect(RECORD_TAG_SIGHTING_SCRIPT).toContain("redis.call('HSET', KEYS[1], field, value)")
+  })
+
+  it('refreshes the expiry on every write, and never on a refused one', () => {
+    // The EXPIRE sits after the cap's early return: a stream of unknown origins
+    // must not be able to keep a full hash alive forever without adding a fact
+    // to it, and a write that does land must restart the 24 hours.
+    const refusal = RECORD_TAG_SIGHTING_SCRIPT.indexOf('return 0')
+    const expire = RECORD_TAG_SIGHTING_SCRIPT.indexOf("redis.call('EXPIRE', KEYS[1], ttl_seconds)")
+    expect(refusal).toBeGreaterThan(0)
+    expect(expire).toBeGreaterThan(refusal)
+  })
+
+  it('reads the site hash newest first', async () => {
+    const fake = fakeClient({
+      'https://staging.example.com': '{"at":"2026-09-14T09:00:00.000Z","allowed":false}',
+      'https://shop.example.com': '{"at":"2026-09-14T11:30:00.000Z","allowed":true}',
+      'http://localhost:3000': '{"at":"2026-09-14T10:00:00.000Z","allowed":false}',
+    })
+
+    const sightings = await fake.cache.readTagSightings({ siteId: SITE })
+
+    expect(fake.hgetalls).toEqual([tagSightingKey(SITE)])
+    // The screens render "the newest sighting", so the order is the answer
+    // rather than a presentation detail — a hash has none of its own.
+    expect(sightings.map((sighting) => sighting.origin)).toEqual([
+      'https://shop.example.com',
+      'http://localhost:3000',
+      'https://staging.example.com',
+    ])
+    expect(sightings[0]).toEqual({
+      origin: 'https://shop.example.com',
+      at: '2026-09-14T11:30:00.000Z',
+      allowed: true,
+    })
+  })
+
+  it('skips a malformed entry rather than failing the whole read', async () => {
+    const fake = fakeClient({
+      'https://good.example.com': '{"at":"2026-09-14T10:00:00.000Z","allowed":true}',
+      'https://not-json.example.com': 'not json at all',
+      'https://no-instant.example.com': '{"allowed":true}',
+      'https://unparseable-instant.example.com': '{"at":"whenever","allowed":true}',
+      'https://no-verdict.example.com': '{"at":"2026-09-14T10:00:00.000Z"}',
+      'https://not-an-object.example.com': '42',
+    })
+
+    // One unreadable value must not hide the ones that would have told the
+    // developer what they need to know; and an entry with no orderable instant
+    // can never be "the newest sighting", which is all the screens read.
+    expect(await fake.cache.readTagSightings({ siteId: SITE })).toEqual([
+      { origin: 'https://good.example.com', at: '2026-09-14T10:00:00.000Z', allowed: true },
+    ])
+  })
+
+  it('reports an empty hash as an empty list, which is a measurement', async () => {
+    // Never `null` from here: "the cache was read and nothing has loaded the
+    // tag" is a fact this method is allowed to state. A failed read throws
+    // instead, and the api decides what "not computed" looks like on its own
+    // contract (ADR-0081, D3).
+    const fake = fakeClient({})
+    expect(await fake.cache.readTagSightings({ siteId: SITE })).toEqual([])
+  })
+
+  it('keys the hash by site alone, so an origin can never name a key', () => {
+    expect(tagSightingKey('site-1')).toBe('tag_sighting:site-1')
+    expect(() => tagSightingKey('site:1')).toThrow(InvalidKeyComponentError)
   })
 })

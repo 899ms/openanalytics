@@ -59,6 +59,14 @@ const DISABLED_PATCH: TrackerConfigPatch = { disabled: true }
 interface TrackerConfigResponse {
   config_version?: number
   collection_paused?: boolean
+  /**
+   * The site's origin allowlist, as the collector holds it (ADR-0081, D1).
+   *
+   * It has always been on the wire (`toTrackerConfig` in
+   * `ingest-config-store.ts`) and was parsed by nobody. The tracker reads it to
+   * tell the developer, once, that this host is not one the server counts.
+   */
+  allowed_domains?: string[]
   redact_query_keys?: string[]
   interaction_sampling?: number
   heartbeat_interval_seconds?: number
@@ -77,6 +85,7 @@ interface CachedConfig {
 
 export function toRuntimeConfig(response: TrackerConfigResponse): TrackerConfigPatch {
   const runtime: {
+    allowedDomains?: readonly string[]
     redactQueryKeys?: readonly string[]
     interactionSampling?: number
     heartbeatIntervalSeconds?: number
@@ -85,6 +94,20 @@ export function toRuntimeConfig(response: TrackerConfigResponse): TrackerConfigP
     noCodeRules?: TrackerRuntimeConfig['noCodeRules']
   } = {}
 
+  // Carried through as the server spells them: the verdict lowercases and trims
+  // each entry itself, and the console line quotes them back to the person who
+  // typed them into the dashboard.
+  //
+  // Absent — an older cached body, or a deployment that does not send the field
+  // — leaves the runtime value alone, and the runtime default is the empty list,
+  // which admits every host. That is the direction this has to fail in: a
+  // missing list must never silence a tracker that the server would have
+  // counted.
+  if (Array.isArray(response.allowed_domains)) {
+    runtime.allowedDomains = response.allowed_domains.filter(
+      (domain): domain is string => typeof domain === 'string',
+    )
+  }
   if (Array.isArray(response.redact_query_keys)) {
     runtime.redactQueryKeys = response.redact_query_keys
       .filter((key): key is string => typeof key === 'string')
