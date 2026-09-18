@@ -10,7 +10,45 @@ Releases before 0.6.0 have their notes on the
 
 ## [Unreleased]
 
+**Upgrade notes: nothing by hand, but the first start takes longer.**
+`./upgrade.sh` as always. The migrate container then fills the new
+fifteen-minute rollups from your history by itself — once, reading every raw
+event, so on a large install the migrate step runs noticeably longer than
+usual. A fill that fails is logged as `oa-migrate: history fill … failed`,
+does not stop the stack, and is retried on the next `docker compose up -d`.
+If the worker keeps running through the switch (a platform redeploy, or
+`pull` and `up -d` without `./upgrade.sh`), the quarter hour in which the new
+views are created counts only the events that arrived after that moment. The
+new rollups take up to four rows for every hourly one. The new ClickHouse
+grants arrive with the new image. Details in `SELF-HOSTING.md`, "Upgrades and
+going back".
+
 ### Added
+
+- **Every timezone.** Reports are assembled from fifteen-minute rollups
+  instead of hourly ones, so a site can report on any IANA timezone,
+  including those whose offset is not a whole hour — India (+05:30), Nepal
+  (+05:45), Chatham (+12:45) — with local days, hours and daylight-saving days
+  cut exactly. 0.6.0 refused those zones.
+- **Every site has a reporting timezone.** It is set under Settings, General,
+  and the dashboard, widgets, the share page, the MCP server and the assistant
+  all read on it, so "today" means the same day to everyone on the team. A
+  reader switches their own view from a timezone button in the dashboard
+  header, which changes nothing for anybody else. Existing sites get their
+  owner's account timezone, or UTC.
+- **Site cards carry numbers.** The sites grid shows each site's all-time
+  visitors, pageviews and, for an owner with a provider connected, revenue,
+  with a line of weekly visitors. `GET /v1/sites` carries them, from one
+  gateway query for all listed sites, cached for five minutes; three optional
+  variables tune it (`SITES_CARD_*`).
+- **A tag that cannot count says so.** A tag loaded on a host the site's
+  allowed domains refuse — localhost, a preview or staging deployment — writes
+  one line in the browser console naming the host, and the dashboard's waiting
+  screens name the host it was seen on, with "Allow this domain" for a preview
+  or staging host. `GET /v1/sites/{id}` carries `tag_sightings`.
+- **Waiting for events.** A site that has never received an event says so: a
+  badge beside the overview's heading opens the install itself, and Funnels
+  and Realtime show the same state instead of zeros.
 
 - **Five share posters.** The share button's poster is no longer only the
   overview: sources, countries, the people on the site right now and the top
@@ -36,6 +74,17 @@ Releases before 0.6.0 have their notes on the
 
 ### Changed
 
+- **`PATCH /v1/sites/{id}` refuses `reporting_timezone: null`** with a 400.
+  Every site has a zone now, so there is no unset state to return to.
+- The reporting timezone moved from the Widgets tab to Settings, General.
+- The hourly rollup tables are no longer written. They stay as frozen
+  history; a later release drops them.
+- **Every service's log has a ceiling**: 3 files of 100 MB, in all three
+  compose files. Docker's default never rotates.
+- **Fewer metric lines.** Without a remote-write backend, an unchanged gauge
+  is logged at most once a minute rather than on every tick; with one, the
+  exporter is the only sink. The tracker's gzip budget is 10,240 B (+454 B for
+  the host check).
 - **The tracker is MIT.** `apps/tracker/` and the `oa.js` it builds now carry
   the MIT licence ([`apps/tracker/LICENSE`](apps/tracker/LICENSE)); the rest of
   the product stays AGPL-3.0. It is the one file that runs on your visitors'
@@ -52,6 +101,9 @@ Releases before 0.6.0 have their notes on the
 
 ### Fixed
 
+- **The ClickHouse migration CLI reads `*_FILE` variables.** It parsed the
+  environment itself, so `CLICKHOUSE_MIGRATION_PASSWORD_FILE` read as no
+  password at all.
 - **MinIO is pulled from Quay.** The `minio/minio` repository stopped
   resolving on Docker Hub, so `docker compose --profile object-storage up`
   failed with "pull access denied". The compose file now names
