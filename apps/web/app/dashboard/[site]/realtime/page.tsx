@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { FirstEventGate } from "@/components/dashboard/awaiting-events";
 import { RealtimeBoard } from "@/components/dashboard/realtime-board";
 
 export const metadata: Metadata = {
@@ -6,5 +7,11 @@ export const metadata: Metadata = {
 };
 
 export default function RealtimePage() {
-  return <RealtimeBoard />;
+  // An empty room and a quiet minute look identical here, so a site that has
+  // never received an event says which one it is instead of drawing zero.
+  return (
+    <FirstEventGate surface="realtime">
+      <RealtimeBoard />
+    </FirstEventGate>
+  );
 }

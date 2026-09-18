@@ -1,5 +1,6 @@
 import { Activity01Icon } from "hugeicons-react";
 import { AiReferralsCard } from "@/components/dashboard/ai-referrals-card";
+import { AwaitingEventsBadge } from "@/components/dashboard/awaiting-events";
 import { CustomEventsCard } from "@/components/dashboard/custom-events-card";
 import { IntervalProvider } from "@/components/dashboard/interval-context";
 import { IntervalSelect } from "@/components/dashboard/interval-select";
@@ -52,6 +53,11 @@ export default async function OverviewPage({
           {/* Outside the baseline group: a bordered control against text
               only looks level when it is centred, not baselined. */}
           <RefreshButton />
+
+          {/* A site that has never received an event says so here rather than
+              in a strip above the cards: the state is usually over within a
+              minute, and it should not move the whole board while it lasts. */}
+          <AwaitingEventsBadge />
         </div>
         {/* The active filters ride the tab bar's own tray (its filter face),
             which is the one piece of chrome on every screen and the only one
