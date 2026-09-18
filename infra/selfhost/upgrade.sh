@@ -273,7 +273,7 @@ Check the services are answering, and that they are the version you think:
   docker compose exec api node -e "fetch('http://127.0.0.1:8082/health').then(r=>r.json()).then(o=>console.log(o.commit,o.status))"
 
 and that no history fill failed (none of these lines is the good answer; a
-failed fill does not stop the stack, and the next `docker compose up -d`
+failed fill does not stop the stack, and the next "docker compose up -d"
 retries it):
 
   docker compose logs migrate | grep 'history fill'
