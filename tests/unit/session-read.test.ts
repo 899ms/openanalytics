@@ -50,16 +50,32 @@ describe('splitSessionRange', () => {
   it('is provably non-overlapping: finalized.to === provisional.from', () => {
     const split = splitSessionRange({
       ...range,
-      finalizedThrough: '2026-07-04T09:00:00.000Z',
-      splitUnit: 'hour',
+      finalizedThrough: '2026-07-04T09:07:30.000Z',
+      splitUnit: 'quarter',
     })
-    // The hour-floored boundary is shared: [from, B) and [B, to) never overlap.
+    // The quarter-floored boundary is shared: [from, B) and [B, to) never
+    // overlap, and it lands inside the hour the watermark sits in — which is
+    // the whole point of cutting on the source's own bucket width (ADR-0079).
     expect(split.finalized?.to).toBe(split.provisional?.from)
     expect(split.finalized?.to).toBe('2026-07-04T09:00:00.000Z')
   })
 
+  it('cuts at the quarter-hour, not the hour, so no session lands in both layers', () => {
+    const split = splitSessionRange({
+      ...range,
+      finalizedThrough: '2026-07-04T09:52:00.000Z',
+      splitUnit: 'quarter',
+    })
+    // 09:45, not 09:00: the finalized layer takes the three quarter-hour buckets
+    // the finalizer has actually closed, and the provisional layer opens exactly
+    // where they stop.
+    expect(split.boundary).toBe('2026-07-04T09:45:00.000Z')
+    expect(split.finalized?.to).toBe('2026-07-04T09:45:00.000Z')
+    expect(split.provisional?.from).toBe('2026-07-04T09:45:00.000Z')
+  })
+
   it('reads the whole range as provisional when nothing is finalized', () => {
-    const split = splitSessionRange({ ...range, finalizedThrough: null, splitUnit: 'hour' })
+    const split = splitSessionRange({ ...range, finalizedThrough: null, splitUnit: 'quarter' })
     expect(split.finalized).toBeNull()
     expect(split.provisional).toEqual({ from: range.effectiveFrom, to: range.effectiveTo })
   })
@@ -86,8 +102,8 @@ describe('splitSessionRange', () => {
 })
 
 describe('floorUtcTo', () => {
-  it('floors to the UTC hour and day', () => {
-    expect(floorUtcTo('2026-07-05T13:42:11.500Z', 'hour')).toBe('2026-07-05T13:00:00.000Z')
+  it('floors to the UTC quarter-hour and day', () => {
+    expect(floorUtcTo('2026-07-05T13:42:11.500Z', 'quarter')).toBe('2026-07-05T13:30:00.000Z')
     expect(floorUtcTo('2026-07-05T13:42:11.500Z', 'day')).toBe('2026-07-05T00:00:00.000Z')
   })
 })

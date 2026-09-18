@@ -9,17 +9,26 @@ import {
   type AnalyticsRange,
 } from "@/lib/api";
 import { useSession } from "@/lib/auth-client";
-import { resolveTimezone, sessionTimezone } from "@/lib/timezone";
+import { useSiteSummary } from "@/components/dashboard/site-summary-context";
+import {
+  isUsableTimezone,
+  resolveTimezone,
+  resolveViewingTimezone,
+  sessionTimezone,
+} from "@/lib/timezone";
 
 /**
  * The overview screen's shared time range. One provider per screen; every
  * analytics panel reads the same `range`, so picking an interval refetches
  * them all together instead of each panel keeping its own idea of "now".
  *
- * Calendar boundaries are cut in the *resolved* timezone — the user's stored
- * preference (flattened onto the session as `user.timezone`), else the
- * browser's zone — and the same zone is sent as the `timezone` parameter, so
- * "Today" always means the user's today even on a travelling laptop.
+ * Calendar boundaries are cut in the *viewing* timezone and the same zone is
+ * sent as the `timezone` parameter. Since ADR-0079 D5 that zone is the
+ * **site's** (`sites.reporting_timezone`) by default rather than each reader's
+ * own: two people looking at one site should see the same day boundary unless
+ * one of them asked for a different one. `resolveViewingTimezone` is the whole
+ * rule and the header pill is how somebody asks — the pick moves this view for
+ * this visit and never writes the site's column.
  *
  * "All time" anchors on `min(created_at, first_event_at)`: `first_event_at`
  * can precede `created_at` by up to 24 hours (a client-stamped event the
@@ -114,6 +123,27 @@ function storeInterval(key: IntervalKey, memory: IntervalMemory): void {
 
 const emptySubscribe = () => () => {};
 
+/**
+ * Where a reader's own zone pick is remembered: this tab, this site, this
+ * visit — the interval's `visit` memory in every respect except that it is
+ * never the account's.
+ *
+ * Per site, because a zone chosen while reading one site is not a statement
+ * about the next one; per tab, because it is a way of looking rather than a
+ * preference. Nothing here writes `sites.reporting_timezone`: the pill moves
+ * the view, and Settings → General moves the site.
+ */
+const zoneMemoryKey = (slug: string) => `oa-dash-tz:${slug}`;
+
+function readStoredZone(slug: string): string | null {
+  if (slug === "") return null;
+  try {
+    return window.sessionStorage.getItem(zoneMemoryKey(slug));
+  } catch {
+    return null;
+  }
+}
+
 /* --------------------------------------------------------------------- */
 /* Calendar math in an arbitrary IANA zone                                */
 /* --------------------------------------------------------------------- */
@@ -177,9 +207,7 @@ function zonedDayStart(
 /**
  * Half-open `[from, to)` for an interval, cut at the resolved zone's calendar
  * boundaries and sent with that zone. The backend snaps endpoints to the
- * served grain and echoes the effective range; a sub-hour-offset zone can be
- * refused at hour/day grain (`RESOLUTION_NOT_AVAILABLE`), which the panels
- * present as a range error.
+ * served grain and echoes the effective range.
  *
  * `allFromMs` anchors the "all" interval; while it is still unknown the view
  * falls back to the trailing 12 months and refines the moment the site read
@@ -191,7 +219,12 @@ export function rangeForInterval(
   allFromMs?: number | null,
   now: Date = new Date()
 ): AnalyticsRange {
-  const tz = timezone ?? resolveTimezone(null);
+  // The resolver upstream already refuses a zone `Intl` cannot use, but this
+  // is the function that would do the throwing — every caller's endpoints are
+  // cut here, including the ones that pass a zone straight in — so this is
+  // where being unable to throw has to be true. UTC over a crashed screen.
+  const asked = timezone ?? resolveTimezone(null);
+  const tz = isUsableTimezone(asked) ? asked : "UTC";
   const day = (shift: Parameters<typeof zonedDayStart>[2]) =>
     zonedDayStart(now, tz, shift);
   const tomorrow = day({ days: 1 });
@@ -230,12 +263,38 @@ type IntervalContextValue = {
    */
   rangePending: boolean;
   /**
+   * True while the site's own clock is still unknown: its summary is in
+   * flight and `timezone` is the next step of the chain standing in.
+   *
+   * Already folded into `rangePending`, which is what panels wait on. It is
+   * published separately for the header pill (`HeaderTimezonePill`), which
+   * should not name a zone the screen is a moment away from leaving: the
+   * panels behind it are holding for that same answer, so a name there would
+   * be the only thing on screen claiming to have it.
+   */
+  zonePending: boolean;
+  /**
    * The intervals this screen offers. The picker reads it rather than the
    * module constant, so a surface can withhold one it cannot honestly serve —
    * the public board withholds "All time", whose anchor needs a site the
    * viewer cannot see.
    */
   intervals: readonly (typeof INTERVALS)[number][];
+  /**
+   * The zone every window on this screen is cut in — the same string `range`
+   * carries, offered separately so the header pill can wear it without
+   * unpicking a range.
+   */
+  timezone: string;
+  /**
+   * Moves this view to another zone for this visit (ADR-0079 D5). It changes
+   * nothing stored about the site or the account.
+   *
+   * A no-op on a surface that supplies its own `timezone` — there the screen
+   * owns the clock and drives its own picker, and a second setter here would
+   * only be a way for the two to disagree.
+   */
+  setTimezone: (zone: string) => void;
 };
 
 const IntervalContext = React.createContext<IntervalContextValue | null>(null);
@@ -266,10 +325,10 @@ export function IntervalProvider({
    */
   allAnchorMs?: number | null;
   /**
-   * The clock ranges are cut in, supplied by a screen whose clock is not
-   * the signed-in user's — the share board passes the viewer's pick,
-   * defaulting to the site's reporting zone (ADR-0044). Omitted, the
-   * account preference (else the browser) applies as ever.
+   * The clock ranges are cut in, supplied by a screen that resolves its own —
+   * the public share board, which has a viewer's pick and a site identity but
+   * no session to read a preference from (ADR-0044). Omitted, this provider
+   * resolves the chain itself and owns the pick.
    */
   timezone?: string;
 }) {
@@ -291,12 +350,60 @@ export function IntervalProvider({
   const [chosen, setChosen] = React.useState<IntervalKey | null>(null);
   const interval = chosen ?? stored ?? RETURNING_INTERVAL;
 
-  const { data: session } = useSession();
-  const timezone =
-    timezoneProp ?? resolveTimezone(sessionTimezone(session?.user));
-
   const params = useParams<{ site?: string }>();
   const slug = params.site ? decodeURIComponent(params.site) : "";
+
+  const { data: session } = useSession();
+  /**
+   * The site's own clock, read off the summary the lifecycle gate already
+   * fetches for every `/dashboard/[site]` screen — no second request, and one
+   * answer for every panel under it.
+   */
+  const siteSummary = useSiteSummary();
+  /**
+   * Read through `useSyncExternalStore` for the interval memory's own reason:
+   * the server render has no storage, so it and hydration agree on `null` and
+   * the remembered pick takes over in the post-hydration pass.
+   */
+  const readZone = React.useCallback(() => readStoredZone(slug), [slug]);
+  const rememberedZone = React.useSyncExternalStore(
+    emptySubscribe,
+    readZone,
+    () => null
+  );
+  const [chosenZone, setChosenZone] = React.useState<string | null>(null);
+  const setTimezone = React.useCallback(
+    (zone: string) => {
+      // A supplied clock is the screen's, not ours: it drives its own picker.
+      if (timezoneProp !== undefined) return;
+      setChosenZone(zone);
+      if (slug === "") return;
+      try {
+        window.sessionStorage.setItem(zoneMemoryKey(slug), zone);
+      } catch {
+        /* per-tab memory only — the pick still applies for this visit */
+      }
+    },
+    [slug, timezoneProp]
+  );
+
+  const timezone =
+    timezoneProp ??
+    resolveViewingTimezone({
+      chosen: chosenZone,
+      remembered: rememberedZone,
+      site: siteSummary.site?.reporting_timezone ?? null,
+      preference: sessionTimezone(session?.user),
+    });
+
+  /**
+   * The site's zone is not knowable on the first frame, and a range cut in the
+   * reader's clock and then re-cut in the site's would play every panel's load
+   * twice. So the screens hold, the way they already hold for the "All time"
+   * anchor — one mechanism, `rangePending`, for both unknowns.
+   */
+  const zonePending =
+    timezoneProp === undefined && siteSummary.phase === "loading";
 
   /**
    * The "All time" anchor: `min(created_at, first_event_at)`, fetched from
@@ -386,14 +493,33 @@ export function IntervalProvider({
   // A supplied anchor is never pending, and slug-less surfaces without one
   // (the public share board before ADR-0044) have nothing to wait for.
   const rangePending =
-    interval === "all" &&
-    allAnchorMs === undefined &&
-    slug !== "" &&
-    (allAnchor === null || allAnchor.slug !== slug);
+    zonePending ||
+    (interval === "all" &&
+      allAnchorMs === undefined &&
+      slug !== "" &&
+      (allAnchor === null || allAnchor.slug !== slug));
 
   const value = React.useMemo(
-    () => ({ interval, setInterval, range, rangePending, intervals }),
-    [interval, setInterval, range, rangePending, intervals]
+    () => ({
+      interval,
+      setInterval,
+      range,
+      rangePending,
+      zonePending,
+      intervals,
+      timezone,
+      setTimezone,
+    }),
+    [
+      interval,
+      setInterval,
+      range,
+      rangePending,
+      zonePending,
+      intervals,
+      timezone,
+      setTimezone,
+    ]
   );
 
   return (
@@ -410,16 +536,22 @@ export function IntervalProvider({
  */
 export function useAnalyticsInterval(): IntervalContextValue {
   const context = React.useContext(IntervalContext);
-  const fallback = React.useMemo<IntervalContextValue>(
-    () => ({
+  const fallback = React.useMemo<IntervalContextValue>(() => {
+    const range = rangeForInterval(DEFAULT_INTERVAL);
+    return {
       interval: DEFAULT_INTERVAL,
       setInterval: () => {},
-      range: rangeForInterval(DEFAULT_INTERVAL),
-      // A static default window is never waiting on an anchor.
+      range,
+      // A static default window is never waiting on an anchor, and with no
+      // provider there is no site summary to wait on either.
       rangePending: false,
+      zonePending: false,
       intervals: INTERVALS,
-    }),
-    []
-  );
+      timezone: range.timezone,
+      // No provider, no range to move: a setter here would report success and
+      // change nothing.
+      setTimezone: () => {},
+    };
+  }, []);
   return context ?? fallback;
 }

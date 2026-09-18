@@ -5,6 +5,7 @@ import { useParams, usePathname, useRouter } from "next/navigation";
 import * as React from "react";
 import { GettingStarted } from "@/components/dashboard/getting-started";
 import { SiteSwitcher } from "@/components/dashboard/site-switcher";
+import { HEADER_CLOCK_SLOT_ID } from "@/components/dashboard/timezone-pill";
 import { UserMenu, type MenuUser } from "@/components/dashboard/user-menu";
 import { Logo } from "@/components/ui/logo";
 import { useAccountUsage } from "@seam/slots";
@@ -148,6 +149,17 @@ export function DashboardHeader() {
                 className="mx-1 h-4 w-px rotate-12 bg-border"
               />
               <SiteSwitcher currentSlug={currentSlug} onSelect={switchSite} />
+              {/* The overview's clock, painted in from inside that page's
+                  own provider (`HeaderTimezonePill`) and empty on every
+                  other screen, which `[&:empty]:hidden` keeps from taking
+                  space. Beside the site switcher for the share board's
+                  reason: the clock belongs next to whose board it is.
+                  Desktop only, since the header has no room for it on a
+                  phone. */}
+              <span
+                className="ml-1.5 hidden items-center lg:flex [&:empty]:hidden"
+                id={HEADER_CLOCK_SLOT_ID}
+              />
             </>
           )}
         </div>

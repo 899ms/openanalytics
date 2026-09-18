@@ -22,7 +22,7 @@ import type { QueryParameterValue } from '../../apps/query-gateway/src/clickhous
  *   2. **Range bounds** — the half-open `[from, to)` filter includes and excludes
  *      the right buckets.
  *   3. **Timezone day composition agrees with the UTC day rollup** — for a UTC
- *      request, `timeseries_day` (composed from `metrics_1h` via
+ *      request, `timeseries_day` (composed from `metrics_15m` via
  *      `toStartOfDay(bucket, tz)`) returns the same buckets and numbers as
  *      `timeseries_day_utc` (read straight from `metrics_1d`). This is the golden
  *      check behind the non-UTC composition path.
@@ -175,6 +175,10 @@ describeIfClickHouse('query gateway registry over the rollups', () => {
   const ISTANBUL = 'Europe/Istanbul'
   /** -03:00 all year — southern hemisphere, no DST since 2019. */
   const SAO_PAULO = 'America/Sao_Paulo'
+  /** +05:30 all year: local midnight is 18:30Z, in the middle of a UTC hour. */
+  const KOLKATA = 'Asia/Kolkata'
+  /** +05:45 all year: local midnight is 18:15Z, in the middle of a UTC hour. */
+  const KATHMANDU = 'Asia/Kathmandu'
 
   /**
    * Reads a returned bucket label as the UTC instant it claims to be, exactly as
@@ -183,6 +187,15 @@ describeIfClickHouse('query gateway registry over the rollups', () => {
    */
   const bucketMs = (row: Record<string, unknown>): number =>
     Date.parse(`${String(row['bucket']).replace(' ', 'T')}Z`)
+
+  /** A read straight off `events_raw` — the truth a rollup answer is checked against. */
+  const queryRows = async <T>(query: string): Promise<T[]> => {
+    const resultSet = await client.query({ query, format: 'JSONEachRow' })
+    return await resultSet.json<T>()
+  }
+
+  /** Both sides render a bucket as a UTC wall clock; only the precision differs. */
+  const clock = (value: unknown): string => String(value).replace('.000', '')
 
   /**
    * Every bucket a half-open range read returns must fall inside that range. A
@@ -613,7 +626,7 @@ describeIfClickHouse('query gateway registry over the rollups', () => {
   // A week is the one grain with no rollup behind it, and deliberately so: it
   // starts on the *request timezone's* Monday, which a stored UTC-week bucket
   // could only ever be right about for UTC. Both week operations therefore group
-  // at read time — the UTC one over metrics_1d, the local one over metrics_1h —
+  // at read time — the UTC one over metrics_1d, the local one over metrics_15m —
   // and the two things worth proving against a real ClickHouse are that the
   // Monday is the ISO Monday (mode 1, not the default Sunday) and that weekly
   // unique visitors come from merging the stored states rather than adding up
@@ -759,6 +772,114 @@ describeIfClickHouse('query gateway registry over the rollups', () => {
     expect(days.map((row) => String(row['bucket']))).toEqual(['2026-07-11 21:00:00.000'])
     expect(bucketMs(days[0] as Record<string, unknown>)).toBeLessThan(Date.parse(from))
   })
+
+  // -------------------------------------------------------------------------
+  // Quarter-hour offsets (ADR-0079, step 3).
+  //
+  // These zones' local midnight — 18:30Z for +05:30, 18:15Z for +05:45 — falls
+  // in the middle of a UTC hour, which is why every operation below refused
+  // them from M7 until the atom moved to fifteen minutes. What is asserted is
+  // not that the SQL runs: it is that its answer equals what `events_raw` says
+  // when grouped by the same local day. The seed puts a page view a minute
+  // either side of local midnight on every day, so an answer composed from hour
+  // buckets would put both on the same local day and this suite would say so.
+  // -------------------------------------------------------------------------
+
+  const QUARTER_RANGE = { from: '2026-08-09T18:30:00.000Z', to: '2026-08-12T18:30:00.000Z' }
+
+  it.each([
+    // `days` is how many local days the fixed range covers in this zone, and the
+    // two differ on purpose: the range's edges are quarter-hour instants, and
+    // +05:30 and +05:45 cut them into a different number of local days. Pinning
+    // it per zone keeps the seed itself under assertion rather than trusting
+    // whatever the query happens to return.
+    { tz: KOLKATA, before: '18:29:00.000', after: '18:31:00.000', days: 3 },
+    { tz: KATHMANDU, before: '18:14:00.000', after: '18:16:00.000', days: 4 },
+  ])(
+    'composes a correct $tz local day from the atom rollup',
+    async ({ tz, before, after, days }) => {
+      const site = randomUUID()
+      const rows: RawRow[] = []
+      for (const day of ['2026-08-09', '2026-08-10', '2026-08-11', '2026-08-12']) {
+        for (const [index, at] of [before, after].entries()) {
+          rows.push({
+            site_id: site,
+            event_id: randomUUID(),
+            batch_id: tz,
+            type: 'page_view',
+            occurred_at: `${day} ${at}`,
+            // Distinct either side of midnight, shared across days: a local day
+            // that swallowed its neighbour's edge row would show two visitors.
+            anonymous_id: `side${String(index)}`,
+            page_path: '/edge',
+          })
+        }
+        rows.push({
+          site_id: site,
+          event_id: randomUUID(),
+          batch_id: tz,
+          type: 'page_view',
+          occurred_at: `${day} 06:30:00.000`,
+          anonymous_id: 'noon',
+          page_path: '/noon',
+        })
+      }
+      await insertRaw(`quarter-${tz}`, rows)
+
+      // The truth, from the raw events: each one placed on its own local day, and
+      // that day named by its start instant rendered in UTC — the same label the
+      // gateway's `bucketUtc` produces.
+      const truth = await queryRows<{ bucket: string; pageviews: string; visitors: string }>(
+        `SELECT toString(toDateTime(toStartOfDay(toDateTime(occurred_at, 'UTC'), '${tz}'), 'UTC')) AS bucket,
+              count() AS pageviews,
+              uniqExact(anonymous_id) AS visitors
+         FROM events_raw
+        WHERE site_id = '${site}'
+          AND type = 'page_view'
+          AND occurred_at >= toDateTime64('2026-08-09 18:30:00.000', 3, 'UTC')
+          AND occurred_at <  toDateTime64('2026-08-12 18:30:00.000', 3, 'UTC')
+        GROUP BY bucket
+        ORDER BY bucket`,
+      )
+      // The edge rows of each day sit on opposite sides of a local midnight —
+      // the shape that makes the comparison below worth making at all.
+      expect(truth).toHaveLength(days)
+
+      const series = await run('analytics.timeseries_day', {
+        site_id: site,
+        ...QUARTER_RANGE,
+        timezone: tz,
+      })
+      expect(
+        series.map((row) => [
+          clock(row['bucket']),
+          Number(row['pageviews']),
+          Number(row['visitors']),
+        ]),
+      ).toEqual(
+        truth.map((row) => [clock(row.bucket), Number(row.pageviews), Number(row.visitors)]),
+      )
+
+      const expectedPageviews = truth.reduce((sum, row) => sum + Number(row.pageviews), 0)
+
+      // The range totals sum the same population the chart plots.
+      const [totals] = await run('analytics.overview_hour', {
+        site_id: site,
+        ...QUARTER_RANGE,
+        timezone: tz,
+      })
+      expect(Number(totals?.['pageviews'])).toBe(expectedPageviews)
+
+      // And the breakdown, which reads its own `*_15m` table rather than metrics.
+      const pages = await run('analytics.pages_hour', {
+        site_id: site,
+        ...QUARTER_RANGE,
+        limit: 10,
+        timezone: tz,
+      })
+      expect(pages.reduce((sum, row) => sum + Number(row['views']), 0)).toBe(expectedPageviews)
+    },
+  )
 
   it('returns a freshness watermark from the finest rollup', async () => {
     const [row] = await run('analytics.freshness', { site_id: siteA })

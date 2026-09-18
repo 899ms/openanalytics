@@ -13,6 +13,7 @@ import {
 } from "@/components/dashboard/realtime-card";
 import { RevenueCard } from "@/components/dashboard/revenue-card";
 import { ShareOverviewButton } from "@/components/dashboard/share-overview-button";
+import { HeaderTimezonePill } from "@/components/dashboard/timezone-pill";
 import { SourcesProvider } from "@/components/dashboard/sources-resource";
 import { TechCard } from "@/components/dashboard/tech-card";
 import { TopPagesCard } from "@/components/dashboard/top-pages-card";
@@ -31,6 +32,12 @@ export default async function OverviewPage({
   const { site } = await params;
   return (
     <IntervalProvider>
+    {/* The screen's clock, worn in the dashboard header beside the site
+        switcher: it is painted into the header's slot from inside this
+        provider, so the pick reaches every panel below. Only this screen
+        paints one. It shows the site's own zone by default, and changing it
+        changes this visit, never the site. */}
+    <HeaderTimezonePill />
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between gap-4">
         {/* Baseline group, not items-center: the badge is text against the

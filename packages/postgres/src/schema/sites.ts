@@ -66,13 +66,18 @@ export const sites = pgTable(
     // reporting amounts beside them are materialized into. Changing it is a
     // re-materialization of the facts, never a re-ingest.
     reportingCurrency: text('reporting_currency').notNull().default('USD'),
-    // The site's own reporting clock (migration 0039, ADR-0044 D4) — an
-    // *override* layered on the user preference ADR-0026 chose, never a
-    // replacement for it. Nullable with no default: NULL means "not configured;
-    // the viewer's clock applies", and a stored 'UTC' would be
-    // indistinguishable from an owner who genuinely chose UTC. Read by the
-    // public site-identity surface; no private query reads it.
-    reportingTimezone: text('reporting_timezone'),
+    // The site's own reporting clock (migration 0039, ADR-0044 D4; required by
+    // migration 0046, ADR-0079 D5). Every analytics window this product cuts —
+    // the private dashboard's, the share board's, every widget's — starts and
+    // ends on this zone's calendar, so a site without one is a site whose two
+    // readers see two different weeks. It was nullable while it was an override
+    // on the share board alone; the backfill in 0046 took the owner's own
+    // account zone (ADR-0026) for every site that had none and 'UTC' for the
+    // handful whose owner had never named a clock either.
+    //
+    // A reader who wants their own zone switches to it from the header pill.
+    // That is a view — per tab, per site — and it never reaches this column.
+    reportingTimezone: text('reporting_timezone').notNull().default('UTC'),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },

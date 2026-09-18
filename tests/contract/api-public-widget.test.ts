@@ -411,8 +411,11 @@ describe('the stored configuration is the whole request (ADR-0045, D10)', () => 
     expect(body.data.meta.timezone).toBe('Europe/Istanbul')
   })
 
-  it('falls back to UTC when the site has configured no clock', async () => {
-    stored.value = widgetRow({ reportingTimezone: null })
+  it('reports whatever clock the site is on, UTC included', async () => {
+    // There is no "no clock" case any longer (migration 0046, ADR-0079 D5): a
+    // site whose owner never named a zone carries 'UTC', which the route serves
+    // as the value it is rather than as a fallback it invented.
+    stored.value = widgetRow({ reportingTimezone: 'UTC' })
     const res = await get(buildApp())
     const body = (await res.json()) as { data: { meta: { timezone: string } } }
     expect(body.data.meta.timezone).toBe('UTC')

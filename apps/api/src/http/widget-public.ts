@@ -300,9 +300,10 @@ export function createWidgetPublicRoutes(deps: WidgetPublicDeps): Hono<Env> {
    * D10 rather than of this route:
    *
    * - `from`/`to`/`timezone` come from the stored range, never from a query
-   *   parameter. The zone is the **site's** (`UTC` when unset): a widget has no
-   *   viewer to ask, and rendering "today" in a stranger's laptop clock would
-   *   make one embed show two readers of the same page different numbers.
+   *   parameter. The zone is the **site's**, which every site has since
+   *   migration 0046 (ADR-0079 D5): a widget has no viewer to ask, and rendering
+   *   "today" in a stranger's laptop clock would make one embed show two readers
+   *   of the same page different numbers.
    * - `timeseries` is served at the grain its range fixes, so an embed with no
    *   interval picker never meets the ~1 440-bucket default ADR-0039 D8 closed.
    * - `sessions` passes **no** resolution, exactly as the share does: no
@@ -314,7 +315,7 @@ export function createWidgetPublicRoutes(deps: WidgetPublicDeps): Hono<Env> {
    *   a stranger's page is bytes nobody asked for.
    */
   async function historical(widget: ResolvedPublicWidget): Promise<unknown> {
-    const timezone = widget.reportingTimezone ?? 'UTC'
+    const timezone = widget.reportingTimezone
     // `range` is non-null on every surface but `realtime`, enforced by the
     // create/patch validator and by a column CHECK; the fallback keeps this
     // total rather than trusting two layers to have agreed.

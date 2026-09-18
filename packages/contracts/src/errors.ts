@@ -101,8 +101,11 @@ export const ERROR_CODES = [
   // `Retry-After` would be a lie.
   'RANGE_TOO_LARGE',
   // The requested range/timezone/grain combination has no rollup that can answer
-  // it honestly — a sub-hour timezone at hour/day grain (docs snapshot 02 §15).
-  // Client-correctable: pick minute grain, a shorter range, or a whole-hour zone.
+  // it honestly — a minute grain over a range far past the minute rollup's cap,
+  // or `resolution=day` on totals outside UTC (docs snapshot 02 §15).
+  // Client-correctable: pick a coarser grain or a shorter range. Since ADR-0079
+  // the timezone alone is no longer a cause: every offset in force is a whole
+  // number of the fifteen-minute atom the reads compose from.
   'RESOLUTION_NOT_AVAILABLE',
   // An event definition's name is already used on this site (ADR-0034, D3).
   // Its own code rather than IDEMPOTENCY_CONFLICT because the recovery is

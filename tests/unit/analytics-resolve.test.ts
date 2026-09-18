@@ -15,17 +15,23 @@ import {
  * operation choice and the requested-vs-effective snapping.
  */
 
-const NY = 'America/New_York' // whole-hour
-const KOLKATA = 'Asia/Kolkata' // sub-hour
+const NY = 'America/New_York' // whole-hour, DST
+const KOLKATA = 'Asia/Kolkata' // +05:30 all year
 const ISTANBUL = 'Europe/Istanbul' // whole-hour, +03:00 all year (no DST since 2016)
-const KATHMANDU = 'Asia/Kathmandu' // sub-hour, +05:45 all year
+const KATHMANDU = 'Asia/Kathmandu' // +05:45 all year
+// -10:40 until 1979-10-01 - the last offset the fifteen-minute atom cannot
+// express, and so the only zone/range pair these resolvers still refuse.
+const OLD_KIRITIMATI = 'Pacific/Kiritimati'
+const PRE_1979 = { from: '1975-01-01T00:00:00.000Z', to: '1975-01-08T00:00:00.000Z' }
 
 describe('floorToUtcBoundary', () => {
   it('floors to minute, hour and day', () => {
     expect(floorToUtcBoundary('2026-07-23T14:37:42.500Z', 'minute')).toBe(
       '2026-07-23T14:37:00.000Z',
     )
-    expect(floorToUtcBoundary('2026-07-23T14:37:42.500Z', 'hour')).toBe('2026-07-23T14:00:00.000Z')
+    expect(floorToUtcBoundary('2026-07-23T14:37:42.500Z', 'quarter')).toBe(
+      '2026-07-23T14:30:00.000Z',
+    )
     expect(floorToUtcBoundary('2026-07-23T14:37:42.500Z', 'day')).toBe('2026-07-23T00:00:00.000Z')
   })
 })
@@ -68,12 +74,35 @@ describe('resolveTimeseries', () => {
     expect(r.withTimezone).toBe(true)
   })
 
-  it('refuses a sub-hour zone at hour grain', () => {
+  it('serves a quarter-hour zone at hour grain, from the atom rollup', () => {
     const r = resolveTimeseries({
       from: '2026-07-16T00:00:00.000Z',
       to: '2026-07-23T00:00:00.000Z',
       timezone: KOLKATA,
     })
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    expect(r.operation).toBe('analytics.timeseries_hour')
+    expect(r.sourceRollup).toBe('15m')
+    expect(r.alignment).toBe('local')
+  })
+
+  it('snaps a quarter-hour range to the quarter, never to the hour', () => {
+    // The gateway checks the endpoints against the atom's own boundary, so a
+    // range floored to the hour would be a range the 15m operations reject.
+    const r = resolveTimeseries({
+      from: '2026-07-16T00:37:42.000Z',
+      to: '2026-07-23T09:52:00.000Z',
+      timezone: KOLKATA,
+    })
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    expect(r.effectiveFrom).toBe('2026-07-16T00:30:00.000Z')
+    expect(r.effectiveTo).toBe('2026-07-23T09:45:00.000Z')
+  })
+
+  it('still refuses an offset that is not a multiple of fifteen minutes', () => {
+    const r = resolveTimeseries({ ...PRE_1979, timezone: OLD_KIRITIMATI })
     expect(r.servable).toBe(false)
   })
 })
@@ -86,8 +115,8 @@ describe('resolveTimeseries', () => {
  * over a quarter, week buckets at all — but may not force one the range or
  * timezone cannot honestly carry, and the refusals must be exactly the ones the
  * automatic path already makes for the same (range, timezone) pair. So the
- * matrix below walks every grain against a UTC, a whole-hour and a sub-hour zone
- * at a short and a long span, and asserts the operation or the refusal.
+ * matrix below walks every grain against a UTC, a whole-hour and a quarter-hour
+ * zone at a short and a long span, and asserts the operation or the refusal.
  */
 describe('resolveTimeseries with a forced resolution', () => {
   /** Six hours: inside every span cap, shorter than a single day bucket. */
@@ -132,11 +161,11 @@ describe('resolveTimeseries with a forced resolution', () => {
     ).toBeNull()
   })
 
-  it('serves hour for UTC and whole-hour zones up to the 400d cap, never for a sub-hour zone', () => {
+  it('serves hour for every zone up to the 400d cap, quarter-hour offsets included', () => {
     for (const range of [SHORT, QUARTER]) {
       expect(operationFor(range, 'UTC', 'hour')).toBe('analytics.timeseries_hour')
       expect(operationFor(range, ISTANBUL, 'hour')).toBe('analytics.timeseries_hour')
-      expect(operationFor(range, KATHMANDU, 'hour')).toBeNull()
+      expect(operationFor(range, KATHMANDU, 'hour')).toBe('analytics.timeseries_hour')
     }
     // Past the hour rollup's own scan cap, no zone can force it.
     expect(operationFor(LONG, 'UTC', 'hour')).toBeNull()
@@ -150,11 +179,12 @@ describe('resolveTimeseries with a forced resolution', () => {
       expect(operationFor(range, 'UTC', 'day')).toBe('analytics.timeseries_day_utc')
     }
     expect(operationFor(QUARTER, ISTANBUL, 'day')).toBe('analytics.timeseries_day')
-    // A non-UTC day composes from metrics_1h, so it inherits the hour cap even
+    expect(operationFor(QUARTER, KATHMANDU, 'day')).toBe('analytics.timeseries_day')
+    // A non-UTC day composes from metrics_15m, so it inherits the atom cap even
     // though a UTC day of the same length is fine.
     expect(operationFor(LONG, ISTANBUL, 'day')).toBeNull()
+    expect(operationFor(LONG, KATHMANDU, 'day')).toBeNull()
     expect(operationFor(HUGE, 'UTC', 'day')).toBeNull()
-    expect(operationFor(QUARTER, KATHMANDU, 'day')).toBeNull()
   })
 
   it('serves week from the same sources as day, under the same class rules', () => {
@@ -172,25 +202,29 @@ describe('resolveTimeseries with a forced resolution', () => {
     if (!local.servable) return
     expect(local.operation).toBe('analytics.timeseries_week')
     expect(local.grain).toBe('week')
-    expect(local.sourceRollup).toBe('1h')
+    expect(local.sourceRollup).toBe('15m')
     expect(local.withTimezone).toBe(true)
 
-    // Same caps as the day family, and the same sub-hour refusal.
+    // Same caps as the day family, and a quarter-hour zone takes the same path.
     expect(operationFor(LONG, ISTANBUL, 'week')).toBeNull()
     expect(operationFor(LONG, 'UTC', 'week')).toBe('analytics.timeseries_week_utc')
     expect(operationFor(HUGE, 'UTC', 'week')).toBeNull()
     for (const range of [SHORT, QUARTER]) {
-      expect(operationFor(range, KATHMANDU, 'week')).toBeNull()
+      expect(operationFor(range, KATHMANDU, 'week')).toBe('analytics.timeseries_week')
     }
   })
 
   it('names the reason a forced grain was refused, precisely enough to act on', () => {
-    const subHour = resolveTimeseries({ ...QUARTER, timezone: KATHMANDU, resolution: 'week' })
-    expect(subHour.servable).toBe(false)
-    if (subHour.servable) return
-    expect(subHour.alignment).toBe('sub-hour')
-    expect(subHour.reason).toMatch(/week/)
-    expect(subHour.reason).toMatch(/sub-hour/)
+    const unservable = resolveTimeseries({
+      ...PRE_1979,
+      timezone: OLD_KIRITIMATI,
+      resolution: 'week',
+    })
+    expect(unservable.servable).toBe(false)
+    if (unservable.servable) return
+    expect(unservable.alignment).toBe('unservable')
+    expect(unservable.reason).toMatch(/week/)
+    expect(unservable.reason).toMatch(/multiple of fifteen minutes/)
 
     const tooLong = resolveTimeseries({ ...LONG, timezone: ISTANBUL, resolution: 'week' })
     expect(tooLong.servable).toBe(false)
@@ -222,8 +256,8 @@ describe('resolveTimeseries with a forced resolution', () => {
     })
     expect(local.servable).toBe(true)
     if (!local.servable) return
-    expect(local.effectiveFrom).toBe('2026-07-23T13:00:00.000Z')
-    expect(local.effectiveTo).toBe('2026-08-20T09:00:00.000Z')
+    expect(local.effectiveFrom).toBe('2026-07-23T13:30:00.000Z')
+    expect(local.effectiveTo).toBe('2026-08-20T09:15:00.000Z')
   })
 
   it('leaves the automatic path untouched when no resolution is asked for', () => {
@@ -264,7 +298,7 @@ describe('resolveTimeseries with a forced resolution', () => {
 })
 
 describe('resolveAggregate (overview & reports)', () => {
-  it('uses the hour rollup for a whole-hour zone of any length up to the cap', () => {
+  it('uses the atom rollup for a non-UTC zone of any length up to the cap', () => {
     const r = resolveAggregate({
       from: '2026-01-01T05:00:00.000Z',
       to: '2026-06-01T04:00:00.000Z',
@@ -272,7 +306,7 @@ describe('resolveAggregate (overview & reports)', () => {
     })
     expect(r.servable).toBe(true)
     if (!r.servable) return
-    expect(r.sourceRollup).toBe('1h')
+    expect(r.sourceRollup).toBe('15m')
     expect(overviewOperationFor(r.sourceRollup)).toBe('analytics.overview_hour')
     expect(reportOperationFor('pages', r.sourceRollup)).toBe('analytics.pages_hour')
   })
@@ -290,7 +324,7 @@ describe('resolveAggregate (overview & reports)', () => {
     expect(reportOperationFor('geography', r.sourceRollup)).toBe('analytics.geography_day')
   })
 
-  it('uses the hour rollup for a short UTC range', () => {
+  it('uses the atom rollup for a short UTC range', () => {
     const r = resolveAggregate({
       from: '2026-07-16T00:00:00.000Z',
       to: '2026-07-23T00:00:00.000Z',
@@ -298,18 +332,28 @@ describe('resolveAggregate (overview & reports)', () => {
     })
     expect(r.servable).toBe(true)
     if (!r.servable) return
-    expect(r.sourceRollup).toBe('1h')
+    expect(r.sourceRollup).toBe('15m')
   })
 
-  it('refuses a sub-hour zone (no aggregate rollup can honour its boundaries)', () => {
+  it('serves a quarter-hour zone from the atom rollup, under the same operations', () => {
     const r = resolveAggregate({
       from: '2026-07-16T00:00:00.000Z',
       to: '2026-07-23T00:00:00.000Z',
       timezone: KOLKATA,
     })
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    expect(r.sourceRollup).toBe('15m')
+    expect(r.alignment).toBe('local')
+    expect(overviewOperationFor(r.sourceRollup)).toBe('analytics.overview_hour')
+    expect(reportOperationFor('pages', r.sourceRollup)).toBe('analytics.pages_hour')
+  })
+
+  it('refuses an offset that is not a multiple of fifteen minutes', () => {
+    const r = resolveAggregate({ ...PRE_1979, timezone: OLD_KIRITIMATI })
     expect(r.servable).toBe(false)
     if (r.servable) return
-    expect(r.reason).toMatch(/sub-hour/)
+    expect(r.reason).toMatch(/multiple of fifteen minutes/)
   })
 
   it('refuses an inverted range', () => {
@@ -338,7 +382,7 @@ describe('resolveAggregate (overview & reports)', () => {
       const r = resolveAggregate({ ...QUARTER, timezone: 'UTC', resolution: 'hour' })
       expect(r.servable).toBe(true)
       if (!r.servable) return
-      expect(r.sourceRollup).toBe('1h')
+      expect(r.sourceRollup).toBe('15m')
       expect(overviewOperationFor(r.sourceRollup)).toBe('analytics.overview_hour')
     })
 
@@ -349,9 +393,24 @@ describe('resolveAggregate (overview & reports)', () => {
       expect(r.reason).toMatch(/UTC-day rollup/)
     })
 
-    it('still refuses a sub-hour zone whichever grain is forced', () => {
+    it('serves a forced hour for a quarter-hour zone, and still refuses a forced day', () => {
+      // The day refusal is not about the zone's offset - it is the UTC-day
+      // rollup's own bucketing, which no non-UTC request can read.
+      expect(resolveAggregate({ ...WEEK, timezone: KATHMANDU, resolution: 'hour' })).toMatchObject({
+        servable: true,
+        sourceRollup: '15m',
+      })
+      const day = resolveAggregate({ ...WEEK, timezone: KATHMANDU, resolution: 'day' })
+      expect(day.servable).toBe(false)
+      if (day.servable) return
+      expect(day.reason).toMatch(/UTC-day rollup/)
+    })
+
+    it('still refuses an offset that is not a multiple of fifteen minutes', () => {
       for (const resolution of ['hour', 'day'] as const) {
-        expect(resolveAggregate({ ...WEEK, timezone: KATHMANDU, resolution }).servable).toBe(false)
+        expect(
+          resolveAggregate({ ...PRE_1979, timezone: OLD_KIRITIMATI, resolution }).servable,
+        ).toBe(false)
       }
     })
 
@@ -371,17 +430,17 @@ describe('resolveAggregate (overview & reports)', () => {
       // Pinned to literals rather than compared against the same function with
       // `resolution: undefined` — that comparison would follow any regression.
       const week = resolveAggregate({ ...WEEK, timezone: 'UTC' })
-      expect(week).toMatchObject({ servable: true, grain: 'hour', sourceRollup: '1h' })
+      expect(week).toMatchObject({ servable: true, grain: 'hour', sourceRollup: '15m' })
       const quarter = resolveAggregate({ ...QUARTER, timezone: 'UTC' })
       expect(quarter).toMatchObject({ servable: true, grain: 'day', sourceRollup: '1d' })
       const quarterNy = resolveAggregate({ ...QUARTER, timezone: NY })
-      expect(quarterNy).toMatchObject({ servable: true, grain: 'hour', sourceRollup: '1h' })
+      expect(quarterNy).toMatchObject({ servable: true, grain: 'hour', sourceRollup: '15m' })
     })
   })
 })
 
 describe('resolveSession (finalized + provisional layer operations)', () => {
-  it('serves a short range at hour grain from the 1h layers', () => {
+  it('serves a short range at hour grain from the 15m layers', () => {
     const r = resolveSession({
       from: '2026-07-23T00:00:00.000Z',
       to: '2026-07-23T14:00:00.000Z',
@@ -392,7 +451,7 @@ describe('resolveSession (finalized + provisional layer operations)', () => {
     expect(r.grain).toBe('hour')
     expect(r.finalizedOperation).toBe('analytics.sessions_finalized_hour')
     expect(r.provisionalOperation).toBe('analytics.sessions_provisional_hour')
-    expect(r.splitUnit).toBe('hour')
+    expect(r.splitUnit).toBe('quarter')
     expect(r.withTimezone).toBe(true)
   })
 
@@ -411,7 +470,7 @@ describe('resolveSession (finalized + provisional layer operations)', () => {
     expect(r.withTimezone).toBe(false)
   })
 
-  it('composes local days from the 1h layers for a non-UTC long range, splitting on the hour', () => {
+  it('composes local days from the 15m layers for a non-UTC long range, splitting on the quarter', () => {
     const r = resolveSession({
       from: '2026-01-01T05:00:00.000Z',
       to: '2026-06-01T04:00:00.000Z',
@@ -422,18 +481,27 @@ describe('resolveSession (finalized + provisional layer operations)', () => {
     expect(r.grain).toBe('day')
     expect(r.finalizedOperation).toBe('analytics.sessions_finalized_day_local')
     expect(r.provisionalOperation).toBe('analytics.sessions_provisional_day_local')
-    expect(r.splitUnit).toBe('hour')
+    expect(r.splitUnit).toBe('quarter')
     expect(r.withTimezone).toBe(true)
   })
 
-  it('refuses a sub-hour zone: session metrics have no minute rollup to fall back to', () => {
+  it('serves a quarter-hour zone: the session rollups have a 15m grain now', () => {
     const r = resolveSession({
       from: '2026-07-23T00:00:00.000Z',
       to: '2026-07-23T06:00:00.000Z',
       timezone: KOLKATA,
     })
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    expect(r.grain).toBe('hour')
+    expect(r.finalizedOperation).toBe('analytics.sessions_finalized_hour')
+    expect(r.splitUnit).toBe('quarter')
+  })
+
+  it('still refuses an offset that is not a multiple of fifteen minutes', () => {
+    const r = resolveSession({ ...PRE_1979, timezone: OLD_KIRITIMATI })
     expect(r.servable).toBe(false)
     if (r.servable) return
-    expect(r.reason).toMatch(/sub-hour|minute rollup/)
+    expect(r.reason).toMatch(/multiple of fifteen minutes/)
   })
 })

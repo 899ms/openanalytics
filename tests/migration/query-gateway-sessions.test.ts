@@ -706,7 +706,7 @@ describeIfClickHouse('session-read and funnel gateway operations', () => {
 
     // Bucket 09:00 — generation 1 then a superseding generation 2 (a late pageview
     // flipped a bounce). Bucket 10:00 — one generation. Site B bucket must not leak.
-    await insertRollup('session_rollups_1h', {
+    await insertRollup('session_rollups_15m', {
       bucket_start: '2026-07-01 09:00:00',
       generation: 1,
       sessions: 3,
@@ -716,7 +716,7 @@ describeIfClickHouse('session-read and funnel gateway operations', () => {
       total_session_duration_ms: 90_000,
       total_active_duration_ms: 30_000,
     })
-    await insertRollup('session_rollups_1h', {
+    await insertRollup('session_rollups_15m', {
       bucket_start: '2026-07-01 09:00:00',
       generation: 2,
       sessions: 3,
@@ -726,7 +726,7 @@ describeIfClickHouse('session-read and funnel gateway operations', () => {
       total_session_duration_ms: 120_000,
       total_active_duration_ms: 48_000,
     })
-    await insertRollup('session_rollups_1h', {
+    await insertRollup('session_rollups_15m', {
       bucket_start: '2026-07-01 10:00:00',
       generation: 1,
       sessions: 2,
@@ -737,7 +737,7 @@ describeIfClickHouse('session-read and funnel gateway operations', () => {
       total_active_duration_ms: 24_000,
     })
     await client.insert({
-      table: 'session_rollups_1h',
+      table: 'session_rollups_15m',
       values: [
         {
           site_id: siteB,
@@ -844,7 +844,7 @@ describeIfClickHouse('session-read and funnel gateway operations', () => {
   it('finalized session buckets carry the bucket instant in UTC', async () => {
     const site = randomUUID()
     await client.insert({
-      table: 'session_rollups_1h',
+      table: 'session_rollups_15m',
       values: [
         {
           site_id: site,
@@ -871,6 +871,61 @@ describeIfClickHouse('session-read and funnel gateway operations', () => {
     expect(rows.map((row) => String(row['bucket']))).toEqual(['2026-07-12 10:00:00.000'])
     expect(Number(rows[0]?.['sessions'])).toBe(4)
   })
+
+  // -------------------------------------------------------------------------
+  // Quarter-hour offsets (ADR-0079, step 3).
+  //
+  // Kolkata's local midnight is 18:30Z and Kathmandu's is 18:15Z, so a local day
+  // boundary falls inside a UTC hour. Composing these from `session_rollups_1h`
+  // was impossible — the hour bucket straddling midnight would have to be split
+  // — and it is what the refusal in `resolveSession` existed for. With the 15m
+  // grain the boundary is a bucket boundary, and these assert that the buckets
+  // land on the side of midnight they belong to rather than merely that the
+  // query returns rows.
+  // -------------------------------------------------------------------------
+
+  it.each([
+    { tz: 'Asia/Kolkata', before: '18:15:00', after: '18:30:00', midnight: '18:30:00.000' },
+    { tz: 'Asia/Kathmandu', before: '18:00:00', after: '18:15:00', midnight: '18:15:00.000' },
+  ])(
+    'splits a $tz local day at its own midnight, from the 15m finalized layer',
+    async ({ tz, before, after, midnight }) => {
+      const site = randomUUID()
+      const bucket = (bucketStart: string, sessions: number) => ({
+        site_id: site,
+        bucket_start: bucketStart,
+        generation: 1,
+        sessions,
+        engaged_sessions: sessions,
+        bounced_sessions: 0,
+        pageviews: sessions,
+        total_session_duration_ms: 1_000 * sessions,
+        total_active_duration_ms: 500 * sessions,
+        computed_at: '2026-08-11 00:00:00.000',
+      })
+      await client.insert({
+        table: 'session_rollups_15m',
+        values: [
+          // The last quarter-hour of the local day, and the first of the next.
+          bucket(`2026-08-10 ${before}`, 2),
+          bucket(`2026-08-10 ${after}`, 5),
+        ],
+        format: 'JSONEachRow',
+      })
+
+      const rows = await run('analytics.sessions_finalized_day_local', {
+        site_id: site,
+        from: '2026-08-09T18:15:00.000Z',
+        to: '2026-08-11T18:15:00.000Z',
+        timezone: tz,
+      })
+      // Two local days, not one: the bucket before midnight belongs to the day
+      // that is ending, the bucket at midnight to the day that is starting. An
+      // hour-grain source would have put both in the same bucket.
+      expect(rows.map((row) => Number(row['sessions']))).toEqual([2, 5])
+      expect(String(rows[1]?.['bucket'])).toBe(`2026-08-10 ${midnight}`)
+    },
+  )
 
   it('funnel operation matches the pure computeFunnel reference on the same events', async () => {
     const funnelSite = randomUUID()

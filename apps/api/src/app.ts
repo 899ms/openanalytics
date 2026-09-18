@@ -18,6 +18,7 @@ import type { CredentialVault, ObjectStorage, OpenAiChatClient } from '@openanal
 import type { Logger, Metrics, ServiceMetadata } from '@openanalytics/observability'
 import { createServiceApp } from '@openanalytics/observability/hono'
 import {
+  getSiteReportingTimezone,
   markUserEmailVerified,
   resolveOAuthAccessToken,
   type Database,
@@ -734,6 +735,9 @@ export function createApp(deps: AppDeps) {
         authorizationServer: `${apiOrigin}/api/auth`,
         // The read arm's own resolver, so "is this token live" has one answer.
         verifyBearer: async (token) => resolveOAuthAccessToken(readDb, token),
+        // The default calendar a ranged tool reads on (ADR-0079 D5), scoped to
+        // the caller's own membership.
+        siteTimezone: async (params) => getSiteReportingTimezone(readDb, params),
         logger: deps.logger,
       }),
     )

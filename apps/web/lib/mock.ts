@@ -54,8 +54,9 @@ export const MOCK_SITES: SiteSummary[] = [
     ingest_grace_until: null,
     retention_deadline: null,
     reporting_currency: "USD",
-    // The owner picked a reporting clock (ADR-0044). The other two mocks leave
-    // it null, which is the default and means "the viewer's own clock applies".
+    // Every site has a reporting clock (ADR-0044, required by ADR-0079 D5).
+    // This one's owner picked it; the two below carry the 'UTC' a site gets
+    // when nobody ever named one.
     reporting_timezone: "Europe/Istanbul",
   },
   {
@@ -72,7 +73,7 @@ export const MOCK_SITES: SiteSummary[] = [
     ingest_grace_until: null,
     retention_deadline: null,
     reporting_currency: "USD",
-    reporting_timezone: null,
+    reporting_timezone: "UTC",
   },
   {
     site_id: "019f8740-2b3c-7a10-9c1d-4e5f6a7b8d02",
@@ -89,7 +90,7 @@ export const MOCK_SITES: SiteSummary[] = [
     ingest_grace_until: null,
     retention_deadline: null,
     reporting_currency: "USD",
-    reporting_timezone: null,
+    reporting_timezone: "UTC",
   },
 ];
 

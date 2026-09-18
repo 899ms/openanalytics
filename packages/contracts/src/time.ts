@@ -62,6 +62,31 @@ export function isValidTimezone(value: string): boolean {
 }
 
 /**
+ * UTC offset, in minutes, that `timezone` had at `instant`.
+ *
+ * Read from the runtime's own timezone database via `longOffset` ("GMT+05:45"),
+ * so DST and historical shifts are honoured rather than approximated. `GMT`
+ * with no suffix is offset zero.
+ *
+ * It lives in the contract package rather than beside the resolver that grew it
+ * because more than one tree needs the same arithmetic and only this one is
+ * importable by all of them: the resolver (`@openanalytics/domain`) and the
+ * dashboard, which may import nothing else (D-218).
+ * One implementation, so "what offset is this zone on" cannot get two answers.
+ */
+export function timezoneOffsetMinutes(instant: Date, timezone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    timeZoneName: 'longOffset',
+  }).formatToParts(instant)
+  const name = parts.find((part) => part.type === 'timeZoneName')?.value ?? 'GMT'
+  const match = /GMT([+-])(\d{2}):(\d{2})/.exec(name)
+  if (!match) return 0
+  const sign = match[1] === '-' ? -1 : 1
+  return sign * (Number(match[2]) * 60 + Number(match[3]))
+}
+
+/**
  * Half-open UTC range.
  *
  * `to` is exclusive: an event at exactly `to` belongs to the next range. This is

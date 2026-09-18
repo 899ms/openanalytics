@@ -532,19 +532,32 @@ describe('binding keeps values out of the statement and enforces the range', () 
   })
 
   it('rejects a range whose endpoints do not align to the rollup bucket boundary', () => {
-    const hour = findOperation('analytics.overview_hour')
-    // 00:15 is not a UTC-hour boundary — a sub-hour timezone would land here.
+    const quarter = findOperation('analytics.overview_hour')
+    // 00:07 is not a UTC quarter-hour boundary — the atom rollup buckets at
+    // :00/:15/:30/:45 and nothing finer, so this range has no honest answer.
     expect(() =>
-      hour?.bindParams({
+      quarter?.bindParams({
         site_id: SITE,
-        from: '2026-07-01T00:15:00.000Z',
+        from: '2026-07-01T00:07:00.000Z',
         to: DAY_RANGE.to,
         ...NO_IMPORT,
       }),
     ).toThrow(ApiError)
 
+    // 00:15 IS a quarter-hour boundary, and since ADR-0079 step 3 it is the
+    // shape a +05:30 zone's local midnight actually snaps to. The old hour
+    // check rejected it; accepting it is the whole point of the step.
+    expect(() =>
+      quarter?.bindParams({
+        site_id: SITE,
+        from: '2026-07-01T00:15:00.000Z',
+        to: DAY_RANGE.to,
+        ...NO_IMPORT,
+      }),
+    ).not.toThrow()
+
     const day = findOperation('analytics.overview_day')
-    // 06:00 is a valid hour boundary but not a UTC-day boundary.
+    // 06:00 is a valid quarter-hour boundary but not a UTC-day boundary.
     expect(() =>
       day?.bindParams({
         site_id: SITE,
@@ -955,9 +968,10 @@ describe('timezone binding', () => {
     expect(local?.sql).toContain(
       "toDateTime64(toDateTime(toStartOfWeek(t.bucket_start, 1, {tz:String}), {tz:String}), 3, 'UTC')",
     )
-    // A local Monday midnight is an hour boundary, never a UTC-day one, so the
-    // local week composes from metrics_1h — the same source the local day uses.
-    expect(local?.sql).toContain('FROM metrics_1h')
+    // A local Monday midnight is a quarter-hour boundary, never a UTC-day one,
+    // so the local week composes from metrics_15m — the same source the local
+    // day uses.
+    expect(local?.sql).toContain('FROM metrics_15m')
 
     for (const operation of [utc, local]) {
       // The point of grouping a week at read time rather than adding seven day

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { isValidTimezone, type Resolution } from '@openanalytics/contracts'
+import { isValidTimezone, timezoneOffsetMinutes, type Resolution } from '@openanalytics/contracts'
 
 /**
  * Dashboard rollup selection (docs snapshot 02 §15 "Dashboard query rule",
@@ -17,33 +17,40 @@ import { isValidTimezone, type Resolution } from '@openanalytics/contracts'
  * ### The timezone problem
  *
  * Every rollup buckets on `occurred_at` at **UTC** boundaries (migrations
- * 0003–0012): `metrics_1d.bucket_start` is a UTC midnight, `*_1h.bucket_start`
- * a UTC hour. A site's "day", however, begins at midnight in its own IANA
- * timezone. So a non-UTC day cannot be read from `*_1d` — its UTC-day buckets
- * straddle two local days. It must be composed from `*_1h` with ClickHouse's
- * timezone-aware `toStartOfDay(bucket_start, {tz:String})`, which also produces
- * the correct 23-/25-hour days across a DST transition.
+ * 0003–0012, 0025–0026): `metrics_1d.bucket_start` is a UTC midnight,
+ * `*_15m.bucket_start` a UTC quarter-hour. A site's "day", however, begins at
+ * midnight in its own IANA timezone. So a non-UTC day cannot be read from
+ * `*_1d` — its UTC-day buckets straddle two local days. It must be composed
+ * from `*_15m` with ClickHouse's timezone-aware
+ * `toStartOfDay(bucket_start, {tz:String})`, which also produces the correct
+ * 23-/25-hour days across a DST transition.
  *
- * That composition only works when each UTC **hour** belongs wholly to one
- * local day — i.e. when the zone's offset is a whole number of hours. Zones
- * with a sub-hour offset (Asia/Kolkata +05:30, Asia/Kathmandu +05:45,
- * Australia/Lord_Howe +10:30) have a local-midnight — and every local hour
- * boundary — that falls in the *middle* of a UTC hour, so no `*_1h` bucket can
- * be split to honour it. The minute rollup (`metrics_1m`) aligns to any
- * whole-minute offset and every IANA offset is a whole number of minutes, so it
- * could compose sub-hour local hours/days — but only `metrics` has a minute
- * rollup, and a minute scan over a long range is not affordable. Rather than
- * return misattributed buckets, this function reports such combinations as
- * **not servable** and names why; the caller surfaces that instead of a wrong
- * number.
+ * That composition only works when each stored bucket belongs wholly to one
+ * local day — i.e. when the zone's offset is a whole number of bucket widths.
+ * With the hour atom this file was built on, zones on a sub-hour offset
+ * (Asia/Kolkata +05:30, Asia/Kathmandu +05:45, Australia/Lord_Howe +10:30) had
+ * a local midnight — and every local hour boundary — falling in the *middle* of
+ * a UTC hour, and were refused rather than misattributed. ADR-0079 moved the
+ * atom to fifteen minutes, which is the coarsest grain every IANA offset in
+ * force since 1979 is a multiple of, so those zones compose exactly like any
+ * other and are served by the same path.
+ *
+ * What remains refusable is an offset that is not a multiple of fifteen minutes
+ * at all. The last one in the tz database ended on 1979-10-01, when
+ * Pacific/Kiritimati left −10:40, so only a historical range can reach this
+ * class — but the rule is enforced rather than assumed, because a range that
+ * dips into such an offset would otherwise be answered with buckets split down
+ * the middle. Rather than return misattributed buckets, this function reports
+ * such combinations as **not servable** and names why; the caller surfaces that
+ * instead of a wrong number.
  *
  * The rule this encodes, therefore:
  *
- * | timezone class | minute grain | hour grain | day grain            |
- * |----------------|--------------|------------|----------------------|
- * | UTC            | `metrics_1m` | `*_1h`     | `*_1d` (direct)      |
- * | whole-hour     | `metrics_1m` | `*_1h`     | `*_1h` via toStartOfDay(tz) |
- * | sub-hour       | `metrics_1m` | not served | not served           |
+ * | timezone class | minute grain | hour grain | day grain                    |
+ * |----------------|--------------|------------|------------------------------|
+ * | UTC            | `metrics_1m` | `*_15m`    | `*_1d` (direct)              |
+ * | local          | `metrics_1m` | `*_15m`    | `*_15m` via toStartOfDay(tz) |
+ * | unservable     | `metrics_1m` | not served | not served                   |
  *
  * Timezone is never spliced into SQL here: this module only *classifies* the
  * zone and picks a resolution. The gateway binds the zone as a `{tz:String}`
@@ -51,15 +58,26 @@ import { isValidTimezone, type Resolution } from '@openanalytics/contracts'
  */
 
 /** Which rollup table family answers the query. */
-export const ROLLUP_RESOLUTIONS = ['1m', '1h', '1d'] as const
+export const ROLLUP_RESOLUTIONS = ['1m', '15m', '1d'] as const
 export type RollupResolution = (typeof ROLLUP_RESOLUTIONS)[number]
 
-/** How the requested zone's UTC offset aligns to rollup bucket boundaries. */
-export const TIMEZONE_ALIGNMENTS = ['utc', 'whole-hour', 'sub-hour'] as const
+/**
+ * How the requested zone's UTC offset aligns to rollup bucket boundaries
+ * (ADR-0079, D4).
+ *
+ * `utc` is a zero offset throughout the range and reads the UTC-day rollup
+ * directly; `local` is any other offset the fifteen-minute atom can compose;
+ * `unservable` is an offset that is not a multiple of fifteen minutes, which
+ * no bucket in any family can be split to honour.
+ */
+export const TIMEZONE_ALIGNMENTS = ['utc', 'local', 'unservable'] as const
 export type TimezoneAlignment = (typeof TIMEZONE_ALIGNMENTS)[number]
 
 const MS_PER_HOUR = 3_600_000
 const MS_PER_DAY = 86_400_000
+
+/** The atom grain, in minutes: every servable offset is a multiple of it. */
+const ATOM_GRAIN_MINUTES = 15
 
 /**
  * Engineering values for rollup selection (docs snapshot 02 §5: typed config,
@@ -86,9 +104,13 @@ export const analyticsQueryConfigSchema = z
     /** Hard cap on a minute-rollup scan, independent of grain selection. */
     MAX_SPAN_MINUTE_HOURS: z.coerce.number().int().min(1).max(336).default(48),
     /**
-     * Hard cap on an hour-rollup scan. It must clear a full year, because a
-     * non-UTC "1 year" day chart composes its days from `*_1h` (see the class
-     * table above) — 366 days × 24 = 8 784 hour buckets per series.
+     * Hard cap on the atom-rollup scan. It must clear a full year, because a
+     * non-UTC "1 year" day chart composes its days from `*_15m` (see the class
+     * table above) — 366 days × 96 = 35 136 quarter-hour buckets per series.
+     *
+     * The env key still says `HOUR` because it is a deployed name and ADR-0079
+     * changed the atom, not the operator's configuration surface; a rename
+     * would silently drop whatever a running `.env` already sets.
      */
     MAX_SPAN_HOUR_DAYS: z.coerce.number().int().min(1).max(1_000).default(400),
     /** Hard cap on a day-rollup scan — the "all time" ceiling for UTC sites. */
@@ -177,37 +199,29 @@ export const DEFAULT_ANALYTICS_QUERY_CONFIG: AnalyticsQueryConfig = loadAnalytic
 /**
  * UTC offset, in minutes, that `timezone` had at `instant`.
  *
- * Read from the runtime's own timezone database via `longOffset` ("GMT+05:45"),
- * so DST and historical shifts are honoured rather than approximated. `GMT`
- * with no suffix is offset zero.
+ * Re-exported rather than implemented: the arithmetic moved to
+ * `@openanalytics/contracts` when the dashboard needed the same `% 60` rule and
+ * may import nothing else (D-218). This name stays because it is the one every
+ * caller in this package and the widget range builder already use.
  */
-export function timezoneOffsetMinutes(instant: Date, timezone: string): number {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    timeZoneName: 'longOffset',
-  }).formatToParts(instant)
-  const name = parts.find((part) => part.type === 'timeZoneName')?.value ?? 'GMT'
-  const match = /GMT([+-])(\d{2}):(\d{2})/.exec(name)
-  if (!match) return 0
-  const sign = match[1] === '-' ? -1 : 1
-  return sign * (Number(match[2]) * 60 + Number(match[3]))
-}
+export { timezoneOffsetMinutes }
 
 /**
  * Interior sampling step for {@link classifyTimezoneAlignment}.
  *
- * Endpoints alone are not enough: a range whose two ends share a whole-hour
+ * Endpoints alone are not enough: a range whose two ends share a servable
  * offset can still enclose a stretch on a *different* offset. Australia/Lord_Howe
- * is the worst case — it runs +11:00 in its summer DST and +10:30 (sub-hour) for
- * the ~six standard-time months between. A range from one summer to the next
- * samples +11:00 at both ends and would be called `whole-hour`, then compose
- * local days from the hour rollup across a stretch the hour rollup cannot honour.
+ * is the worst case — it runs +11:00 in its summer DST and +10:30 for the ~six
+ * standard-time months between. Both are multiples of fifteen minutes, so both
+ * are servable today; the walk is what keeps that a *measured* fact rather than
+ * an assumption, and it is the same walk that catches a historical range dipping
+ * through an offset the atom cannot express.
  *
  * So the interior is walked too. A daily step catches any offset regime that
- * lasts a day or more, which every real IANA sub-hour period does (the shortest
+ * lasts a day or more, which every real IANA offset period does (the shortest
  * is months). The walk is bounded to {@link MAX_ALIGNMENT_SAMPLES} `Intl` lookups
  * regardless of range length: up to that many days it steps daily; past it (only
- * for ranges longer than ~two years, which are already beyond the hour-rollup
+ * for ranges longer than ~two years, which are already beyond the atom-rollup
  * composed-day domain and refused by the span caps) it coarsens the step to stay
  * cheap. The step is not a correctness knob a caller sets — it is fixed here so
  * the classification a caller gets is the same one the gateway's range check
@@ -217,9 +231,9 @@ const ALIGNMENT_SAMPLE_STEP_MS = MS_PER_DAY
 
 /**
  * Ceiling on interior samples, so a pathological multi-decade range cannot turn
- * classification into thousands of `Intl` lookups. Chosen above the hour-rollup
- * cap (400 days) so every range that can actually be composed from the hour
- * rollup — the only case where a missed interior sub-hour stretch would matter —
+ * classification into thousands of `Intl` lookups. Chosen above the atom-rollup
+ * cap (400 days) so every range that can actually be composed from the atom
+ * rollup — the only case where a missed interior offset stretch would matter —
  * is still sampled at full daily granularity.
  */
 const MAX_ALIGNMENT_SAMPLES = 750
@@ -228,12 +242,12 @@ const MAX_ALIGNMENT_SAMPLES = 750
  * How the zone aligns to UTC bucket boundaries across the whole of `[from, to)`.
  *
  * The offset is sampled at both ends **and** at every interior day boundary, so a
- * range that dips through a sub-hour offset in its middle (Lord Howe's +10:30
+ * range that dips through a different offset in its middle (Lord Howe's +10:30
  * between two +11:00 summers) is classified by its worst sample, not by its ends.
- * `utc` requires a zero offset at every sample; `whole-hour` requires every
- * sample to be a whole number of hours; anything else is `sub-hour`. A worse
- * sample can only *demote* the result (utc → whole-hour → sub-hour), so the walk
- * can stop the moment it sees a sub-hour offset.
+ * `utc` requires a zero offset at every sample; `local` requires every sample to
+ * be a whole number of fifteen-minute atoms; anything else is `unservable`. A
+ * worse sample can only *demote* the result (utc → local → unservable), so the
+ * walk can stop the moment it sees an offset the atom cannot express.
  */
 export function classifyTimezoneAlignment(
   from: Date,
@@ -258,12 +272,12 @@ export function classifyTimezoneAlignment(
   for (let at = fromMs; ; at += step) {
     const sampleAt = at > toMs ? toMs : at
     const offset = timezoneOffsetMinutes(new Date(sampleAt), timezone)
-    if (offset % 60 !== 0) return 'sub-hour'
+    if (offset % ATOM_GRAIN_MINUTES !== 0) return 'unservable'
     if (offset !== 0) sawNonZero = true
     if (sampleAt === toMs) break
   }
 
-  return sawNonZero ? 'whole-hour' : 'utc'
+  return sawNonZero ? 'local' : 'utc'
 }
 
 export interface ResolutionInput {
@@ -286,8 +300,12 @@ export interface QueryResolution {
   readonly sourceRollup: RollupResolution
   /**
    * Whether a day-grain answer must be composed with `toStartOfDay(bucket, tz)`
-   * over an hour rollup (`true`) rather than read straight from a day rollup
+   * over the atom rollup (`true`) rather than read straight from a day rollup
    * (`false`). Only meaningful when `grain === 'day'`.
+   *
+   * The name predates ADR-0079, when the atom was an hour; it still names the
+   * same decision — compose a local day from sub-day buckets, or read the
+   * UTC-day table — and every caller of it reads that meaning.
    */
   readonly composeDayFromHour: boolean
   readonly timezoneAlignment: TimezoneAlignment
@@ -381,10 +399,10 @@ export function chooseResolution(
   }
 
   if (grain === 'hour') {
-    if (alignment === 'sub-hour') {
+    if (alignment === 'unservable') {
       return notServable(
-        'hour grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups; ' +
-          'use minute grain for a shorter range',
+        'hour grain cannot be aligned to a timezone offset that is not a multiple of fifteen ' +
+          'minutes; use minute grain for a shorter range',
       )
     }
     if (spanDays > config.MAX_SPAN_HOUR_DAYS) {
@@ -394,7 +412,7 @@ export function chooseResolution(
     }
     return {
       grain,
-      sourceRollup: '1h',
+      sourceRollup: '15m',
       composeDayFromHour: false,
       timezoneAlignment: alignment,
       requestedSpanMs: spanMs,
@@ -403,9 +421,9 @@ export function chooseResolution(
   }
 
   // grain === 'day'
-  if (alignment === 'sub-hour') {
+  if (alignment === 'unservable') {
     return notServable(
-      'day grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups',
+      'day grain cannot be aligned to a timezone offset that is not a multiple of fifteen minutes',
     )
   }
 
@@ -426,9 +444,9 @@ export function chooseResolution(
     }
   }
 
-  // whole-hour, non-UTC: compose local days from the hour rollup so DST 23/25h
-  // days are correct. The day rollup would be UTC-day-bucketed and therefore
-  // wrong for this zone.
+  // Non-UTC: compose local days from the atom rollup so DST 23/25h days are
+  // correct. The day rollup would be UTC-day-bucketed and therefore wrong for
+  // this zone.
   if (spanDays > config.MAX_SPAN_HOUR_DAYS) {
     return notServable(
       `day grain for a non-UTC timezone composes from the hour rollup, and span ${spanDays.toFixed(
@@ -438,7 +456,7 @@ export function chooseResolution(
   }
   return {
     grain,
-    sourceRollup: '1h',
+    sourceRollup: '15m',
     composeDayFromHour: true,
     timezoneAlignment: alignment,
     requestedSpanMs: spanMs,
@@ -476,13 +494,13 @@ export function chooseResolution(
  * | timezone class | week source                                    |
  * |----------------|------------------------------------------------|
  * | UTC            | `metrics_1d`, grouped by `toStartOfWeek(…, 1)` |
- * | whole-hour     | `metrics_1h`, grouped by the local Monday      |
- * | sub-hour       | not served — same reason day is not            |
+ * | local          | `metrics_15m`, grouped by the local Monday     |
+ * | unservable     | not served — same reason day is not            |
  *
  * A UTC week always starts on a UTC midnight, so the day rollup's buckets nest
  * inside it exactly; a non-UTC week starts on a local midnight, which only the
- * hour rollup can honour, and only when the zone's offset is a whole number of
- * hours. Grouping (rather than summing seven day-buckets client-side) is also
+ * atom rollup can honour, and only when the zone's offset is a whole number of
+ * fifteen-minute atoms. Grouping (rather than summing seven day-buckets client-side) is also
  * what keeps weekly unique visitors correct: the read merges the stored
  * `uniq` states across the whole week instead of adding seven overlapping
  * counts.
@@ -554,10 +572,10 @@ export function resolveForcedGrain(
   }
 
   if (requested === 'hour') {
-    if (alignment === 'sub-hour') {
+    if (alignment === 'unservable') {
       return refuse(
-        'hour grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups; ' +
-          'use minute grain for a shorter range',
+        'hour grain cannot be aligned to a timezone offset that is not a multiple of fifteen ' +
+          'minutes; use minute grain for a shorter range',
       )
     }
     if (spanDays > config.MAX_SPAN_HOUR_DAYS) {
@@ -565,13 +583,14 @@ export function resolveForcedGrain(
         `hour grain span ${spanDays.toFixed(1)}d exceeds the ${config.MAX_SPAN_HOUR_DAYS}d hour-rollup cap`,
       )
     }
-    return serve('1h')
+    return serve('15m')
   }
 
   // day and week share their sources and therefore their class rules.
-  if (alignment === 'sub-hour') {
+  if (alignment === 'unservable') {
     return refuse(
-      `${requested} grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups`,
+      `${requested} grain cannot be aligned to a timezone offset that is not a multiple of ` +
+        'fifteen minutes',
     )
   }
 
@@ -586,8 +605,8 @@ export function resolveForcedGrain(
     return serve('1d')
   }
 
-  // whole-hour, non-UTC: local days (and therefore local weeks) start on an hour
-  // boundary the day rollup cannot express, so compose from `*_1h`.
+  // Non-UTC: local days (and therefore local weeks) start on a boundary the day
+  // rollup cannot express, so compose from `*_15m`.
   if (spanDays > config.MAX_SPAN_HOUR_DAYS) {
     return refuse(
       `${requested} grain for a non-UTC timezone composes from the hour rollup, and span ${spanDays.toFixed(
@@ -595,7 +614,7 @@ export function resolveForcedGrain(
       )}d exceeds the ${config.MAX_SPAN_HOUR_DAYS}d hour-rollup cap`,
     )
   }
-  return serve('1h', requested === 'day')
+  return serve('15m', requested === 'day')
 }
 
 /** A half-open UTC range as ISO-8601 instants. */
@@ -641,7 +660,25 @@ export function isUtcMinuteAligned(instant: string): boolean {
   return !Number.isNaN(ms) && ms % 60_000 === 0
 }
 
-/** True when the instant lands exactly on a UTC hour. */
+/**
+ * True when the instant lands exactly on a UTC quarter-hour — the atom rollup's
+ * own bucket boundary (ADR-0079), and the alignment every non-UTC read is
+ * snapped to and checked against.
+ */
+export function isUtcQuarterAligned(instant: string): boolean {
+  const ms = Date.parse(instant)
+  return !Number.isNaN(ms) && ms % (ATOM_GRAIN_MINUTES * 60_000) === 0
+}
+
+/**
+ * True when the instant lands exactly on a UTC hour.
+ *
+ * No read has been routed to an hour boundary since ADR-0079 step 3 moved the
+ * atom to fifteen minutes, and step 4 retired the grain itself: the `*_1h`
+ * tables are frozen history now and nothing writes them. Kept because the
+ * predicate is part of this package's public surface and a whole-hour instant
+ * is still a meaningful thing to ask about.
+ */
 export function isUtcHourAligned(instant: string): boolean {
   const ms = Date.parse(instant)
   return !Number.isNaN(ms) && ms % MS_PER_HOUR === 0

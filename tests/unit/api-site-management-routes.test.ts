@@ -41,7 +41,7 @@ const calls = {
   updateSiteSettings: [] as {
     name?: string
     domains?: readonly string[]
-    reportingTimezone?: string | null
+    reportingTimezone?: string
   }[],
   revokeInvite: [] as string[],
   resendInvite: [] as { siteId: string; inviteId: string }[],
@@ -72,14 +72,14 @@ vi.mock('@openanalytics/postgres', async (importOriginal) => {
     },
     updateSiteSettings: async (
       _db: unknown,
-      input: { name?: string; domains?: readonly string[]; reportingTimezone?: string | null },
+      input: { name?: string; domains?: readonly string[]; reportingTimezone?: string },
     ) => {
       calls.updateSiteSettings.push({
         ...(input.name === undefined ? {} : { name: input.name }),
         ...(input.domains === undefined ? {} : { domains: input.domains }),
-        // Recorded on `undefined` vs present rather than on truthiness: `null`
-        // is a value here (it clears the setting), so a truthiness test would
-        // make "clear it" indistinguishable from "do not touch it".
+        // Recorded on `undefined` vs present, which is the only absence the
+        // input has: a route that reached the repository at all must have sent
+        // a zone, so "was it sent" and "what was sent" stay separate questions.
         ...(input.reportingTimezone === undefined
           ? {}
           : { reportingTimezone: input.reportingTimezone }),
@@ -94,7 +94,7 @@ vi.mock('@openanalytics/postgres', async (importOriginal) => {
         configVersionBumped: input.domains !== undefined,
         createdAt: new Date('2026-02-03T04:05:06.000Z'),
         firstEventAt: new Date('2026-02-03T05:00:00.000Z'),
-        reportingTimezone: input.reportingTimezone ?? null,
+        reportingTimezone: input.reportingTimezone ?? 'UTC',
       }
     },
     listSiteInvites: async () => [
@@ -377,7 +377,7 @@ describe('PATCH /v1/sites/{site_id}', () => {
     })
     expect(res.status).toBe(200)
     expect(calls.updateSiteSettings).toEqual([{ reportingTimezone: 'Europe/Istanbul' }])
-    const body = (await res.json()) as { reporting_timezone: string | null }
+    const body = (await res.json()) as { reporting_timezone: string }
     expect(body.reporting_timezone).toBe('Europe/Istanbul')
   })
 
@@ -410,10 +410,22 @@ describe('PATCH /v1/sites/{site_id}', () => {
     expect(calls.updateSiteSettings).toEqual([])
   })
 
-  it('accepts an explicit null as "clear it", which is not the same as omitting it', async () => {
+  it('refuses an explicit null, which no longer has a state to clear to', async () => {
+    // It meant "not configured; the viewer's clock applies" while the column was
+    // nullable. Migration 0046 made every site carry a zone (ADR-0079 D5), so a
+    // null is a request to leave a site's readers disagreeing about what a week
+    // is — refused at the edge rather than 500ing on the NOT NULL behind it.
     const res = await send('PATCH', `/v1/sites/${SITE}`, OWNER, { reporting_timezone: null })
-    expect(res.status).toBe(200)
-    expect(calls.updateSiteSettings).toEqual([{ reportingTimezone: null }])
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as {
+      error: { code: string; details: { issues: { field: string; value: string | null }[] } }
+    }
+    expect(body.error.code).toBe('VALIDATION_FAILED')
+    expect(body.error.details.issues[0]).toMatchObject({
+      field: 'reporting_timezone',
+      value: null,
+    })
+    expect(calls.updateSiteSettings).toEqual([])
   })
 
   it('a lone reporting_timezone satisfies the at-least-one-field rule', async () => {

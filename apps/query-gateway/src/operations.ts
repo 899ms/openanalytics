@@ -8,8 +8,8 @@ import {
   MAX_FILTER_VALUE_LENGTH,
   filterValuesFor,
   isUtcDayAligned,
-  isUtcHourAligned,
   isUtcMinuteAligned,
+  isUtcQuarterAligned,
   type AnalyticsFilter,
   type RollupResolution,
 } from '@openanalytics/domain'
@@ -185,15 +185,30 @@ function defineOperation<TSchema extends z.ZodType>(definition: {
 // Shared parameter shapes
 // ---------------------------------------------------------------------------
 
-/** UTC-bucket boundary alignment the range must satisfy for its source rollup. */
-type RangeAlignment = 'minute' | 'hour' | 'day'
+/**
+ * UTC-bucket boundary alignment the range must satisfy for its source rollup.
+ *
+ * `quarter` — the fifteen-minute atom (ADR-0079) — replaced `hour` in step 3,
+ * because every read that used to be routed to an hour table is now routed to
+ * its `*_15m` twin and its range is snapped a quarter-hour at a time. It is the
+ * looser of the two: every UTC-hour boundary is also a quarter-hour boundary, so
+ * nothing a caller could send before is refused now.
+ */
+type RangeAlignment = 'minute' | 'quarter' | 'day'
+
+/** What the refusal message calls each boundary. */
+const ALIGNMENT_LABEL: Record<RangeAlignment, string> = {
+  minute: 'minute',
+  quarter: 'quarter-hour',
+  day: 'day',
+}
 
 function isAligned(alignment: RangeAlignment, instant: string): boolean {
   switch (alignment) {
     case 'minute':
       return isUtcMinuteAligned(instant)
-    case 'hour':
-      return isUtcHourAligned(instant)
+    case 'quarter':
+      return isUtcQuarterAligned(instant)
     case 'day':
       return isUtcDayAligned(instant)
   }
@@ -224,12 +239,11 @@ const cutoverDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
  * Builds the typed parameter schema for a range operation.
  *
  * The endpoint-alignment refinement is the structural guard behind the rollup
- * choice: an hour operation reads UTC-hour buckets, so a range whose endpoints
- * are not UTC-hour boundaries — a sub-hour timezone's local midnight, say — is
- * rejected here rather than answered with misattributed buckets. A day
- * operation likewise refuses anything but a UTC-midnight boundary, which is why
- * it is only ever routed a UTC request (`chooseResolution` composes non-UTC days
- * from the hour operation instead).
+ * choice: a quarter operation reads UTC quarter-hour buckets, so a range whose
+ * endpoints are not quarter-hour boundaries is rejected here rather than
+ * answered with misattributed buckets. A day operation likewise refuses anything
+ * but a UTC-midnight boundary, which is why it is only ever routed a UTC request
+ * (`chooseResolution` composes non-UTC days from the atom operation instead).
  */
 function rangeParamsSchema(options: RangeParamsOptions) {
   const shape: Record<string, z.ZodTypeAny> = {
@@ -271,7 +285,7 @@ function rangeParamsSchema(options: RangeParamsOptions) {
       if (!isAligned(options.alignment, from) || !isAligned(options.alignment, to)) {
         ctx.addIssue({
           code: 'custom',
-          message: `range endpoints must align to a UTC ${options.alignment} boundary`,
+          message: `range endpoints must align to a UTC ${ALIGNMENT_LABEL[options.alignment]} boundary`,
         })
       }
     })
@@ -388,7 +402,7 @@ function importedFilter(table: string, zone: string): string {
 
 const maxRangeFor: Record<RollupResolution, number> = {
   '1m': MAX_SPAN_MINUTE_MS,
-  '1h': MAX_SPAN_HOUR_MS,
+  '15m': MAX_SPAN_HOUR_MS,
   '1d': MAX_SPAN_DAY_MS,
 }
 
@@ -539,25 +553,25 @@ const timeseriesOperations: readonly QueryOperation[] = [
   }),
   defineTimeseries({
     id: 'analytics.timeseries_hour',
-    summary: 'Events, pageviews and unique visitors per timezone-local hour (metrics_1h).',
-    table: 'metrics_1h',
-    source: '1h',
+    summary: 'Events, pageviews and unique visitors per timezone-local hour (metrics_15m).',
+    table: 'metrics_15m',
+    source: '15m',
     bucketExpr: bucketUtc('toStartOfHour(t.bucket_start, {tz:String})'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 1_000,
   }),
   defineTimeseries({
     id: 'analytics.timeseries_day',
     summary:
-      'Events, pageviews and unique visitors per timezone-local day, composed from metrics_1h so DST 23/25h days are correct, unioned with the published import before the cutover.',
-    table: 'metrics_1h',
-    source: '1h',
+      'Events, pageviews and unique visitors per timezone-local day, composed from metrics_15m so DST 23/25h days are correct, unioned with the published import before the cutover.',
+    table: 'metrics_15m',
+    source: '15m',
     bucketExpr: bucketUtc('toStartOfDay(t.bucket_start, {tz:String})'),
     // A provider day *is* a local day, so the placement is the whole bucketing:
     // no re-grouping, just the same label the live side computes.
     importedBucketExpr: importedDayInstant('{tz:String}'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
   }),
@@ -608,9 +622,9 @@ const timeseriesOperations: readonly QueryOperation[] = [
   defineTimeseries({
     id: 'analytics.timeseries_week',
     summary:
-      'Events, pageviews and unique visitors per timezone-local ISO week (Monday start), composed from metrics_1h.',
-    table: 'metrics_1h',
-    source: '1h',
+      'Events, pageviews and unique visitors per timezone-local ISO week (Monday start), composed from metrics_15m.',
+    table: 'metrics_15m',
+    source: '15m',
     // Three steps, each undoing an ambiguity the previous one leaves:
     //   toStartOfWeek(col, 1, tz) → the local Monday, as a `Date` — a calendar
     //     date with no instant attached, so it cannot be a bucket label yet.
@@ -632,7 +646,7 @@ const timeseriesOperations: readonly QueryOperation[] = [
     // week. The zone belongs on the `toDateTime` that turns the resulting Monday
     // back into an instant, which is where it is.
     importedBucketExpr: bucketUtc('toDateTime(toStartOfWeek(i.date, 1), {tz:String})'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 600,
   }),
@@ -733,10 +747,10 @@ const overviewOperations: readonly QueryOperation[] = [
   defineOverview({
     id: 'analytics.overview_hour',
     summary:
-      'Range totals — events, pageviews, billable events, unique visitors (metrics_1h plus the published import).',
-    table: 'metrics_1h',
-    source: '1h',
-    alignment: 'hour',
+      'Range totals — events, pageviews, billable events, unique visitors (metrics_15m plus the published import).',
+    table: 'metrics_15m',
+    source: '15m',
+    alignment: 'quarter',
   }),
   defineOverview({
     id: 'analytics.overview_day',
@@ -845,7 +859,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'pages',
     imported: true,
-    hourTable: 'pages_1h',
+    hourTable: 'pages_15m',
     dayTable: 'pages_1d',
     dimensions: ['page_path'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -855,7 +869,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'sources',
     imported: true,
-    hourTable: 'sources_1h',
+    hourTable: 'sources_15m',
     dayTable: 'sources_1d',
     dimensions: ['referrer_domain', 'utm_source', 'utm_medium', 'utm_campaign'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -865,7 +879,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'geography',
     imported: true,
-    hourTable: 'geography_1h',
+    hourTable: 'geography_15m',
     dayTable: 'geography_1d',
     dimensions: ['country', 'city'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -875,7 +889,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'devices',
     imported: true,
-    hourTable: 'devices_1h',
+    hourTable: 'devices_15m',
     dayTable: 'devices_1d',
     dimensions: ['device_type', 'browser', 'os'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -885,7 +899,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'custom_events',
     imported: true,
-    hourTable: 'custom_events_1h',
+    hourTable: 'custom_events_15m',
     dayTable: 'custom_events_1d',
     dimensions: ['event_name', 'event_type'],
     measures: [
@@ -899,7 +913,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'performance',
     imported: false,
-    hourTable: 'performance_1h',
+    hourTable: 'performance_15m',
     dayTable: 'performance_1d',
     dimensions: ['metric', 'device_type'],
     measures: [
@@ -919,8 +933,8 @@ const reportOperations: readonly QueryOperation[] = REPORT_SHAPES.flatMap((shape
   defineReport({
     id: `analytics.${shape.slug}_hour`,
     table: shape.hourTable,
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     dimensions: shape.dimensions,
     measures: shape.measures,
     orderBy: shape.orderBy,
@@ -1016,9 +1030,9 @@ function defineCustomEventSamples(definition: {
 const customEventSampleOperations: readonly QueryOperation[] = [
   defineCustomEventSamples({
     id: 'analytics.custom_event_samples_hour',
-    table: 'custom_event_samples_1h',
-    source: '1h',
-    alignment: 'hour',
+    table: 'custom_event_samples_15m',
+    source: '15m',
+    alignment: 'quarter',
     summary: 'Last-seen instant, page and properties per custom event. Hour rollup.',
   }),
   defineCustomEventSamples({
@@ -1089,10 +1103,11 @@ function defineImportedReport(definition: {
     requiresSiteScope: true,
     params: rangeParamsSchema({
       // The api routes these beside an hour- or a day-rollup report, and a
-      // day-aligned range is hour-aligned too, so the looser boundary accepts
-      // both without ever accepting a sub-hour one.
+      // day-aligned range is quarter-aligned too, so the looser boundary
+      // accepts both — and it has to be the looser one, because the live report
+      // beside it is routed a quarter-hour-snapped range (ADR-0079, step 3).
       maxRangeMs: MAX_SPAN_DAY_MS,
-      alignment: 'hour',
+      alignment: 'quarter',
       // The same placement the live half of this report used. Two halves of one
       // merged list that disagreed about which days a range contains would be a
       // table whose rows come from different windows.
@@ -1351,14 +1366,14 @@ function defineSessionProvisional(definition: {
 }
 
 const sessionOperations: readonly QueryOperation[] = [
-  // Hour grain: whole-hour/UTC local hours from the 1h layers.
+  // Hour grain: local hours composed from the 15m layers, in any zone.
   defineSessionFinalized({
     id: 'analytics.sessions_finalized_hour',
-    summary: 'Finalized session totals per timezone-local hour (session_rollups_1h).',
-    table: 'session_rollups_1h',
+    summary: 'Finalized session totals per timezone-local hour (session_rollups_15m).',
+    table: 'session_rollups_15m',
     bucketExpr: bucketUtc('toStartOfHour(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 2_000,
   }),
@@ -1366,8 +1381,8 @@ const sessionOperations: readonly QueryOperation[] = [
     id: 'analytics.sessions_provisional_hour',
     summary: 'Provisional session totals per timezone-local hour (session_facts_versions).',
     bucketExpr: bucketUtc('toStartOfHour(cur.session_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 2_000,
   }),
@@ -1395,11 +1410,11 @@ const sessionOperations: readonly QueryOperation[] = [
   // are correct, the same rule the additive day chart uses.
   defineSessionFinalized({
     id: 'analytics.sessions_finalized_day_local',
-    summary: 'Finalized session totals per timezone-local day, composed from session_rollups_1h.',
-    table: 'session_rollups_1h',
+    summary: 'Finalized session totals per timezone-local day, composed from session_rollups_15m.',
+    table: 'session_rollups_15m',
     bucketExpr: bucketUtc('toStartOfDay(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
   }),
@@ -1408,8 +1423,8 @@ const sessionOperations: readonly QueryOperation[] = [
     summary:
       'Provisional session totals per timezone-local day, composed from session_facts_versions.',
     bucketExpr: bucketUtc('toStartOfDay(cur.session_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
   }),
@@ -1425,8 +1440,8 @@ const sessionOperations: readonly QueryOperation[] = [
 // shipped in M8. This is the read that was waiting for it.
 //
 // They come from the session facts and they cannot come from anywhere else.
-// `session_rollups_1h`/`_1d` are keyed `(site_id, bucket_start)` with NO path
-// dimension (migration 0014), and `pages_1h`/`_1d` are event-grain with no
+// `session_rollups_15m`/`_1d` are keyed `(site_id, bucket_start)` with NO path
+// dimension (migration 0014), and `pages_15m`/`_1d` are event-grain with no
 // session in them. So this operation sits on the same provisional-over-facts
 // layer the session totals sit on, and reads the fact table by the contract
 // migration 0013 mandates:
@@ -1563,10 +1578,10 @@ function definePageSessions(definition: {
 const pageSessionOperations: readonly QueryOperation[] = [
   definePageSessions({
     id: 'analytics.page_sessions_hour',
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     summary:
-      'Entrances, exits, bounces and sessions per page path from the session facts. Hour-aligned.',
+      'Entrances, exits, bounces and sessions per page path from the session facts. Quarter-hour-aligned.',
   }),
   definePageSessions({
     id: 'analytics.page_sessions_day',
@@ -2149,7 +2164,7 @@ const recentVisitorOperations: readonly QueryOperation[] = [
 //
 // Four families, and the split between them is the D-212 layering made visible:
 //
-//   * the two BUCKET families (timeseries, summary) read `revenue_1h`/`_1d` — a
+//   * the two BUCKET families (timeseries, summary) read `revenue_15m`/`_1d` — a
 //     versioned swap target, so every read is `argMax(col, generation)` per
 //     (site, bucket) and then a sum across the range, never `FINAL`;
 //   * the two OBJECT families (transactions, journey) read the FACTS
@@ -2321,7 +2336,7 @@ const revenueUnconvertedOperation = defineOperation({
     // other fact-touching read here is allowed, so the summary refuses the same
     // ranges its own timeseries does.
     maxRangeMs: MAX_SPAN_HOUR_MS,
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: false,
     withLimit: false,
   }),
@@ -2656,11 +2671,11 @@ const revenueOrderObjectsOperation = defineOperation({
 const revenueOperations: readonly QueryOperation[] = [
   defineRevenueTimeseries({
     id: 'analytics.revenue_timeseries_hour',
-    summary: 'Revenue totals per timezone-local hour (revenue_1h).',
-    table: 'revenue_1h',
+    summary: 'Revenue totals per timezone-local hour (revenue_15m).',
+    table: 'revenue_15m',
     bucketExpr: bucketUtc('toStartOfHour(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 2_000,
   }),
@@ -2674,26 +2689,26 @@ const revenueOperations: readonly QueryOperation[] = [
     withTimezone: false,
     maxRows: 4_000,
   }),
-  // A non-UTC local day is composed from the hour rollup, exactly as the session
+  // A non-UTC local day is composed from the atom rollup, exactly as the session
   // and additive families do, so a DST 23/25-hour day is correct rather than
   // shifted. Without it a non-UTC day chart would either be refused or answered
   // with UTC-day buckets wearing local labels.
   defineRevenueTimeseries({
     id: 'analytics.revenue_timeseries_day_local',
-    summary: 'Revenue totals per timezone-local day, composed from revenue_1h.',
-    table: 'revenue_1h',
+    summary: 'Revenue totals per timezone-local day, composed from revenue_15m.',
+    table: 'revenue_15m',
     bucketExpr: bucketUtc('toStartOfDay(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
   }),
   defineRevenueSummary({
     id: 'analytics.revenue_summary_hour',
-    summary: 'Revenue totals over a range, read from revenue_1h.',
-    table: 'revenue_1h',
-    source: '1h',
-    alignment: 'hour',
+    summary: 'Revenue totals over a range, read from revenue_15m.',
+    table: 'revenue_15m',
+    source: '15m',
+    alignment: 'quarter',
   }),
   defineRevenueSummary({
     id: 'analytics.revenue_summary_day',
@@ -2764,8 +2779,8 @@ export const clickhouseRoundtripOperation = defineOperation({
 // ## Why a filtered read cannot use a rollup at all
 //
 // Every rollup has already aggregated away the thing a filter selects on.
-// `pages_1h` is `(site, bucket, page_path)`; there is no session in it and no
-// referrer either. `sources_1h` carries a referrer but has no page. A filtered
+// `pages_15m` is `(site, bucket, page_path)`; there is no session in it and no
+// referrer either. `sources_15m` carries a referrer but has no page. A filtered
 // pages report is "the pages viewed by sessions that came from X", and no
 // pre-aggregated table has both halves. So a filter is answered from the facts —
 // and D-F4 is what keeps that cost off everybody else: these operations are
@@ -2996,7 +3011,7 @@ function filteredParamsSchema(options: {
       if (!isAligned(options.alignment, from) || !isAligned(options.alignment, to)) {
         ctx.addIssue({
           code: 'custom',
-          message: `range endpoints must align to a UTC ${options.alignment} boundary`,
+          message: `range endpoints must align to a UTC ${ALIGNMENT_LABEL[options.alignment]} boundary`,
         })
       }
       // D-F4, asserted structurally: an EMPTY filter set may not reach this
@@ -3098,11 +3113,11 @@ const filteredReportOperations: readonly QueryOperation[] = FILTERED_REPORT_SHAP
   (shape) => [
     defineFilteredReport({
       id: `analytics.filtered_${shape.slug}_hour`,
-      source: '1h',
-      alignment: 'hour',
+      source: '15m',
+      alignment: 'quarter',
       dimensions: shape.dimensions,
       orderBy: 'views',
-      summary: `${shape.summary} for sessions matching a filter set. Hour-aligned.`,
+      summary: `${shape.summary} for sessions matching a filter set. Quarter-hour-aligned.`,
     }),
     defineFilteredReport({
       id: `analytics.filtered_${shape.slug}_day`,
@@ -3223,18 +3238,18 @@ const filteredTimeseriesOperations: readonly QueryOperation[] = [
   }),
   defineFilteredTimeseries({
     id: 'analytics.filtered_timeseries_hour',
-    source: '1h',
+    source: '15m',
     bucketExpr: bucketUtc('toStartOfHour(er.occurred_at, {tz:String})'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 1_000,
     summary: 'Filtered events, pageviews and visitors per timezone-local hour.',
   }),
   defineFilteredTimeseries({
     id: 'analytics.filtered_timeseries_day',
-    source: '1h',
+    source: '15m',
     bucketExpr: bucketUtc('toStartOfDay(er.occurred_at, {tz:String})'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
     summary: 'Filtered events, pageviews and visitors per timezone-local day.',
@@ -3250,9 +3265,9 @@ const filteredTimeseriesOperations: readonly QueryOperation[] = [
   }),
   defineFilteredTimeseries({
     id: 'analytics.filtered_timeseries_week',
-    source: '1h',
+    source: '15m',
     bucketExpr: bucketUtc('toDateTime(toStartOfWeek(er.occurred_at, 1, {tz:String}), {tz:String})'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 600,
     summary: 'Filtered events, pageviews and visitors per timezone-local ISO week.',
@@ -3271,9 +3286,10 @@ const filteredTimeseriesOperations: readonly QueryOperation[] = [
 const filteredOverviewOperations: readonly QueryOperation[] = [
   defineFilteredOverview({
     id: 'analytics.filtered_overview_hour',
-    source: '1h',
-    alignment: 'hour',
-    summary: 'Filtered range totals — events, pageviews, billable events, visitors. Hour-aligned.',
+    source: '15m',
+    alignment: 'quarter',
+    summary:
+      'Filtered range totals — events, pageviews, billable events, visitors. Quarter-hour-aligned.',
   }),
   defineFilteredOverview({
     id: 'analytics.filtered_overview_day',
@@ -3295,11 +3311,11 @@ const filteredOverviewOperations: readonly QueryOperation[] = [
 const filteredPageSessionOperations: readonly QueryOperation[] = [
   definePageSessions({
     id: 'analytics.filtered_page_sessions_hour',
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     filtered: true,
     summary:
-      'Entrances, exits, bounces and sessions per page path for sessions matching a filter set. Hour-aligned.',
+      'Entrances, exits, bounces and sessions per page path for sessions matching a filter set. Quarter-hour-aligned.',
   }),
   definePageSessions({
     id: 'analytics.filtered_page_sessions_day',

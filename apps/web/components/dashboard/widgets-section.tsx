@@ -16,23 +16,20 @@ import { WidgetPreview } from "@/components/dashboard/widget-preview";
 import { CopyButton } from "@/components/ui/copy-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { SaveButton } from "@/components/ui/save-button";
 import { SkeletonBar, SkeletonReveal } from "@/components/ui/skeleton-reveal";
 import { Switch } from "@/components/ui/switch";
-import { TimezoneSelect } from "@/components/ui/timezone-select";
 import { INTERVALS } from "@/components/dashboard/interval-context";
 import {
   API_BASE_URL,
   LIVE_API,
   presentError,
-  sites,
   widgets as widgetsApi,
   type SiteSummary,
   type Widget,
   type WidgetRange,
   type WidgetSurface,
 } from "@/lib/api";
-import { useAction, useApi } from "@/lib/use-api";
+import { useApi } from "@/lib/use-api";
 import { cn } from "@/lib/utils";
 
 /**
@@ -199,14 +196,16 @@ export function WidgetsSection({ site }: { site: SiteSummary }) {
   const canManage = site.role !== "viewer";
 
   /**
-   * The site's reporting timezone lives on this tab because this tab is who
-   * needs it: a widget's windows are cut in this zone server-side, with no
-   * timezone parameter on the public door. Held here, above both panels, so
-   * a save in the panel below is what the widget editor's hint reads.
+   * The site's reporting timezone, read for the widget editor's hint.
+   *
+   * The editor for it moved to Settings → General with ADR-0079 D5: it stopped
+   * being the widgets' own setting the day the dashboard started reporting in
+   * it too, and a site-wide clock belongs beside the site-wide currency. This
+   * tab still has to *say* which zone a widget will use, so it still reads the
+   * value — it just no longer owns it. Every site has one (migration 0046), so
+   * there is no "set one first" branch to render.
    */
-  const [reportingZone, setReportingZone] = React.useState(
-    site.reporting_timezone
-  );
+  const reportingZone = site.reporting_timezone;
 
   const list = useApi(
     () => widgetsApi.list(site.site_id).then((page) => page.items),
@@ -240,7 +239,6 @@ export function WidgetsSection({ site }: { site: SiteSummary }) {
   const listReady = list.phase !== "loading";
 
   return (
-    <>
     <SettingsPanel
       action={
         <span className="flex items-center gap-3">
@@ -436,95 +434,6 @@ export function WidgetsSection({ site }: { site: SiteSummary }) {
         ) : null}
       </AnimatePresence>
     </SettingsPanel>
-
-    <ReportingTimezonePanel
-      canEdit={canManage}
-      onSaved={setReportingZone}
-      site={site}
-      zone={reportingZone}
-    />
-    </>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Reporting timezone — the widgets' clock, so it lives on their tab   */
-/* ------------------------------------------------------------------ */
-
-/**
- * `reporting_timezone` (ADR-0044) on `PATCH /v1/sites/{site_id}` — its own
- * panel and its own save, because it moved out of General: every widget's
- * window is cut in this zone server-side (there is no timezone parameter on
- * the public widget door), and the public dashboard opens in it by default.
- * The dashboard's own charts keep following each member's clock (ADR-0026).
- */
-function ReportingTimezonePanel({
-  site,
-  zone,
-  canEdit,
-  onSaved,
-}: {
-  site: SiteSummary;
-  zone: string | null;
-  canEdit: boolean;
-  onSaved: (next: string | null) => void;
-}) {
-  const [selected, setSelected] = React.useState(zone);
-  const [saved, setSaved] = React.useState(false);
-  const timeout = React.useRef<ReturnType<typeof setTimeout>>(undefined);
-  React.useEffect(() => () => clearTimeout(timeout.current), []);
-
-  const save = useAction(async () => {
-    setSaved(false);
-    if (LIVE_API) {
-      // Read the answer back rather than trusting what was sent.
-      const next = await sites.update(site.site_id, {
-        reporting_timezone: selected,
-      });
-      setSelected(next.reporting_timezone);
-      onSaved(next.reporting_timezone);
-    } else {
-      onSaved(selected);
-    }
-    setSaved(true);
-    clearTimeout(timeout.current);
-    timeout.current = setTimeout(() => setSaved(false), 2000);
-  });
-
-  return (
-    <SettingsPanel title="Reporting timezone">
-      <div className="flex flex-col gap-3 p-5">
-        <TimezoneSelect
-          ariaLabel="Reporting timezone"
-          disabled={!canEdit}
-          nullLabel="Not set: widgets report in UTC"
-          onPick={setSelected}
-          value={selected}
-          variant="field"
-        />
-        <p className="text-xs leading-5 text-muted-foreground">
-          The clock your widgets cut their windows in: &quot;Today&quot;,
-          &quot;Last 7 days&quot; and every other window start and end on this
-          zone&apos;s calendar. Not set, they resolve in UTC — a
-          &quot;Today&quot; widget then reports UTC&apos;s today.
-        </p>
-        <div className="flex items-center gap-3">
-          <SaveButton
-            disabled={!canEdit}
-            onClick={() => save.run()}
-            size="sm"
-            state={save.busy ? "saving" : saved ? "saved" : "idle"}
-          >
-            Save changes
-          </SaveButton>
-          {save.error ? (
-            <span className="text-xs text-destructive-foreground">
-              {save.error.body}
-            </span>
-          ) : null}
-        </div>
-      </div>
-    </SettingsPanel>
   );
 }
 
@@ -688,7 +597,7 @@ function WidgetEditor({
   def: Widget | null;
   site: SiteSummary;
   /** The saved reporting zone — the panel under the list is where it is set. */
-  reportingZone: string | null;
+  reportingZone: string;
   onClose: () => void;
   onCommitted: (kind: "saved" | "deleted", next: Widget) => void;
 }) {
@@ -728,7 +637,7 @@ function WidgetEditor({
     (Number.isInteger(limitNumber) && limitNumber >= 1 && limitNumber <= 50);
 
   /** The zone every window of this widget is cut in — never the reader's. */
-  const zone = reportingZone ?? "UTC";
+  const zone = reportingZone;
 
   const save = () => {
     if (!limitValid) {
@@ -997,17 +906,8 @@ function WidgetEditor({
               </span>
               <span className="text-xs leading-5 text-muted-foreground">
                 A widget has no viewer whose clock could be asked, so days are
-                cut in <span className="font-medium">{zone}</span>
-                {reportingZone === null ? (
-                  <>
-                    {" "}
-                    — the site has no reporting timezone yet. Set one right
-                    below the widget list so &quot;Today&quot; means your
-                    today.
-                  </>
-                ) : (
-                  <>, the site&apos;s reporting timezone.</>
-                )}
+                cut in <span className="font-medium">{zone}</span>, the
+                site&apos;s reporting timezone.
               </span>
             </label>
           )}

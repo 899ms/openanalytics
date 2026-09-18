@@ -19,6 +19,7 @@ import {
   type CreatedSite,
 } from "@/lib/api";
 import { MOCK_CREATED_SITE } from "@/lib/mock";
+import { browserTimezone } from "@/lib/timezone";
 
 const SPRING = { type: "spring", stiffness: 550, damping: 38 } as const;
 
@@ -188,6 +189,25 @@ export function AddSiteFlow({ onClose }: { onClose: () => void }) {
           await sites.update(site.site_id, { domains: [bareDomain] });
         } catch {
           /* settings screen owns fixing the allowlist */
+        }
+
+        // The reporting timezone, defaulted to this browser's zone (ADR-0079
+        // D5). This dialog asks no timezone question — onboarding does, once —
+        // so the default is the honest guess rather than the null that used to
+        // make a new site's widgets report UTC's today. Settings → General is
+        // where it is changed.
+        //
+        // Its own PATCH, and that is the point: the server validates the zone
+        // against its own ICU, which can be older than this browser's, and one
+        // rejected id sent together with the domains took the allowlist down
+        // with it — leaving the site with an empty allowlist, which accepts
+        // *every* origin rather than none.
+        try {
+          await sites.update(site.site_id, {
+            reporting_timezone: browserTimezone(),
+          });
+        } catch {
+          /* the site keeps the null zone it was created with */
         }
         setBusy(false);
         setCreated(site);

@@ -48,6 +48,7 @@ export {
   isHalfOpenContained,
   isValidTimezone,
   resolutionSchema,
+  timezoneOffsetMinutes,
   timezoneSchema,
   utcInstantSchema,
   type Accuracy,

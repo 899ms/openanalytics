@@ -33,6 +33,7 @@ import {
   TransferOfferSkeleton,
   useTransferOffer,
 } from "@seam/slots";
+import { useSiteSummary } from "@/components/dashboard/site-summary-context";
 import { TeamSection } from "@/components/dashboard/team-section";
 import { WidgetsSection } from "@/components/dashboard/widgets-section";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -43,6 +44,7 @@ import {
   SkeletonCircle,
   SkeletonReveal,
 } from "@/components/ui/skeleton-reveal";
+import { TimezoneSelect } from "@/components/ui/timezone-select";
 import {
   SectionHeading,
   SettingsPanel,
@@ -174,11 +176,39 @@ export function SettingsBoard({ slug }: { slug: string }) {
 
   // URLs carry the slug; the api speaks site_id. Resolve once here and hand
   // the summary to every section — none of them re-fetches identity.
-  const site = useApi(
+  const read = useApi(
     () => sites.resolve(slug).then((found) => sites.get(found.site_id)),
     () => mockSiteBySlug(slug),
     slug
   );
+
+  /**
+   * The row General last saved, standing in front of the read.
+   *
+   * The save answers with the whole updated site, so the tabs beside it
+   * already have the new truth in hand: the Widgets tab reads
+   * `reporting_timezone` off this summary for its editor hint, and left to
+   * the read alone it goes on saying there is no reporting timezone yet.
+   * Re-reading instead would cost a second request *and* draw the board's
+   * skeleton back over a screen whose save had just succeeded.
+   *
+   * It stands in front of exactly the answer it was saved over, and no other.
+   * The read is refetched on its own — a slug change, the dashboard's refresh
+   * pulse — and whatever comes back is newer than this by definition, so a
+   * held row that outlived its answer would be a teammate's edit quietly
+   * reverted on screen.
+   */
+  const [savedRow, setSavedRow] = React.useState<{
+    row: SiteSummary;
+    over: SiteSummary;
+  } | null>(null);
+  const acceptSaved = (row: SiteSummary) => {
+    if (read.phase === "ready") setSavedRow({ row, over: read.data });
+  };
+  const site =
+    read.phase === "ready" && savedRow?.over === read.data
+      ? { ...read, data: savedRow.row }
+      : read;
 
   // Pixel-matched to the ready layout: real column widths, real nav row
   // metrics, a General-shaped panel — so the reveal never shifts a thing.
@@ -315,7 +345,7 @@ export function SettingsBoard({ slug }: { slug: string }) {
                   description={`What ${site.data.name} is called, which origins may send events, and who can see its numbers.`}
                   title="General"
                 />
-                <General site={site.data} />
+                <General onSaved={acceptSaved} site={site.data} />
               </>
             ) : null}
             {active === "installation" ? (
@@ -467,7 +497,18 @@ function GeneralPanelsSkeleton({
   );
 }
 
-function General({ site }: { site: SiteSummary }) {
+function General({
+  site,
+  onSaved,
+}: {
+  site: SiteSummary;
+  /**
+   * Hands the row the server confirmed back to the board, so the tabs beside
+   * this one read what was saved rather than what was loaded.
+   */
+  onSaved: (row: SiteSummary) => void;
+}) {
+  const summary = useSiteSummary();
   const [name, setName] = React.useState(site.name);
   const [domains, setDomains] = React.useState<string[]>(site.domains);
   const [draft, setDraft] = React.useState("");
@@ -506,6 +547,21 @@ function General({ site }: { site: SiteSummary }) {
   );
   const [converting, setConverting] = React.useState(false);
 
+  /**
+   * The reporting timezone (ADR-0044), beside the currency since ADR-0079 D5.
+   *
+   * It lived on the Widgets tab while widgets were the only thing cut in it.
+   * They are not: the dashboard, the share board and every widget now report in
+   * this zone by default, so it belongs where the other two site-wide labels
+   * are — these numbers are expressed in this currency, on this clock. Same
+   * `site:settings` PATCH, same save button.
+   *
+   * There is no "not set" row any more (ADR-0079 D5, step 5c): every site has a
+   * clock, and the choice a reader makes for themselves is the header pill's —
+   * per visit, per tab, and it never reaches this column.
+   */
+  const [timezone, setTimezone] = React.useState(site.reporting_timezone);
+
   // The tab's two reads, started here so they run in parallel and share one
   // reveal moment. Their panels take the answers as props.
   const publicSettings = usePublicDashboard(site.site_id);
@@ -516,18 +572,30 @@ function General({ site }: { site: SiteSummary }) {
   const save = useAction(async () => {
     setSaved(false);
     const currencyChanged = currency !== appliedCurrency;
+    // Measured against the last row the server confirmed, which `onSaved`
+    // keeps current — so a later save that only renames the site does not
+    // re-read the screen's summary for a clock that never moved.
+    const zoneChanged = timezone !== site.reporting_timezone;
     if (LIVE_API) {
       // Read the response back — the server normalizes and de-duplicates.
       const next = await sites.update(site.site_id, {
         name: name.trim(),
         domains: nextDomains,
         reporting_currency: currency,
+        reporting_timezone: timezone,
       });
       setName(next.name);
       setDomains(next.domains);
       setPendingRemoval([]);
       setCurrency(next.reporting_currency);
       setAppliedCurrency(next.reporting_currency);
+      setTimezone(next.reporting_timezone);
+      onSaved(next);
+      // And the screen's own summary, which is a different read in a layout
+      // that survives the walk back to the overview: without this the new
+      // clock is stored, echoed here, and ignored by every panel until a
+      // refresh (ADR-0079 D5).
+      if (zoneChanged) summary.reload();
     } else {
       setAppliedCurrency(currency);
     }
@@ -773,6 +841,31 @@ function General({ site }: { site: SiteSummary }) {
                 : `${currency} is a settlement currency the ECB does not publish a rate for. It is accepted, but until a wider rate source lands, payments taken in any other currency stay uncounted in your totals rather than being converted: shown separately, never silently dropped.`}
             </span>
           </label>
+
+          {/* Reporting timezone (ADR-0044, ADR-0079 D5) — the currency's
+              opposite number: one says what the figures are denominated in and
+              the other says which days they are counted on. A div rather than
+              a label like its neighbours: the picker names itself through
+              `ariaLabel`, and a label wrapping a button forwards the click into
+              it, opening and closing the list on the same press. */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-sm font-medium">Reporting timezone</span>
+            <TimezoneSelect
+              ariaLabel="Reporting timezone"
+              disabled={!canEdit}
+              onPick={(zone) => {
+                // No `nullLabel` is offered, so `null` cannot arrive; the
+                // guard is for the type, not a case.
+                if (zone !== null) setTimezone(zone);
+              }}
+              value={timezone}
+              variant="field"
+            />
+            <span className="text-xs leading-5 text-muted-foreground">
+              The clock this site&apos;s days are cut on. Readers can switch to
+              their own zone from the header.
+            </span>
+          </div>
 
           <div className="flex items-center gap-3">
             <SaveButton

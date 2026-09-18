@@ -18,8 +18,8 @@
  * cutting at a UTC bucket boundary derived from `finalized_through`:
  *
  *   - Let `B = floor(finalized_through)` to the source rollup's UTC bucket unit
- *     (hour for the 1h-sourced reads, day for the 1d-sourced read). `B` is
- *     bucket-aligned and `B <= finalized_through`.
+ *     (a quarter-hour for the 15m-sourced reads, a day for the 1d-sourced read).
+ *     `B` is bucket-aligned and `B <= finalized_through`.
  *   - **Finalized layer** reads rollup buckets with `bucket_start < B`. Every
  *     session in such a bucket has `session_start < B <= finalized_through`, so it
  *     is finalized and its rollup row will never change again (acceptance
@@ -40,16 +40,26 @@
  * answer for a site with no finalized rollups yet.
  */
 
-const MS_PER_HOUR = 3_600_000
+const MS_PER_QUARTER = 900_000
 const MS_PER_DAY = 86_400_000
 
-/** The UTC bucket unit a session read is aligned and split on. */
-export type SessionSplitUnit = 'hour' | 'day'
+/**
+ * The UTC bucket unit a session read is aligned and split on.
+ *
+ * `quarter` since ADR-0079 step 3: the finest session rollup is
+ * `session_rollups_15m`, so the finalized/provisional cut lands on a
+ * quarter-hour rather than the hour the 1h-sourced reads used to cut on. The
+ * unit must be the *source's own bucket width* or the two layers stop
+ * partitioning the sessions between them — a boundary inside a bucket would put
+ * that bucket in the finalized read and some of its sessions in the provisional
+ * one as well.
+ */
+export type SessionSplitUnit = 'quarter' | 'day'
 
-/** Floors an ISO instant to the start of its UTC hour or day. */
+/** Floors an ISO instant to the start of its UTC quarter-hour or day. */
 export function floorUtcTo(iso: string, unit: SessionSplitUnit): string {
   const ms = Date.parse(iso)
-  const size = unit === 'hour' ? MS_PER_HOUR : MS_PER_DAY
+  const size = unit === 'quarter' ? MS_PER_QUARTER : MS_PER_DAY
   return new Date(Math.floor(ms / size) * size).toISOString()
 }
 

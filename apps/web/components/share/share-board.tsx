@@ -42,7 +42,7 @@ import {
   useAnalyticsInterval,
 } from "@/components/dashboard/interval-context";
 import { IntervalSelect } from "@/components/dashboard/interval-select";
-import { TimezoneSelect } from "@/components/ui/timezone-select";
+import { TimezonePill } from "@/components/dashboard/timezone-pill";
 import {
   AVG_VISIT_INFO,
   BOUNCE_INFO,
@@ -84,7 +84,7 @@ import {
   type PublicOverviewResponse,
   type PublicSessionsResponse,
 } from "@/lib/api";
-import { browserTimezone } from "@/lib/timezone";
+import { resolveViewingTimezone } from "@/lib/timezone";
 import {
   MOCK_DEVICES,
   MOCK_PAGES,
@@ -187,8 +187,14 @@ export function ShareBoard({ slug }: { slug: string }) {
     },
     [slug]
   );
-  const siteZone = identity.data?.reporting_timezone ?? null;
-  const timezone = chosenZone ?? storedZone ?? siteZone ?? browserTimezone();
+  // The dashboard's rule, from the one place that holds it (ADR-0079 D5).
+  // There is no `preference` step here and there never can be: the viewer is
+  // anonymous, so the chain runs out at their browser.
+  const timezone = resolveViewingTimezone({
+    chosen: chosenZone,
+    remembered: storedZone,
+    site: identity.data?.reporting_timezone ?? null,
+  });
 
   return (
     // The dashboard's own interval machinery, with two changes for a surface
@@ -215,47 +221,6 @@ export function ShareBoard({ slug }: { slug: string }) {
         timezone={timezone}
       />
     </IntervalProvider>
-  );
-}
-
-/**
- * The board's clock, worn in the header beside the site's name: the zone
- * every window on the page is cut in, so a reader anywhere picks their own.
- *
- * The shared `TimezoneSelect` in its header dress — country-aware search
- * included, so "US" or "Türkiye" finds a clock without IANA spelling.
- *
- * Rendered only after hydration: its value defaults through the viewer's
- * browser zone, which the server cannot know — a server-rendered value
- * would be the host's clock and a hydration mismatch.
- */
-function HeaderZoneSelect({
-  value,
-  onPick,
-}: {
-  value: string;
-  onPick: (zone: string) => void;
-}) {
-  const hydrated = React.useSyncExternalStore(
-    zoneSubscribe,
-    () => true,
-    () => false
-  );
-  if (!hydrated) return null;
-
-  return (
-    <div className="hidden min-w-0 sm:block">
-      <TimezoneSelect
-        ariaLabel="Timezone the dashboard reports in"
-        onPick={(zone) => {
-          // No `nullLabel` is offered, so `null` cannot arrive; the guard
-          // is for the type, not a case.
-          if (zone !== null) onPick(zone);
-        }}
-        value={value}
-        variant="header"
-      />
-    </div>
   );
 }
 
@@ -342,12 +307,13 @@ function ShareScreen({
   );
   const chartFolded = chartFoldedFor === chartKey;
   const loadChart = React.useCallback(async () => {
-    const wholeHourZone = new Date().getTimezoneOffset() % 60 === 0;
+    // The grain is named for every zone now: since ADR-0079 step 3 the reads
+    // compose from a fifteen-minute atom, so an hour or a day is servable at
+    // +05:30 exactly as it is at +01:00. This used to withhold `resolution`
+    // for the offsets the server would have refused.
     const search = new URLSearchParams(query);
-    if (wholeHourZone) {
-      const spanMs = Date.parse(range.to) - Date.parse(range.from);
-      search.set("resolution", resolutionForInterval(interval, spanMs));
-    }
+    const spanMs = Date.parse(range.to) - Date.parse(range.from);
+    search.set("resolution", resolutionForInterval(interval, spanMs));
     try {
       const response = await publicShare.timeseries(slug, search.toString());
       setChartFoldedFor(null);
@@ -404,7 +370,7 @@ function ShareScreen({
                 reporting zone when configured, else the viewer's own — and
                 a full IANA list, so a reader anywhere views the numbers in
                 their own time. */}
-            <HeaderZoneSelect onPick={onPickZone} value={timezone} />
+            <TimezonePill onPick={onPickZone} value={timezone} />
           </span>
           <span className="flex items-center gap-3">
             <span className="hidden text-sm text-muted-foreground sm:inline">

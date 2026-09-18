@@ -144,7 +144,10 @@ const EXPECTED_CONSTRAINTS = [
   // identifier-shaped at the database, a literal mirror of `users_timezone_format`
   // above. It is what refuses an offset zone such as `+05:00` — which `Intl`
   // accepts as a time zone and this product does not — so a direct SQL write
-  // cannot plant a value the public read would have to defend against.
+  // cannot plant a value the public read would have to defend against. Its
+  // `IS NULL OR …` arm is unreachable since migration 0046 made the column NOT
+  // NULL (ADR-0079 D5); the constraint is left as written rather than rewritten
+  // to delete an arm that can no longer be taken.
   'sites_reporting_timezone_format',
   // ADR-0033 D4 (migration 0027): the ingest layer's two idempotency rules and
   // the vocabularies they rest on.
@@ -290,6 +293,25 @@ describeIfPostgres('postgres schema bootstrap', () => {
         expect(present, `${table.name}.${column}`).toContain(column)
       }
     }
+  })
+
+  it('requires a reporting timezone on every site, defaulting to UTC', async () => {
+    // ADR-0079 D5 / migration 0046. Not merely a column shape: it is the
+    // statement that every window this product cuts — the dashboard's, the share
+    // board's, every widget's — has a calendar to be cut on. Nullable, a site's
+    // two readers see two different weeks and each calls the other's a bug.
+    //
+    // Pinned here as well as in `sites-reporting-timezone-required.test.ts`,
+    // which proves the *backfill*: this is the one assertion that fails if a
+    // later migration quietly relaxes the column again.
+    const column = await client.query<{ is_nullable: string; column_default: string | null }>(
+      `SELECT is_nullable, column_default
+         FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = 'sites' AND column_name = 'reporting_timezone'`,
+      [schemaName],
+    )
+    expect(column.rows[0]?.is_nullable).toBe('NO')
+    expect(column.rows[0]?.column_default).toContain('UTC')
   })
 
   it('carries the constraints the schema intends', async () => {

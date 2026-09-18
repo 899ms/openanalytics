@@ -2463,10 +2463,12 @@ paths:
       tags: [analytics]
       summary: Events, pageviews and unique visitors bucketed over time.
       description: |
-        The bucket grain (`minute`/`hour`/`day`) is chosen from the span and the
-        timezone; a sub-hour timezone at hour/day grain returns
-        `RESOLUTION_NOT_AVAILABLE` rather than a misattributed answer
-        (docs snapshot 02 §15).
+        The bucket grain (`minute`/`hour`/`day`) is chosen from the span. Every
+        timezone is served: the rollups compose from a fifteen-minute atom, and
+        every IANA offset in force is a whole number of those (docs snapshot 02
+        §15, ADR-0079). A range whose offset is not — the last zone on such an
+        offset left it in 1979 — returns `RESOLUTION_NOT_AVAILABLE` rather than
+        a misattributed answer.
 
         `resolution` overrides that choice and additionally offers `week` — the
         ISO week, Monday start, in the request timezone — which automatic
@@ -2692,9 +2694,9 @@ paths:
         so no session is double-counted. Bounce rate and the averages are derived
         at read from additive totals, never stored. `layering` carries
         `finalized_through` (beyond which results no longer change) and
-        `provisional_through` (the leading edge of revisable data). A sub-hour
-        timezone has no minute session rollup and returns
-        `RESOLUTION_NOT_AVAILABLE`.
+        `provisional_through` (the leading edge of revisable data). Session
+        metrics have no minute grain, so a short range is served at hour grain,
+        composed from the fifteen-minute session rollup in any timezone.
       responses:
         '200':
           description: Session metrics per bucket and as range totals, with layering metadata.
@@ -3209,7 +3211,7 @@ paths:
         card and a widget from one code path (ADR-0045, D3).
 
         **The range is resolved server-side, in the site's reporting zone**
-        (`sites.reporting_timezone`, `UTC` when unset) — a widget has no viewer
+        (`sites.reporting_timezone`, which every site has) — a widget has no viewer
         whose clock could be asked, and the same embed must show two readers the
         same numbers. `meta.timezone` reports what was used. `all` is anchored at
         the site's first event, never at its creation date (ADR-0044, D7). The
@@ -5028,12 +5030,11 @@ paths:
 
         **Revenue has hour and day grain only.** There is no minute revenue
         rollup: a per-minute revenue series is noise around individual
-        transactions, and the transactions list is the surface for those. A
-        sub-hour timezone offset — whose local midnight never lands on a UTC hour
-        — is refused with `RESOLUTION_NOT_AVAILABLE` rather than answered with
-        misattributed buckets, and `minute` or `week` in `resolution` is a
-        `VALIDATION_FAILED`. A non-UTC local day is composed from the hour
-        rollup, so a DST 23- or 25-hour day sums the hours it actually had.
+        transactions, and the transactions list is the surface for those.
+        `minute` or `week` in `resolution` is a `VALIDATION_FAILED`. A non-UTC
+        local day is composed from the fifteen-minute rollup, so a DST 23- or
+        25-hour day sums the hours it actually had — in every timezone, since
+        ADR-0079 made the atom fine enough for every offset in force.
 
         `unconverted_count` per bucket lets a chart mark a bucket whose total is
         incomplete without a second request; the per-currency amounts are on the
@@ -5916,24 +5917,24 @@ components:
             - $ref: '#/components/schemas/ReportingCurrency'
         reporting_timezone:
           description: |
-            The zone this site reports in, or `null` when the owner has never
-            configured one (ADR-0044, D4). Always present, so `null` is a
-            statement — "not configured" — and never "unknown".
+            The zone this site reports in (ADR-0044 D4, ADR-0079 D5). Always a
+            zone: since migration 0046 every site has one, and `null` is neither
+            sent nor accepted.
 
-            An **override**, not a replacement for the reader's own preference:
-            `users.timezone` (ADR-0026) is still what the dashboard sends on
-            every analytics request, and setting this changes no private query.
-            What it does is give the *public* share board a clock of the site's
-            own, so two viewers in two zones stop cutting different buckets
-            behind one link. Whether the public chart should switch to it is
-            F-317, an M18 question; today's default is unchanged.
+            It is the **default clock for every window this product cuts** —
+            "Today", "Last 7 days" and every other range start and end on this
+            zone's calendar, for the private dashboard, the public share board
+            and every widget alike, so two viewers in two countries stop cutting
+            different buckets behind one link. `users.timezone` (ADR-0026) is
+            what a reader falls back to when there is no site to ask, and a
+            reader who wants their own zone switches to it in the dashboard's
+            header — a per-visit view that writes nothing here.
 
             Set with `PATCH /v1/sites/{site_id}` under `site:settings`. Changing
             it does **not** bump the tracker/ingest config generation — the
             collector has never heard of a reporting timezone.
-          oneOf:
+          allOf:
             - $ref: '#/components/schemas/Timezone'
-            - type: 'null'
 
     ReportingCurrency:
       type: string
@@ -6060,7 +6061,7 @@ components:
           $ref: '#/components/schemas/ReportingCurrency'
         reporting_timezone:
           description: |
-            The site's reporting zone (ADR-0044, D4), or `null` to clear it.
+            The site's reporting zone (ADR-0044 D4, ADR-0079 D5).
 
             An IANA identifier, validated against the server runtime's own
             timezone database — a well-formed but unknown name is
@@ -6070,10 +6071,15 @@ components:
             silently, so it is a `400` here rather than a one-hour seam in a
             chart (ADR-0026).
 
+            **`null` is refused too.** It cleared the setting while the column
+            was nullable; since migration 0046 there is no cleared state to
+            return to, because every window the product cuts is cut on this
+            zone. A reader who wants their own switches to it in the dashboard
+            header, which changes their view and not the site.
+
             Setting it does not bump `config_version`.
-          oneOf:
+          allOf:
             - $ref: '#/components/schemas/Timezone'
-            - type: 'null'
 
     DeleteSiteRequest:
       type: object
@@ -8835,27 +8841,22 @@ components:
             - type: 'null'
         reporting_timezone:
           description: |
-            The zone the site's owner reports in, or `null` when they have never
-            configured one.
+            The zone the site's owner reports in. Always a zone — every site has
+            one since migration 0046 (ADR-0079 D5) — and never `null`.
 
-            Always present, so `null` is a statement: "not configured — the
-            viewer's clock applies". Set with `PATCH /v1/sites/{site_id}`
-            (`site:settings`); there is deliberately no server-side default,
-            because a stored `UTC` would be indistinguishable from an owner who
-            genuinely chose UTC (ADR-0026, decision 3).
+            Set with `PATCH /v1/sites/{site_id}` (`site:settings`).
 
             **Served to any live slug, whatever `share_identity` says** — a
             timezone is a rendering fact, not identity, and an anonymous share
             needs correct bucket boundaries as much as a named one (ADR-0044,
             D1).
 
-            Whether the public chart *should* be cut in this zone rather than the
-            viewer's is deliberately not decided by shipping the field: today's
-            default is unchanged and the question is registered as **F-317** for
-            M18.
-          oneOf:
+            The board **is** cut in this zone (ADR-0079 D5, which answered
+            F-317): a visitor who wants their own switches to it from the
+            header, and that choice is theirs for the visit and never the
+            site's.
+          allOf:
             - $ref: '#/components/schemas/Timezone'
-            - type: 'null'
         first_event_at:
           description: |
             When this site's first event reached the ingest pipeline, or `null` if

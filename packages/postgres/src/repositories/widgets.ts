@@ -151,7 +151,7 @@ export interface ResolvedPublicWidget {
   readonly configVersion: number
   readonly publishedImportRunId: string | null
   readonly importCutoverDate: string | null
-  readonly reportingTimezone: string | null
+  readonly reportingTimezone: string
   readonly firstEventAt: Date | null
 }
 

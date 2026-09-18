@@ -163,6 +163,16 @@ const READ_ONLY: McpToolAnnotations = {
 const RANGE_PARAMS = [
   { name: 'from', description: 'Range start, ISO-8601 UTC (inclusive).', required: true },
   { name: 'to', description: 'Range end, ISO-8601 UTC (exclusive).', required: true },
+  {
+    name: 'timezone',
+    description:
+      'Optional IANA timezone the days and weeks are cut on (for example Asia/Kolkata). ' +
+      "Defaults to the site's own reporting timezone, which is the zone its owner reads " +
+      'the dashboard in — send one only to answer a question about a different calendar. ' +
+      'A UTC offset such as +05:30 is refused; the answer names the zone it used in ' +
+      '`meta.timezone`.',
+    required: false,
+  },
 ] as const
 
 const LIMIT_PARAM = {
@@ -901,6 +911,13 @@ export function buildToolRequest(input: {
   readonly args: Record<string, unknown>
   /** The api's own public origin — the URL the request is addressed to. */
   readonly resourceUrl: string
+  /**
+   * The site's own reporting timezone, for a ranged read whose caller named no
+   * zone (ADR-0079 D5). Resolved by the surface, which is where a database and
+   * a principal are; `undefined` falls back to `UTC`, which is what a caller
+   * that cannot resolve one gets rather than a refusal.
+   */
+  readonly siteTimezone?: string
   /** The caller's credential, copied verbatim under the header it arrived on. */
   readonly credential: {
     readonly header: 'authorization' | 'cookie'
@@ -926,11 +943,15 @@ export function buildToolRequest(input: {
     const value = args[param.name]
     if (typeof value === 'string' && value.length > 0) url.searchParams.set(param.name, value)
   }
-  // Every analytics read is UTC here. A model that wanted a local-calendar
-  // answer would have to say which zone, and inventing one from a token is how a
-  // report silently shifts by a day.
-  if (tool.params.some((param) => param.name === 'from')) {
-    url.searchParams.set('timezone', 'UTC')
+  // Every ranged read names a zone, because the read route requires one. The
+  // model's own `timezone` argument is already on the URL if it sent one — it is
+  // a declared parameter like any other — and what fills the gap otherwise is
+  // **the site's** reporting timezone (ADR-0079 D5): the calendar its owner
+  // reads the dashboard on, so "last week" means to a model what it means to
+  // them. `UTC` remains the floor for a caller that could not resolve one, which
+  // is a defined zone rather than one invented from a token.
+  if (tool.params.some((param) => param.name === 'from') && !url.searchParams.has('timezone')) {
+    url.searchParams.set('timezone', input.siteTimezone ?? 'UTC')
   }
 
   const headers = new Headers({ accept: 'application/json' })
@@ -996,6 +1017,15 @@ export interface McpRoutesDeps {
    * stops "is this token valid" from having two answers.
    */
   readonly verifyBearer: (token: string) => Promise<{ userId: string } | null>
+  /**
+   * The reporting timezone of a site **this caller is a member of**, or null.
+   *
+   * Injected for the same reason `verifyBearer` is: this file keeps no database.
+   * Membership-scoped rather than by id alone, so answering "which calendar does
+   * this tool read on" cannot become a way to ask about a site the caller may
+   * not read (ADR-0079 D5).
+   */
+  readonly siteTimezone: (params: { siteId: string; userId: string }) => Promise<string | null>
   readonly logger?: Logger
 }
 
@@ -1095,7 +1125,8 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
     // Verified before any method is answered — including `initialize` and
     // `tools/list`, which is where the first version let a dead token through.
     const bearer = /^Bearer (.+)$/iu.exec(authorization.trim())?.[1]
-    if (!bearer || !(await deps.verifyBearer(bearer))) return unauthorized()
+    const principal = bearer ? await deps.verifyBearer(bearer) : null
+    if (!principal) return unauthorized()
 
     let body: JsonRpcRequest
     try {
@@ -1155,6 +1186,27 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
         const refusal = toolArgumentRefusal(tool, args)
         if (refusal !== null) return fail(JSON_RPC.invalidParams, refusal)
 
+        // The site's own clock, for a ranged tool whose caller named no zone
+        // (ADR-0079 D5). Read here rather than inside the builder because this
+        // is where a principal and a database are, and only for the tools that
+        // can use it — a listing takes no range and asks nothing.
+        //
+        // **Best-effort, and it has to be.** This resolves a presentational
+        // *default*; the read itself is fine without it, because `UTC` is a
+        // defined answer. A database hiccup here must therefore cost a caller
+        // the site's calendar and nothing else — turning a working analytics
+        // read into a 500 for the sake of a default would be a worse failure
+        // than the one it reports.
+        const siteId = args['site_id']
+        let siteTimezone: string | null = null
+        if (tool.params.some((param) => param.name === 'timezone') && typeof siteId === 'string') {
+          try {
+            siteTimezone = await deps.siteTimezone({ siteId, userId: principal.userId })
+          } catch (err) {
+            deps.logger?.warn('mcp_site_timezone_unresolved', { tool: tool.name, err })
+          }
+        }
+
         // **This is plan item 3.** Not a service call that resembles the route's
         // — the route itself, with its auth, its limiter, its membership check,
         // its scope check, its billing gate and its cost ledger. The `Request`
@@ -1166,6 +1218,7 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
             args,
             resourceUrl: deps.resourceUrl,
             credential: { header: 'authorization', value: authorization },
+            ...(siteTimezone === null ? {} : { siteTimezone }),
           }),
         )
         const text = await response.text()

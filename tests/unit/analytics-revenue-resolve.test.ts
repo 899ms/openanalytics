@@ -5,15 +5,18 @@ import { resolveRevenue } from '../../apps/api/src/analytics/resolve.ts'
  * Revenue resolution selection (ADR-0033, D7; ClickHouse migration 0018).
  * Milestone 12 Checkpoint 5.
  *
- * The revenue rollups have exactly the session rollups' shape — 1h and 1d only —
- * so the grain decision is the session decision with money in it. What this pins
- * is the three places that shape bites: no minute grain, a sub-hour zone refused
- * rather than answered wrong, and a non-UTC day composed from hours.
+ * The revenue rollups have exactly the session rollups' shape — 15m and 1d only
+ * — so the grain decision is the session decision with money in it. What this
+ * pins is the three places that shape bites: no minute grain, an offset the atom
+ * cannot express refused rather than answered wrong, and a non-UTC day composed
+ * from the atom rollup.
  */
 
 const UTC = 'UTC'
 const ISTANBUL = 'Europe/Istanbul' // +03:00, whole-hour
-const KATHMANDU = 'Asia/Kathmandu' // +05:45, sub-hour
+const KATHMANDU = 'Asia/Kathmandu' // +05:45, a quarter-hour offset
+// -10:40 until 1979-10-01: not a multiple of fifteen minutes, so still refused.
+const OLD_KIRITIMATI = 'Pacific/Kiritimati'
 
 function servable(result: ReturnType<typeof resolveRevenue>) {
   expect(result.servable, 'servable' in result ? String(result) : '').toBe(true)
@@ -21,7 +24,7 @@ function servable(result: ReturnType<typeof resolveRevenue>) {
 }
 
 describe('grain selection', () => {
-  it('serves a short UTC range at hour grain from revenue_1h', () => {
+  it('serves a short UTC range at hour grain from revenue_15m', () => {
     const r = servable(
       resolveRevenue({
         from: '2026-07-20T00:00:00.000Z',
@@ -91,22 +94,37 @@ describe('grain selection', () => {
         timezone: UTC,
       }),
     )
-    expect(r.effectiveFrom).toBe('2026-07-20T10:00:00.000Z')
+    expect(r.effectiveFrom).toBe('2026-07-20T10:30:00.000Z')
     expect(r.effectiveTo).toBe('2026-07-21T09:00:00.000Z')
+  })
+
+  it('serves a quarter-hour zone from revenue_15m, snapped to the quarter', () => {
+    const r = servable(
+      resolveRevenue({
+        from: '2026-07-19T18:15:00.000Z',
+        to: '2026-07-20T18:15:00.000Z',
+        timezone: KATHMANDU,
+      }),
+    )
+    expect(r.grain).toBe('hour')
+    expect(r.timeseriesOperation).toBe('analytics.revenue_timeseries_hour')
+    expect(r.summaryOperation).toBe('analytics.revenue_summary_hour')
+    expect(r.effectiveFrom).toBe('2026-07-19T18:15:00.000Z')
+    expect(r.effectiveTo).toBe('2026-07-20T18:15:00.000Z')
   })
 })
 
 describe('refusals', () => {
-  it('refuses a sub-hour timezone rather than misattributing every day edge', () => {
+  it('refuses an offset the atom cannot express rather than misattributing a day edge', () => {
     const r = resolveRevenue({
-      from: '2026-07-19T18:15:00.000Z',
-      to: '2026-07-20T18:15:00.000Z',
-      timezone: KATHMANDU,
+      from: '1975-01-01T00:00:00.000Z',
+      to: '1975-01-08T00:00:00.000Z',
+      timezone: OLD_KIRITIMATI,
     })
     expect(r.servable).toBe(false)
     if (!r.servable) {
-      expect(r.alignment).toBe('sub-hour')
-      expect(r.reason).toContain('no minute rollup')
+      expect(r.alignment).toBe('unservable')
+      expect(r.reason).toContain('multiple of fifteen minutes')
     }
   })
 

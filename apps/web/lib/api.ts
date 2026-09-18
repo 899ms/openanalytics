@@ -302,10 +302,11 @@ export const sites = {
    * replace the origin allowlist is trusted with the label the numbers are
    * denominated in, while reading those numbers stays owner-only.
    *
-   * `reporting_timezone` (ADR-0044) rides the same PATCH under the same
-   * scope. `null` clears it — "not configured; the viewer's clock applies" —
-   * and an IANA name is required: the server refuses offsets like `+05:00`
-   * with a `400`, because an offset is a timezone evaluated at one instant.
+   * `reporting_timezone` (ADR-0044, ADR-0079 D5) rides the same PATCH under the
+   * same scope, and an IANA name is the only thing it takes: the server refuses
+   * offsets like `+05:00` with a `400`, because an offset is a timezone
+   * evaluated at one instant, and it refuses `null` too — every site has a
+   * clock, and a reader who wants their own picks it from the header pill.
    */
   update: (
     siteId: string,
@@ -313,7 +314,7 @@ export const sites = {
       name?: string;
       domains?: string[];
       reporting_currency?: string;
-      reporting_timezone?: string | null;
+      reporting_timezone?: string;
     }
   ) => send<SiteSummary>("PATCH", `/v1/sites/${siteId}`, { body }),
   /**

@@ -1,7 +1,7 @@
 import type { Resolution } from '@openanalytics/contracts'
 import { z } from 'zod'
-import { timezoneOffsetMinutes } from './analytics-query.ts'
 import type { WidgetRange } from './widget.ts'
+import { zonedDayStart } from './zoned-calendar.ts'
 
 /**
  * The server's resolution of the dashboard's nine interval keys, and the widget
@@ -22,72 +22,14 @@ import type { WidgetRange } from './widget.ts'
  *
  * Two things it does **not** inherit from the frontend, both by ADR-0045 D10:
  *
- * - The zone is the **site's** (`sites.reporting_timezone`, `UTC` when unset)
- *   rather than the viewer's. A widget has no viewer to ask, and rendering
- *   "today" in a stranger's laptop clock would make one embed show two readers
- *   of the same page different numbers.
+ * - The zone is the **site's** (`sites.reporting_timezone`, which every site has
+ *   since migration 0046 — ADR-0079 D5) rather than the viewer's. A widget has
+ *   no viewer to ask, and rendering "today" in a stranger's laptop clock would
+ *   make one embed show two readers of the same page different numbers.
  * - `all` anchors at `first_event_at` alone, never at
  *   `min(created_at, first_event_at)`: ADR-0044 D7 keeps `created_at` off the
  *   public surface, and `meta.effective_range` would publish it.
  */
-
-/* -------------------------------------------------------------------------- */
-/* Calendar maths in an arbitrary IANA zone                                    */
-/* -------------------------------------------------------------------------- */
-
-/**
- * The zone's local calendar date at `instant`, as `[year, month, day]` with a
- * 1-based month.
- *
- * `en-CA` formats as `YYYY-MM-DD`, which is the one locale in wide use whose
- * default date order needs no part-by-part reassembly.
- */
-function localDateParts(instant: Date, timezone: string): [number, number, number] {
-  const [year, month, day] = new Intl.DateTimeFormat('en-CA', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  })
-    .format(instant)
-    .split('-')
-    .map(Number)
-  return [year as number, month as number, day as number]
-}
-
-/**
- * The UTC instant at which the calendar day containing `base` — shifted by whole
- * years, months or days **on that zone's calendar** — starts in `timezone`.
- *
- * The shift is applied through `Date.UTC`, so it is calendar arithmetic rather
- * than millisecond arithmetic: `{ days: -6 }` is six calendar days back even
- * across a 23- or 25-hour local day, and `{ months: -6 }` lands on the same day
- * of the month rather than 182 days earlier.
- *
- * **Two offset passes, and the second one is load-bearing.** The first converts
- * the target local midnight using the offset in force at the *UTC* instant of
- * that wall time, which is the wrong offset whenever the zone changes between
- * the two; the second re-reads the offset at the instant the first pass produced
- * and converges. Without it, a local midnight on the far side of a DST
- * transition lands an hour out — the error that moves a chart's first bucket
- * into the previous day. `timezoneOffsetMinutes` is the repository's existing
- * reader of the runtime tz database (it powers the gateway's own alignment
- * classification), so this cannot drift from what the query side believes.
- */
-function zonedDayStart(
-  base: Date,
-  timezone: string,
-  shift: { years?: number; months?: number; days?: number } = {},
-): Date {
-  const [year, month, day] = localDateParts(base, timezone)
-  const target = Date.UTC(
-    year + (shift.years ?? 0),
-    month - 1 + (shift.months ?? 0),
-    day + (shift.days ?? 0),
-  )
-  const first = target - timezoneOffsetMinutes(new Date(target), timezone) * 60_000
-  return new Date(target - timezoneOffsetMinutes(new Date(first), timezone) * 60_000)
-}
 
 /* -------------------------------------------------------------------------- */
 /* The nine keys                                                               */
@@ -101,7 +43,7 @@ export interface ResolvedWidgetRange {
 
 export interface WidgetRangeInput {
   readonly range: WidgetRange
-  /** `sites.reporting_timezone`; the caller substitutes `UTC` when it is null. */
+  /** `sites.reporting_timezone`, which is never null (migration 0046). */
   readonly timezone: string
   readonly now: Date
   /** `sites.first_event_at`. Only `all` reads it; `null` is "never ingested". */

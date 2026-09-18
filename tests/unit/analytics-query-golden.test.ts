@@ -20,46 +20,69 @@ import { isHalfOpenContained } from '@openanalytics/contracts'
 
 const NY = 'America/New_York'
 const LORD_HOWE = 'Australia/Lord_Howe'
+const LONDON = 'Europe/London'
 
-describe('Lord Howe interior sampling (the flagged classify defect)', () => {
-  // Lord Howe is +11:00 in the austral summer (Oct–Apr) and +10:30 — a sub-hour
-  // offset — through the standard-time months between. A range from one summer to
-  // the next has whole-hour offsets at *both endpoints* but a sub-hour stretch in
-  // its middle. Sampling only the ends calls it whole-hour and then composes local
-  // days from the hour rollup across a stretch the hour rollup cannot honour.
-  const summer2026 = new Date('2026-01-15T00:00:00.000Z')
-  const winter2026 = new Date('2026-07-15T00:00:00.000Z')
-  const summer2027 = new Date('2027-01-15T00:00:00.000Z')
+describe('interior sampling (the flagged classify defect)', () => {
+  // The defect this pins is *sampling only the endpoints*. Europe/London is the
+  // case that still has teeth after ADR-0079 step 3: it is offset zero at both
+  // ends of a calendar year and +01:00 through the summer between. An end-only
+  // classifier calls the year `utc`, reads `metrics_1d` straight, and gives
+  // every British summer day the wrong twenty-four hours. The interior walk is
+  // what demotes it to `local` and routes it through the composed-day path.
+  const winter2026 = new Date('2026-01-15T00:00:00.000Z')
+  const summer2026 = new Date('2026-07-15T00:00:00.000Z')
+  const winter2027 = new Date('2027-01-15T00:00:00.000Z')
 
-  it('both endpoints are whole-hour but the interior is sub-hour', () => {
-    expect(timezoneOffsetMinutes(summer2026, LORD_HOWE) % 60).toBe(0) // +11:00
-    expect(timezoneOffsetMinutes(summer2027, LORD_HOWE) % 60).toBe(0) // +11:00
-    expect(timezoneOffsetMinutes(winter2026, LORD_HOWE) % 60).not.toBe(0) // +10:30
+  it('both endpoints are UTC but the interior is not', () => {
+    expect(timezoneOffsetMinutes(winter2026, LONDON)).toBe(0)
+    expect(timezoneOffsetMinutes(winter2027, LONDON)).toBe(0)
+    expect(timezoneOffsetMinutes(summer2026, LONDON)).toBe(60) // BST
   })
 
-  it('classifies the summer-to-summer range as sub-hour, not by its ends', () => {
-    expect(classifyTimezoneAlignment(summer2026, summer2027, LORD_HOWE)).toBe('sub-hour')
+  it('classifies the winter-to-winter range as local, not by its ends', () => {
+    expect(classifyTimezoneAlignment(winter2026, winter2027, LONDON)).toBe('local')
   })
 
-  it('chooseResolution refuses that range rather than composing wrong days', () => {
+  it('chooseResolution composes that range rather than reading the UTC day table', () => {
+    const decision = chooseResolution({
+      from: '2026-01-15T00:00:00.000Z',
+      to: '2027-01-15T00:00:00.000Z',
+      timezone: LONDON,
+    })
+    expect(decision.servable).toBe(true)
+    expect(decision.timezoneAlignment).toBe('local')
+    expect(decision.sourceRollup).toBe('15m')
+    expect(decision.composeDayFromHour).toBe(true)
+  })
+
+  // Lord Howe is +11:00 in the austral summer (Oct–Apr) and +10:30 through the
+  // standard-time months between. Before ADR-0079 that half hour was the reason
+  // a summer-to-summer range was refused; fifteen-minute buckets fall wholly
+  // inside a +10:30 local day, so the same range is now served — by the same
+  // interior walk, which still sees both offsets and now approves both.
+  it('serves the summer-to-summer Lord Howe range the hour atom refused', () => {
+    const summer2027 = new Date('2027-01-15T00:00:00.000Z')
+    expect(timezoneOffsetMinutes(summer2026, LORD_HOWE) % 60).not.toBe(0) // +10:30
+    expect(classifyTimezoneAlignment(winter2026, summer2027, LORD_HOWE)).toBe('local')
+
     const decision = chooseResolution({
       from: '2026-01-15T00:00:00.000Z',
       to: '2027-01-15T00:00:00.000Z',
       timezone: LORD_HOWE,
     })
-    expect(decision.servable).toBe(false)
-    expect(decision.timezoneAlignment).toBe('sub-hour')
+    expect(decision.servable).toBe(true)
+    expect(decision.sourceRollup).toBe('15m')
   })
 })
 
 describe('DST days route through the composed-day path', () => {
   // The composed day path (composeDayFromHour) is what makes a 23h spring-forward
   // day and a 25h fall-back day come out right: ClickHouse's toStartOfDay(tz)
-  // groups the hour rollup by local day, so a short/long day gets exactly its own
+  // groups the atom rollup by local day, so a short/long day gets exactly its own
   // hours. The domain selector's job is to *route* a non-UTC day there and to keep
-  // the range hour-aligned; the 23/25h arithmetic itself is proven in the
+  // the range bucket-aligned; the 23/25h arithmetic itself is proven in the
   // ClickHouse rollup suite.
-  it('a US spring-forward local day composes from the hour rollup', () => {
+  it('a US spring-forward local day composes from the atom rollup', () => {
     // 2026-03-08 is the US spring-forward day (02:00 → 03:00 local). The local day
     // starts at 05:00Z (EST, -05:00) and the next local day starts at 04:00Z
     // (EDT, -04:00) — a 23-hour UTC span, both endpoints UTC-hour aligned.
@@ -69,19 +92,19 @@ describe('DST days route through the composed-day path', () => {
       timezone: NY,
     })
     expect(decision.grain).toBe('minute') // 23h ≤ the 24h minute band
-    // Whole-hour zone: even at minute grain the range is hour-aligned and servable.
+    // Non-UTC zone: even at minute grain the range is bucket-aligned and servable.
     expect(decision.servable).toBe(true)
-    expect(decision.timezoneAlignment).toBe('whole-hour')
+    expect(decision.timezoneAlignment).toBe('local')
   })
 
-  it('a multi-month non-UTC day range composes from the hour rollup across DST', () => {
+  it('a multi-month non-UTC day range composes from the atom rollup across DST', () => {
     const decision = chooseResolution({
       from: '2026-01-01T05:00:00.000Z',
       to: '2026-06-01T04:00:00.000Z',
       timezone: NY,
     })
     expect(decision.grain).toBe('day')
-    expect(decision.sourceRollup).toBe('1h')
+    expect(decision.sourceRollup).toBe('15m')
     expect(decision.composeDayFromHour).toBe(true)
     expect(decision.servable).toBe(true)
   })

@@ -10,6 +10,7 @@ import { scrubSecrets } from '@openanalytics/observability'
 import {
   assistantQuestionsSpent,
   chargeAssistantQuestion,
+  getSiteReportingTimezone,
   readAssistantUsage,
   recordAssistantTokens,
   type Database,
@@ -583,12 +584,37 @@ export function createAssistantRoutes(deps: AssistantRoutesDeps): Hono<Env> {
           // `readAuth`, the same live-membership check, the same scope ceiling,
           // the same billing gate, the same range ceiling and the same cost
           // ledger a browser would meet at this URL.
+          //
+          // The site's own clock rides along for a ranged tool the model gave no
+          // zone (ADR-0079 D5), resolved here for the reason the MCP surface
+          // resolves it there: this is where a principal and a database are.
+          // Membership-scoped, so a hallucinated site id learns nothing — and
+          // best-effort, because this is a *default*: `UTC` is a defined answer,
+          // and a failed read of it must not end a turn the model could have
+          // finished.
+          const toolSiteId = args['site_id']
+          let siteTimezone: string | null = null
+          if (
+            tool.params.some((param) => param.name === 'timezone') &&
+            typeof toolSiteId === 'string'
+          ) {
+            try {
+              siteTimezone = await getSiteReportingTimezone(deps.db, {
+                siteId: toolSiteId,
+                userId,
+              })
+            } catch (err) {
+              logger.warn('assistant_site_timezone_unresolved', { tool: tool.name, err })
+            }
+          }
+
           const request = buildToolRequest({
             tool,
             args,
             resourceUrl: deps.resourceUrl,
             credential: { header: 'cookie', value: cookie },
             signal: abort.signal,
+            ...(siteTimezone === null ? {} : { siteTimezone }),
           })
           const response = await deps.dispatch(request)
           const text = await response.text()

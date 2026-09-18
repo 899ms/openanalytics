@@ -604,9 +604,6 @@ describe('analytics read authorization', () => {
     it('400 RESOLUTION_NOT_AVAILABLE for a real grain this range or zone cannot carry', async () => {
       const app = authorized()
       const refused: [string, string][] = [
-        // A sub-hour zone has no honest hour/day/week answer.
-        [seriesUrl('timezone=Asia/Kathmandu&resolution=week'), 'sub-hour week'],
-        [seriesUrl('timezone=Asia/Kathmandu&resolution=day'), 'sub-hour day'],
         // 90 days of minute buckets is far past the minute rollup's scan cap.
         [seriesUrl('timezone=UTC&resolution=minute'), 'minute over a quarter'],
         // The day rollup buckets on UTC midnight, so a +03:00 zone cannot use it.
@@ -638,13 +635,33 @@ describe('analytics read authorization', () => {
     })
   })
 
-  it('400 RESOLUTION_NOT_AVAILABLE for a sub-hour timezone at hour grain', async () => {
+  it('200 for a quarter-hour timezone at hour grain (ADR-0079, step 3)', async () => {
+    // This route returned 400 RESOLUTION_NOT_AVAILABLE for +05:30 from M7 until
+    // the atom moved to fifteen minutes. The zone is now ordinary: it reaches
+    // the gateway on the same operation every other zone uses.
     const app = buildApp(true)
     membership.value = { role: 'viewer', isBillingOwner: false }
     siteBasics.value = { siteId: SITE, slug: 's', name: 'S', status: 'active' }
     const res = await app.fetch(
       new Request(
         `http://api.test/v1/sites/${SITE}/analytics/overview?from=2026-07-16T00:00:00.000Z&to=2026-07-23T00:00:00.000Z&timezone=Asia/Kolkata`,
+      ),
+    )
+    expect(res.status).toBe(200)
+    expect(gatewayCalls).toContain('analytics.overview_hour')
+  })
+
+  it('400 RESOLUTION_NOT_AVAILABLE for an offset the atom cannot express', async () => {
+    // Pacific/Kiritimati ran -10:40 until 1979-10-01 — the last offset in the
+    // tz database that is not a whole number of atoms. The refusal principle is
+    // unchanged (ADR-0011: refuse rather than approximate); what changed is how
+    // few ranges it now applies to.
+    const app = buildApp(true)
+    membership.value = { role: 'viewer', isBillingOwner: false }
+    siteBasics.value = { siteId: SITE, slug: 's', name: 'S', status: 'active' }
+    const res = await app.fetch(
+      new Request(
+        `http://api.test/v1/sites/${SITE}/analytics/overview?from=1975-01-01T00:00:00.000Z&to=1975-01-08T00:00:00.000Z&timezone=Pacific/Kiritimati`,
       ),
     )
     expect(res.status).toBe(400)

@@ -38,7 +38,12 @@ export default function RevenuePage() {
       <div className="flex flex-col gap-6">
         <div className="flex items-center justify-between gap-4">
           <h1 className="text-xl font-medium tracking-tight">Revenue</h1>
-          <IntervalSelect />
+          <div className="flex items-center gap-2">
+            {/* No clock on this screen: the header wears the overview's, and
+                only the overview's (Abbas, 2026-09-03). The pick made there
+                is remembered per site, so this screen's windows follow it. */}
+            <IntervalSelect />
+          </div>
         </div>
 
         {site.status !== "ready" ? (

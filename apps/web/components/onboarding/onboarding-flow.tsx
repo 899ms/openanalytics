@@ -49,9 +49,10 @@ import { MOCK_CREATED_SITE } from "@/lib/mock";
  * what opens the dashboard. A never-funded site has no countdown and is
  * never deleted for waiting, so "I'll do this later" is honest, not a trap.
  *
- * The timezone step writes `PATCH /v1/me/preferences` — the same value the
- * session then carries as `user.timezone`, which every analytics read
- * resolves through. The connect step watches `first_event_at` on the site
+ * The timezone step writes the answer twice: as the site's reporting timezone
+ * (`PATCH /v1/sites/{id}`), the calendar every window on the site is cut on,
+ * and as `PATCH /v1/me/preferences`, the fallback for a reader with no site to
+ * ask. The connect step watches `first_event_at` on the site
  * read: the install-verified signal, filled within ~1.5 s of the first event
  * and never moved again.
  */
@@ -99,12 +100,24 @@ const stepTitle = (step: Step): string =>
     : STEP_TITLES[step];
 
 /**
- * Persists the chosen zone as the account preference. Fire-and-forget: a
- * failed write must not block onboarding — the browser zone stands in until
- * the settings screen stores one.
+ * Persists the chosen zone as the site's reporting timezone and as the account
+ * preference. Fire-and-forget: a failed write must not block onboarding.
+ *
+ * The site write is what every other analytics product does with this answer:
+ * it is the default every dashboard, share and widget window on the site is cut
+ * on, and a brand-new site left on UTC would report UTC's today. It is its own
+ * PATCH, never folded into the allowlist one, because the server validates the
+ * zone against its own ICU — a zone this browser knows and the api does not
+ * would otherwise take the domains down with it, and an empty allowlist
+ * accepts *every* origin rather than none.
  */
-function saveTimezone(timezone: string): void {
+function saveTimezone(timezone: string, siteId: string | null): void {
   if (!LIVE_API) return;
+  if (siteId !== null) {
+    void sites.update(siteId, { reporting_timezone: timezone }).catch(() => {
+      // The site keeps the UTC zone it was created with; settings changes it.
+    });
+  }
   void preferences.update(timezone).catch(() => {
     // Settings owns retrying; analytics reads fall back to the browser zone.
   });
@@ -467,8 +480,9 @@ export function OnboardingFlow() {
                   className="flex flex-col gap-2.5 p-4"
                 >
                   <p className="text-xs leading-5 text-muted-foreground">
-                    Your reports cut their days on this timezone. We picked
-                    your browser&apos;s.
+                    This site&apos;s reports cut their days on this timezone,
+                    and so do yours. We picked your browser&apos;s. Either can
+                    be changed later.
                   </p>
                   {/* The shared picker's field dress: collapsed it is one
                       input-height row, and the list it expands sits in the
@@ -638,7 +652,7 @@ export function OnboardingFlow() {
               <Button
                 size="xs"
                 onClick={() => {
-                  saveTimezone(timezone);
+                  saveTimezone(timezone, created?.site_id ?? null);
                   goTo("install");
                 }}
               >

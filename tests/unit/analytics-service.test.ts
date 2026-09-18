@@ -353,15 +353,40 @@ describe('performance percentile mapping', () => {
   })
 })
 
-describe('sub-hour timezone is a typed refusal, not a wrong answer', () => {
-  it('throws RESOLUTION_NOT_AVAILABLE and never calls the gateway', async () => {
+describe('a quarter-hour timezone is served, and an unservable one is a typed refusal', () => {
+  it('reaches the gateway for Asia/Kolkata, on the same operation UTC uses', async () => {
+    // The refusal this replaces was ADR-0011's, and it rested on the atom being
+    // an hour. ADR-0079 step 3 moved the atom, so +05:30 is an ordinary zone:
+    // same operation id, range snapped to the quarter it now buckets on.
+    const { service, gateway } = serviceWith((op) => {
+      if (op === 'analytics.freshness')
+        return [{ watermark: '2026-07-23 14:35:00.000', buckets: '42' }]
+      return [{ events: '10', pageviews: '8', visitors: '5', billable_events: '10' }]
+    })
+    const res = await service.overview({
+      siteId: SITE,
+      from: '2026-07-16T00:00:00.000Z',
+      to: '2026-07-23T00:00:00.000Z',
+      timezone: 'Asia/Kolkata',
+      compare: false,
+    })
+    expect(res.totals.events).toBe(10)
+    const overview = gateway.calls.find((c) => c.operation === 'analytics.overview_hour')
+    expect(overview).toBeDefined()
+    expect(overview?.params['timezone']).toBe('Asia/Kolkata')
+  })
+
+  it('throws RESOLUTION_NOT_AVAILABLE and never calls the gateway for an offset the atom cannot express', async () => {
+    // Pacific/Kiritimati ran -10:40 until 1979-10-01: forty minutes is not a
+    // whole number of atoms, so the refusal principle (refuse rather than
+    // approximate) still has exactly one class of range it applies to.
     const { service, gateway } = serviceWith(() => [])
     await expect(
       service.overview({
         siteId: SITE,
-        from: '2026-07-16T00:00:00.000Z',
-        to: '2026-07-23T00:00:00.000Z',
-        timezone: 'Asia/Kolkata',
+        from: '1975-01-01T00:00:00.000Z',
+        to: '1975-01-08T00:00:00.000Z',
+        timezone: 'Pacific/Kiritimati',
         compare: false,
       }),
     ).rejects.toMatchObject({ code: 'RESOLUTION_NOT_AVAILABLE' })
@@ -453,17 +478,26 @@ describe('session metrics — finalized/provisional layering', () => {
     expect(res.layering.finalized_through).toBeNull()
   })
 
-  it('refuses a sub-hour timezone without reaching the gateway', async () => {
+  it('refuses only an offset the atom cannot express, and reaches the gateway otherwise', async () => {
     const { service, gateway } = serviceWith(() => [])
     await expect(
       service.sessions({
         siteId: SITE,
-        ...range,
-        timezone: 'Asia/Kolkata',
+        from: '1975-01-01T00:00:00.000Z',
+        to: '1975-01-08T00:00:00.000Z',
+        timezone: 'Pacific/Kiritimati',
         finalizedThrough: null,
       }),
     ).rejects.toMatchObject({ code: 'RESOLUTION_NOT_AVAILABLE' })
     expect(gateway.calls).toHaveLength(0)
+
+    await service.sessions({
+      siteId: SITE,
+      ...range,
+      timezone: 'Asia/Kolkata',
+      finalizedThrough: null,
+    })
+    expect(gateway.calls.length).toBeGreaterThan(0)
   })
 })
 

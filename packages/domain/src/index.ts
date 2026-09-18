@@ -113,6 +113,7 @@ export {
   isUtcDayAligned,
   isUtcHourAligned,
   isUtcMinuteAligned,
+  isUtcQuarterAligned,
   loadAnalyticsQueryConfig,
   resolveForcedGrain,
   timezoneOffsetMinutes,
@@ -198,6 +199,16 @@ export {
   type WidgetRange,
   type WidgetSurface,
 } from './widget.ts'
+
+export {
+  localDay,
+  localDateParts,
+  localHour,
+  localIsoWeekKey,
+  localWeekday,
+  zonedDayStart,
+  zonedWeekStart,
+} from './zoned-calendar.ts'
 
 export {
   loadWidgetReadConfig,

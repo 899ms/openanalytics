@@ -356,8 +356,10 @@ export interface PublicSiteIdentity {
   /** `sites.name` — the name the owner typed, not a separate public alias. */
   readonly displayName: string
   readonly faviconDomain: string | null
-  /** NULL means "not configured; the viewer's clock applies" (ADR-0044, D4). */
-  readonly reportingTimezone: string | null
+  /** The zone this site's days are cut on (ADR-0044 D4; always set since
+   * migration 0046, ADR-0079 D5). An anonymous viewer with no account to ask
+   * gets the owner's boundary rather than their own browser's. */
+  readonly reportingTimezone: string
   /** ADR-0027's install-verified instant, served unchanged. */
   readonly firstEventAt: Date | null
 }

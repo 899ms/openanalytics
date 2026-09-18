@@ -31,8 +31,15 @@ import { cn } from "@/lib/utils";
  *   spring absorbs as growth, not clipping.
  *
  * `nullLabel`, when given, leads the unfiltered list as a first row and is
- * what `value: null` means there ("Browser default…", "Not set…"). Callers
- * without it never receive null from `onPick`.
+ * what `value: null` means there. One caller passes it — the account
+ * preference panel, where "Browser default…" is a real answer and NULL means
+ * "this person has never chosen" (ADR-0026). A *site* has no such state since
+ * ADR-0079 D5, so Settings → General offers no such row. Callers without it
+ * never receive null from `onPick`.
+ *
+ * Every zone the runtime lists is pickable and none is annotated: ADR-0079
+ * step 3 made the fifteen-minute atom the source of every read, so +05:30,
+ * +05:45, +08:45 and +12:45 are served exactly like any other offset.
  */
 
 const SPRING = { type: "spring", stiffness: 550, damping: 38 } as const;
@@ -83,7 +90,21 @@ export function TimezoneSelect({
     () => filterZones(entries, query),
     [entries, query]
   );
-  const showNullRow = nullLabel !== undefined && query.trim() === "";
+  /**
+   * The field variant is an autocomplete, not a directory: nothing is
+   * listed until something is typed. The full tzdb is ~420 rows, and
+   * mounting them behind a 224px scroll window on open is what made the
+   * expand visibly lag its own animation; every open paid for four hundred
+   * rows nobody scrolled to. The cap keeps a one-letter query from
+   * rebuilding most of that directory, and `filterZones`' ranking puts the
+   * zone somebody means inside the first handful anyway.
+   */
+  const typed = query.trim() !== "";
+  const visible = React.useMemo(
+    () => (typed ? filtered.slice(0, 50) : []),
+    [typed, filtered]
+  );
+  const showNullRow = nullLabel !== undefined && !typed;
 
   const close = React.useCallback(() => {
     setOpen(false);
@@ -252,7 +273,16 @@ export function TimezoneSelect({
       <AnimatePresence initial={false}>
         {open && (
           <motion.div
-            animate={{ height: "auto", opacity: 1 }}
+            // Opening gets its own, stiffer spring: a press should be
+            // answered at least as fast as a dismissal, and the exit reads
+            // quick because its fade hides most of the collapse. The other
+            // half of opening fast is above: nothing is listed until typed,
+            // so the expand is a search box, not four hundred rows.
+            animate={{
+              height: "auto",
+              opacity: 1,
+              transition: { type: "spring", stiffness: 900, damping: 46 },
+            }}
             className="overflow-hidden"
             exit={{ height: 0, opacity: 0 }}
             initial={{ height: 0, opacity: 0 }}
@@ -265,14 +295,15 @@ export function TimezoneSelect({
                 className="h-9 w-full rounded-xl border border-input bg-white px-3 text-sm outline-none transition-[box-shadow,border-color] placeholder:text-muted-foreground/60 focus-visible:border-ring focus-visible:[outline:2px_solid_var(--ring)] focus-visible:[outline-offset:-2px]"
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && filtered[0] !== undefined) {
+                  if (event.key === "Enter" && visible[0] !== undefined) {
                     event.preventDefault();
-                    pick(filtered[0].zone);
+                    pick(visible[0].zone);
                   }
                 }}
                 placeholder="Country, city or timezone…"
                 value={query}
               />
+              {showNullRow || typed ? (
               <div
                 className="max-h-56 overflow-y-auto overscroll-contain rounded-xl border border-border bg-white"
                 role="listbox"
@@ -291,12 +322,12 @@ export function TimezoneSelect({
                     )}
                   </button>
                 ) : null}
-                {filtered.length === 0 ? (
+                {!typed ? null : visible.length === 0 ? (
                   <p className="px-3 py-2 text-sm text-muted-foreground">
                     Nothing matches “{query.trim()}”.
                   </p>
                 ) : (
-                  filtered.map((entry) => {
+                  visible.map((entry) => {
                     const isActive = entry.zone === value;
                     return (
                       <button
@@ -323,6 +354,7 @@ export function TimezoneSelect({
                   })
                 )}
               </div>
+              ) : null}
             </div>
           </motion.div>
         )}

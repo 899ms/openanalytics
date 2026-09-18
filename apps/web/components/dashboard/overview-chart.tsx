@@ -364,16 +364,14 @@ export function OverviewChart({
       // `?resolution=` picks the display grain outright: hour for the day
       // views, day for the week/month views, ISO week for 6/12 months —
       // weekly uniques are merged server-side, which no client-side summing
-      // of days could reproduce. Sub-hour-offset zones (Kathmandu) refuse
-      // every named grain, so there the plain ask keeps the server's own
-      // span-based choice.
-      const wholeHourZone = new Date().getTimezoneOffset() % 60 === 0;
+      // of days could reproduce. Named for every zone: the reads compose
+      // from a fifteen-minute atom, so +05:30 and +05:45 serve a named grain
+      // like any other offset. This used to fall back to the server's
+      // span-based choice for those.
       const spanMs = Date.parse(range.to) - Date.parse(range.from);
       return getAnalyticsTimeseries(site_id, range, {
         signal,
-        ...(wholeHourZone
-          ? { resolution: resolutionForInterval(interval, spanMs) }
-          : {}),
+        resolution: resolutionForInterval(interval, spanMs),
         ...(filtersParam !== undefined ? { filters: filtersParam } : {}),
       });
     },

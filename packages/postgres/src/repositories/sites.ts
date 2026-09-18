@@ -421,16 +421,19 @@ export interface UpdateSiteSettingsInput {
   readonly reportingCurrency?: string
   /**
    * The site's own reporting clock (ADR-0044, D4). `undefined` means the caller
-   * did not send it; `null` clears the setting back to "not configured; the
-   * viewer's clock applies". Already validated by `isValidTimezone` at the route,
-   * which is the only place that can ask the runtime's tz database — the column's
-   * CHECK is the shape floor under it, not a second opinion.
+   * did not send it. There is no third state: since migration 0046 the column is
+   * NOT NULL (ADR-0079 D5), so the setting cannot be *cleared* — a site always
+   * reports on some zone, and a reader who wants their own switches to it from
+   * the header pill without writing anything here. Already validated by
+   * `isValidTimezone` at the route, which is the only place that can ask the
+   * runtime's tz database — the column's CHECK is the shape floor under it, not
+   * a second opinion.
    *
    * Unlike a domain change and like `reportingCurrency`, writing it does **not**
    * bump `config_version`: that counter is the tracker/ingest config generation,
    * and the collector has never heard of a reporting timezone.
    */
-  readonly reportingTimezone?: string | null
+  readonly reportingTimezone?: string
   readonly actorUserId: string
 }
 
@@ -444,7 +447,7 @@ export interface UpdatedSiteSettings {
   /** True when the domain set changed, which is what bumped the version. */
   readonly configVersionBumped: boolean
   readonly reportingCurrency: string
-  readonly reportingTimezone: string | null
+  readonly reportingTimezone: string
   /**
    * True when this update changed the reporting currency and therefore queued a
    * re-materialization (ADR-0033, D2c). The route reports it so a client can say
@@ -552,8 +555,9 @@ export async function updateSiteSettings(
           : { reportingCurrency: input.reportingCurrency }),
         // Same treatment, same reason (ADR-0044, D4): a read-side presentation
         // choice, so it is written whenever it was sent and never touches
-        // `config_version`. `null` is a value here, not an absence — it clears
-        // the setting — which is why the branch tests against `undefined`.
+        // `config_version`. Only `undefined` — "the caller did not send it" —
+        // skips the write; the column has held no other absence since migration
+        // 0046 made it NOT NULL (ADR-0079 D5).
         ...(input.reportingTimezone === undefined
           ? {}
           : { reportingTimezone: input.reportingTimezone }),
@@ -951,13 +955,17 @@ export interface SiteForUser {
    */
   readonly reportingCurrency: string
   /**
-   * The site's own reporting clock (ADR-0044, D4), or null when the owner has
-   * never configured one. An *override* on top of ADR-0026's user preference,
-   * not a replacement: no private analytics query reads it. It is on the summary
-   * because the settings screen renders it and the public share board is served
-   * it — one value, one place it is read from.
+   * The site's own reporting clock (ADR-0044, D4), and since migration 0046
+   * always a zone (ADR-0079 D5) — the default every window on this site is cut
+   * on, for the dashboard, the share board and every widget alike. ADR-0026's
+   * user preference is what a reader falls back to when there is no site to ask,
+   * which on this surface there always is.
+   *
+   * It is on the summary because the settings screen renders it, the dashboard
+   * reads its clock off it and the public share board is served it — one value,
+   * one place it is read from.
    */
-  readonly reportingTimezone: string | null
+  readonly reportingTimezone: string
 }
 
 const siteForUserColumns = {
@@ -997,7 +1005,7 @@ function toSiteForUser(
     firstEventAt: Date | null
     suspendedAt: Date | null
     reportingCurrency: string
-    reportingTimezone: string | null
+    reportingTimezone: string
   },
   userId: string,
 ): SiteForUser {
@@ -1062,6 +1070,34 @@ export async function getMembership(
     .innerJoin(sites, eq(siteMembers.siteId, sites.id))
     .where(and(eq(siteMembers.siteId, params.siteId), eq(siteMembers.userId, params.userId)))
   return row ? { role: row.role, isBillingOwner: row.billingOwner === params.userId } : null
+}
+
+/**
+ * The zone a site reports in, for a caller who is a member of it — null when
+ * they are not, or when no such site exists.
+ *
+ * One column, and membership-scoped on purpose. It exists for the tool surfaces
+ * (MCP, the assistant), which have to name a timezone on every ranged read
+ * before the read route can check anything, and the alternative — reading the
+ * column by id alone — would answer "which zone is this site on" to any
+ * authenticated caller who could name an id, for a site they cannot read.
+ *
+ * Narrower than `getSiteForUser` because the caller wants one string: that
+ * function aggregates the domain allowlist in a subquery, which is a list
+ * nobody here renders.
+ */
+export async function getSiteReportingTimezone(
+  db: Database,
+  params: { siteId: string; userId: string },
+): Promise<string | null> {
+  const [row] = await db
+    .select({ reportingTimezone: sites.reportingTimezone })
+    .from(siteMembers)
+    .innerJoin(sites, eq(siteMembers.siteId, sites.id))
+    .where(
+      and(eq(siteMembers.userId, params.userId), eq(siteMembers.siteId, params.siteId), notDeleted),
+    )
+  return row?.reportingTimezone ?? null
 }
 
 /** Resolves a public slug to an internal id, but only for a site the caller can

@@ -5,6 +5,10 @@ import Link from "next/link";
 import { useParams, usePathname, useRouter } from "next/navigation";
 import * as React from "react";
 import { SuspendedSiteScreen } from "@seam/slots";
+import {
+  SiteSummaryProvider,
+  type SiteSummaryState,
+} from "@/components/dashboard/site-summary-context";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -78,12 +82,52 @@ export function SiteLifecycleGate({
 
   const onSettings = pathname?.includes("/settings") ?? false;
 
+  // The read this gate makes anyway, published for the screens under it — the
+  // interval provider needs the site's reporting zone before it cuts a window
+  // (ADR-0079 D5), and a second fetch of the same row would only be a way for
+  // two answers to disagree. An error settles as "no site": the panels present
+  // their own failures, and a clock that waits forever on a flaky summary is
+  // worse than one that falls back.
+  const published: SiteSummaryState =
+    summary.phase === "loading"
+      ? { phase: "loading", site: null, reload: summary.reload }
+      : { phase: "settled", site: summary.data, reload: summary.reload };
+
+  return (
+    <SiteSummaryProvider value={published}>
+      <LifecycleScreen
+        locallyDeleting={locallyDeleting}
+        onSettings={onSettings}
+        site={summary.phase === "ready" ? summary.data : null}
+      >
+        {children}
+      </LifecycleScreen>
+    </SiteSummaryProvider>
+  );
+}
+
+/**
+ * Which of the three screens the site's status calls for. Split out so the
+ * summary can be published above it: the provider has to wrap every branch,
+ * including the ones that replace `children` entirely.
+ */
+function LifecycleScreen({
+  site,
+  onSettings,
+  locallyDeleting,
+  children,
+}: {
+  /** `null` while the summary is loading, and on a read that failed. */
+  site: SiteSummary | null;
+  onSettings: boolean;
+  locallyDeleting: ReadonlySet<string>;
+  children: React.ReactNode;
+}) {
   // Fail open on load/error: the panels behind the gate present their own
   // states, and a gate that blanks the site on a flaky summary read would
   // hide screens that still work.
-  if (summary.phase !== "ready") return <>{children}</>;
+  if (site === null) return <>{children}</>;
 
-  const site = summary.data;
   // `deleted` never normally reaches here (by-id reads 404), but if it does,
   // the deleting screen's poll lands on the same 404 and routes out.
   if (

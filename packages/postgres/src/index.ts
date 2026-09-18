@@ -56,6 +56,7 @@ export {
   getMembership,
   getSiteBasics,
   getSiteForUser,
+  getSiteReportingTimezone,
   listMembers,
   listSitesForUser,
   markSitesFirstEvent,

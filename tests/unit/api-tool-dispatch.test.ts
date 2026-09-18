@@ -62,24 +62,52 @@ describe('the tool request builder (ADR-0046 D3)', () => {
     expect(url.searchParams.get('limit')).toBe('5')
   })
 
-  it('pins every ranged read to UTC, and adds no timezone where there is no range', () => {
-    // A model that wanted a local-calendar answer would have to say which zone,
-    // and inventing one is how a report silently shifts by a day.
+  it('cuts a ranged read on the site’s own clock, and adds no timezone where there is no range', () => {
+    // ADR-0079 D5: the site's reporting zone is the calendar its owner reads the
+    // dashboard on, so "last week" means to a model what it means to them. It
+    // used to be a hardcoded `UTC`, which quietly shifted a Kolkata report by a
+    // day against the screen it told the reader to open.
     const ranged = buildToolRequest({
       tool: tool('site_overview'),
       args: { site_id: SITE, from: '2026-07-16T00:00:00.000Z', to: '2026-07-23T00:00:00.000Z' },
       resourceUrl: ORIGIN,
       credential: { header: 'cookie', value: 'oa_session=x' },
+      siteTimezone: 'Asia/Kolkata',
     })
-    expect(new URL(ranged.url).searchParams.get('timezone')).toBe('UTC')
+    expect(new URL(ranged.url).searchParams.get('timezone')).toBe('Asia/Kolkata')
 
     const listing = buildToolRequest({
       tool: tool('list_sites'),
       args: {},
       resourceUrl: ORIGIN,
       credential: { header: 'cookie', value: 'oa_session=x' },
+      siteTimezone: 'Asia/Kolkata',
     })
     expect(new URL(listing.url).searchParams.get('timezone')).toBeNull()
+  })
+
+  it('lets the model name a zone, and falls back to UTC when nobody named one', () => {
+    // The argument wins: a question about a different calendar is a question the
+    // model may legitimately ask, and the answer names the zone it used in
+    // `meta.timezone` either way.
+    const asked = buildToolRequest({
+      tool: tool('site_overview'),
+      args: { site_id: SITE, from: 'a', to: 'b', timezone: 'Pacific/Auckland' },
+      resourceUrl: ORIGIN,
+      credential: { header: 'cookie', value: 'oa_session=x' },
+      siteTimezone: 'Asia/Kolkata',
+    })
+    expect(new URL(asked.url).searchParams.get('timezone')).toBe('Pacific/Auckland')
+
+    // And a caller that could resolve no site zone still names a defined one,
+    // rather than sending a read the route would refuse for a missing parameter.
+    const unresolved = buildToolRequest({
+      tool: tool('site_overview'),
+      args: { site_id: SITE, from: 'a', to: 'b' },
+      resourceUrl: ORIGIN,
+      credential: { header: 'cookie', value: 'oa_session=x' },
+    })
+    expect(new URL(unresolved.url).searchParams.get('timezone')).toBe('UTC')
   })
 
   it('names the site in the header for a site tool, and not at all for list_sites', () => {
@@ -184,7 +212,7 @@ describe('the revenue tool rows (ADR-0049 D2)', () => {
     }
   })
 
-  it('dispatches into the revenue route with the range, the site header and UTC', () => {
+  it('dispatches into the revenue route with the range, the site header and the site’s zone', () => {
     const request = buildToolRequest({
       tool: tool('revenue_summary'),
       args: {
@@ -195,10 +223,11 @@ describe('the revenue tool rows (ADR-0049 D2)', () => {
       },
       resourceUrl: ORIGIN,
       credential: { header: 'cookie', value: 'oa_session=x' },
+      siteTimezone: 'Europe/Istanbul',
     })
     const url = new URL(request.url)
     expect(url.origin + url.pathname).toBe(`${ORIGIN}/v1/read/revenue/summary`)
-    expect(url.searchParams.get('timezone')).toBe('UTC')
+    expect(url.searchParams.get('timezone')).toBe('Europe/Istanbul')
     expect(url.searchParams.get('resolution')).toBe('day')
     expect(request.headers.get(SITE_HEADER)).toBe(SITE)
   })

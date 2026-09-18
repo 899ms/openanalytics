@@ -343,7 +343,7 @@ describeIfPostgres('public dashboard surfaces (migrations 0040 and 0047)', () =>
 
   /** ADR-0044 D4/D5/D6/D7: the four values the site-identity read serves. */
   describe('readPublicSiteIdentity and sites.reporting_timezone (ADR-0044)', () => {
-    it('serves the name, a null timezone and a null favicon domain by default', async () => {
+    it('serves the name, the column default clock and a null favicon domain by default', async () => {
       const { siteId } = await makeSite()
       const identity = await readPublicSiteIdentity(db, siteId)
       expect(identity).toEqual({
@@ -351,10 +351,12 @@ describeIfPostgres('public dashboard surfaces (migrations 0040 and 0047)', () =>
         // No allowlist configured, so there is no domain to derive one from.
         // Null rather than a guess: a wrong favicon is worse than none.
         faviconDomain: null,
-        // Migration 0047 adds the column with no default. NULL is "the owner has
-        // never chosen", which the public read serves as `null` — never 'UTC',
-        // which would be indistinguishable from an owner who chose UTC.
-        reportingTimezone: null,
+        // The column was nullable until migration 0046 (0047 in the public
+        // stream) and NULL meant "the owner has never chosen". It is NOT NULL
+        // DEFAULT 'UTC' now (ADR-0079 D5): every window the product cuts is cut
+        // on this zone, so a site without one is a site whose two readers see
+        // two different weeks.
+        reportingTimezone: 'UTC',
         firstEventAt: null,
       })
     })
@@ -395,19 +397,32 @@ describeIfPostgres('public dashboard surfaces (migrations 0040 and 0047)', () =>
       expect((await readPublicSiteIdentity(db, siteId))?.reportingTimezone).toBe('Europe/Istanbul')
     })
 
-    it('clears the setting on an explicit null, and null is not "unset the field"', async () => {
+    it('leaves the clock alone when the update does not name one', async () => {
+      // `undefined` is the only absence the input has since migration 0046:
+      // there is no cleared state to return to, so a rename must not quietly
+      // take a site's reporting zone with it.
       const { siteId, ownerUserId } = await makeSite()
       await updateSiteSettings(db, {
         siteId,
         reportingTimezone: 'Europe/Istanbul',
         actorUserId: ownerUserId,
       })
-      const cleared = await updateSiteSettings(db, {
+      const renamed = await updateSiteSettings(db, {
         siteId,
-        reportingTimezone: null,
+        name: 'Renamed',
         actorUserId: ownerUserId,
       })
-      expect(cleared.reportingTimezone).toBeNull()
+      expect(renamed.reportingTimezone).toBe('Europe/Istanbul')
+    })
+
+    it('the column refuses a NULL a direct SQL write could plant', async () => {
+      // The NOT NULL from migration 0046 is the floor under the route's refusal:
+      // the API answers 400 to `reporting_timezone: null`, and this is what
+      // stops anything reaching past it.
+      const { siteId } = await makeSite()
+      await expect(
+        pool.query(`UPDATE sites SET reporting_timezone = NULL WHERE id = $1`, [siteId]),
+      ).rejects.toMatchObject({ column: 'reporting_timezone' })
     })
 
     it('the column CHECK refuses an offset zone a caller could smuggle past the API', async () => {
