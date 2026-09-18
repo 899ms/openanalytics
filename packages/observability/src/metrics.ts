@@ -120,3 +120,74 @@ export function createRecordingMetrics(): Metrics & {
     },
   }
 }
+
+/** Default: a repeated gauge reading is written at most once a minute. */
+export const DEFAULT_GAUGE_MIN_INTERVAL_MS = 60_000
+
+/** Distinct gauge series remembered for throttling. Past this, nothing is held
+ * back — a caller with unbounded labels loses the saving, never a reading. */
+const MAX_THROTTLED_GAUGE_SERIES = 2_000
+
+export interface ThrottleGaugesOptions {
+  /** How long an unchanged reading may be suppressed. Default 60 s. */
+  readonly minIntervalMs?: number
+  readonly now?: () => number
+}
+
+/**
+ * Drops a gauge emission whose value has not moved and whose series was written
+ * less than `minIntervalMs` ago.
+ *
+ * The loops that publish gauges tick far faster than the reading changes — the
+ * outbox dispatcher republishes backlog and oldest-age for every topic × status
+ * every 5 s (`DEFAULT_INTERVAL_MS`), almost always the same zeroes. Against a
+ * remote-write backend that costs nothing (the exporter holds the last value and
+ * pushes on its own flush), but against the structured-log floor every one of
+ * those readings is a line on disk. Measured on a busy worker it was hundreds
+ * of megabytes a day, read by nobody, into a Docker log file that grows until
+ * the disk is full.
+ *
+ * So this wraps the *floor*, not the exporter (see `createServiceMetrics`).
+ * Suppression is bounded in both directions: a value that changes is written
+ * immediately, and an unchanged one is still written every `minIntervalMs`, so
+ * the series never goes stale — an alert rule written as a Prometheus instant
+ * query looks back five minutes, and a one-minute floor clears that with room
+ * to spare.
+ *
+ * Counters pass straight through. A counter's value is the sum of its
+ * emissions; skipping one would lose the measurement rather than repeat it.
+ */
+export function throttleGauges(inner: Metrics, options: ThrottleGaugesOptions = {}): Metrics {
+  const minIntervalMs = options.minIntervalMs ?? DEFAULT_GAUGE_MIN_INTERVAL_MS
+  const now = options.now ?? (() => Date.now())
+  const lastWritten = new Map<string, { value: number; at: number }>()
+
+  const keyOf = (name: string, labels: MetricLabels): string => {
+    const parts = Object.keys(labels)
+      .sort()
+      .map((label) => `${label}=${String(labels[label])}`)
+    return `${name}{${parts.join(',')}}`
+  }
+
+  return {
+    increment(name, labels, value) {
+      inner.increment(name, labels, value)
+    },
+    gauge(name, value, labels = {}) {
+      try {
+        const key = keyOf(name, labels)
+        const previous = lastWritten.get(key)
+        const at = now()
+
+        if (previous && previous.value === value && at - previous.at < minIntervalMs) return
+
+        if (previous || lastWritten.size < MAX_THROTTLED_GAUGE_SERIES) {
+          lastWritten.set(key, { value, at })
+        }
+      } catch {
+        // Bookkeeping must never cost a reading: fall through and emit.
+      }
+      inner.gauge(name, value, labels)
+    },
+  }
+}

@@ -36,12 +36,15 @@ export {
 } from './remote-write.ts'
 
 export {
+  DEFAULT_GAUGE_MIN_INTERVAL_MS,
   NOOP_METRICS,
   createLoggingMetrics,
   createRecordingMetrics,
+  throttleGauges,
   type MetricLabels,
   type Metrics,
   type RecordedMetric,
+  type ThrottleGaugesOptions,
 } from './metrics.ts'
 
 export {

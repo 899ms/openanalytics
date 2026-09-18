@@ -7,9 +7,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
  *
  * The exporter's wire format is proven byte-for-byte in `remote-write.test.ts`;
  * what this owns is the entrypoint decision every long-lived service now shares —
- * build the exporter only with all three credentials, keep the logging floor
- * either way, label every series with the service identity, and say so once when
- * remote-write is off.
+ * build the exporter only with all three credentials, use the logging floor only
+ * when there is no exporter (the floor underneath a working exporter cost
+ * hundreds of megabytes of unread `metric` lines a day on a busy worker), label
+ * every series with the service identity, and name the live sink once at startup.
  */
 
 const BASE: ServiceMetricsEnv = {
@@ -41,12 +42,43 @@ describe('createServiceMetrics — no remote-write credentials', () => {
 
     expect(sm.remoteWrite).toBeNull()
     expect(captured.find('metrics_remote_write_disabled')).toHaveLength(1)
+    expect(captured.find('metrics_sink')[0]?.['sink']).toBe('logging')
 
     // The floor is live: an increment still lands as a structured metric line.
     sm.metrics.increment('collector_some_counter', { reason: 'x' })
     const metric = captured.find('metric')
     expect(metric).toHaveLength(1)
     expect(metric[0]?.['metric']).toBe('collector_some_counter')
+  })
+
+  it('throttles a repeated gauge reading on the floor', () => {
+    const captured = createCapturedLogger()
+    const sm = createServiceMetrics({
+      env: BASE,
+      logger: captured.logger,
+      service: 'worker',
+      instance: 'worker-abc123',
+    })
+
+    // The outbox dispatcher's shape: the same zero, every 5 s, per topic.
+    for (let tick = 0; tick < 12; tick += 1) {
+      sm.metrics.gauge('worker_outbox_backlog', 0, { topic: 'email', status: 'pending' })
+    }
+
+    expect(captured.find('metric')).toHaveLength(1)
+
+    // A reading that moves is never held back.
+    sm.metrics.gauge('worker_outbox_backlog', 3, { topic: 'email', status: 'pending' })
+    expect(captured.find('metric')).toHaveLength(2)
+
+    // A different series is throttled independently, not swallowed by the first.
+    sm.metrics.gauge('worker_outbox_backlog', 0, { topic: 'webhook', status: 'pending' })
+    expect(captured.find('metric')).toHaveLength(3)
+
+    // Counters are exempt: their value is the sum of their emissions.
+    sm.metrics.increment('worker_jobs_total', { job: 'x' })
+    sm.metrics.increment('worker_jobs_total', { job: 'x' })
+    expect(captured.find('metric')).toHaveLength(5)
   })
 
   it('stops cleanly when no exporter was built', async () => {
@@ -62,7 +94,7 @@ describe('createServiceMetrics — no remote-write credentials', () => {
 })
 
 describe('createServiceMetrics — remote-write credentials present', () => {
-  it('builds the exporter, keeps the floor, and emits no disabled warning', () => {
+  it('builds the exporter, drops the floor, and emits no disabled warning', () => {
     const captured = createCapturedLogger()
     const sm = createServiceMetrics({
       env: WITH_CREDS,
@@ -73,10 +105,13 @@ describe('createServiceMetrics — remote-write credentials present', () => {
 
     expect(sm.remoteWrite).not.toBeNull()
     expect(captured.find('metrics_remote_write_disabled')).toHaveLength(0)
+    expect(captured.find('metrics_sink')[0]?.['sink']).toBe('remote_write')
 
-    // The logging floor stays underneath the exporter.
+    // No floor underneath the exporter: nothing reads those lines, and on a
+    // busy worker they were hundreds of megabytes a day.
     sm.metrics.increment('realtime_some_counter')
-    expect(captured.find('metric')).toHaveLength(1)
+    sm.metrics.gauge('realtime_connections', 4)
+    expect(captured.find('metric')).toHaveLength(0)
   })
 
   it('labels every series with service/environment/version/instance', async () => {
