@@ -55,10 +55,11 @@ export default function ShareDocsPage() {
 
       <DocSection title="The viewer's controls">
         <p>
-          A visitor to the share page picks their own range and their own
-          timezone (searchable by country or city), so a reader in another
-          country reads your day on their clock. Their choices touch nothing
-          of yours.
+          The page opens on your site&apos;s reporting timezone, the same
+          clock your dashboard and widgets use. A visitor picks their own
+          range and can switch the timezone (searchable by country or city),
+          so a reader in another country can read your day on their own
+          clock. Their choices touch nothing of yours.
         </p>
       </DocSection>
 

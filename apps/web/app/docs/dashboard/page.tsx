@@ -169,11 +169,11 @@ https://example.com/pricing?ref=newsletter`}</DocCode>
 
       <DocSection title="Whose clock cuts the day">
         <p>
-          Charts follow your account timezone (or your browser&apos;s, until
-          you pick one), so Today means your today. Widgets and public
-          share pages have their own rules; the{" "}
-          <DocLink slug="timezones">timezones page</DocLink> lays out all
-          three clocks.
+          Charts follow the site&apos;s reporting timezone, so Today means
+          the same day for everyone on the team. To read the numbers on your
+          own clock, switch the timezone from the dashboard header; it changes
+          your view only. The{" "}
+          <DocLink slug="timezones">timezones page</DocLink> has the details.
         </p>
       </DocSection>
 

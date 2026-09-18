@@ -51,10 +51,10 @@ export default function WidgetsDocsPage() {
       <DocSection title="Whose clock a widget reads">
         <DocNote>
           A widget&apos;s window (Today, Last 7 days) is cut server-side in
-          the site&apos;s reporting timezone, set on the same Widgets tab.
-          Not set, windows resolve in UTC. This is deliberate: a public
-          widget cannot ask each reader for a timezone, so the site declares
-          one. The whole clock story is on{" "}
+          the site&apos;s reporting timezone, set under Site Settings,
+          General. Every site has one. This is deliberate: a public widget
+          cannot ask each reader for a timezone, so it reads the site&apos;s.
+          The whole clock story is on{" "}
           <DocLink slug="timezones">the timezones page</DocLink>.
         </DocNote>
       </DocSection>

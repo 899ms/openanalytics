@@ -13,36 +13,53 @@ export const metadata = docsMetadata(page);
 export default function TimezonesDocsPage() {
   return (
     <DocArticle page={page}>
-      <DocSection title="Three clocks, three owners">
+      <DocSection title="One clock per site, and a reader's own view">
+        <p>
+          Every site has exactly one reporting timezone, and everything about
+          the site is counted on it. A reader can look at the same numbers on
+          another clock without changing anything.
+        </p>
         <DocTable
           head={["Clock", "Set where", "Governs"]}
           rows={[
             [
-              "Your timezone",
-              "Account, Preferences",
-              "Your own dashboards: Today means today in this zone, on every site you can see. Browser default follows wherever you sign in from.",
-            ],
-            [
               "The site's reporting timezone",
-              "Site Settings, Widgets tab",
-              "Widgets' windows, cut server-side, and the public dashboard's default. Not set, widgets resolve in UTC.",
+              "Site Settings, General tab",
+              "Every reading of the site: the dashboard, widgets, the public share page, and the answers the MCP server and the assistant give. Every site has one. A site created from the dashboard starts on the timezone of the browser that created it, one created through the API starts on UTC, and an owner or admin can change it at any time.",
             ],
             [
-              "The share page viewer's pick",
-              "On the public page itself",
-              "That viewer's reading only; remembered per tab, touches nothing of yours.",
+              "A reader's pick",
+              "The timezone button in the dashboard header, or on the share page",
+              "That reader's view only: the same data, cut on their clock. It is remembered for the tab and writes nothing, so nobody else's view moves.",
+            ],
+            [
+              "Your account timezone",
+              "Account, Preferences",
+              "A fallback only, for the moment before a site's own timezone has loaded. It does not override the site's clock.",
             ],
           ]}
         />
       </DocSection>
 
-      <DocSection title="Why they are separate">
+      <DocSection title="Why the site owns the clock">
         <p>
-          A team is people in different places: each member reads charts on
-          their own clock without changing anyone else&apos;s. A widget is
-          public and cannot ask its reader anything, so the site declares
-          its clock once. A share page can ask, so it does, with a picker
-          that searches by country, city or timezone name.
+          Today, this week and this month have to mean the same thing to
+          everyone who reads a site, or two teammates comparing numbers are
+          comparing different days. So the site declares its clock once, and
+          widgets and share links, which cannot ask their reader anything, use
+          it too. A reader who wants their own day can still switch the view
+          from the header, with a picker that searches by country, city or
+          timezone name.
+        </p>
+      </DocSection>
+
+      <DocSection title="Every timezone works">
+        <p>
+          Any IANA timezone can be a reporting timezone, including the ones
+          whose offset is not a whole hour, such as India (+05:30) and Nepal
+          (+05:45). Days are assembled from fifteen-minute buckets, so a local
+          midnight at half past or quarter to the hour is cut exactly, and
+          daylight saving days come out 23 or 25 hours long, as they are.
         </p>
       </DocSection>
 

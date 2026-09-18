@@ -167,7 +167,7 @@ export const DOC_SECTIONS: DocSection[] = [
         title: "Timezones",
         nav: "Timezones",
         summary:
-          "The three clocks: your dashboard timezone, a site's reporting timezone, and the share page's viewer picker.",
+          "Every site reports on its own timezone, any IANA zone including +05:30 and +05:45, and a reader can switch their own view.",
       },
     ],
   },
