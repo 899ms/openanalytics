@@ -63,6 +63,31 @@ const SUBJECT_ONLY: Readonly<Record<string, Record<string, unknown>>> = {
   'analytics.revenue_transaction_journey': { object_id: 'ch_1' },
 }
 
+/**
+ * The multi-site pair (ADR-0080), whose subject is a *list* of sites.
+ *
+ * Walked separately rather than folded into the range loop below, because the
+ * two things that loop supplies are exactly the two they do not take: a single
+ * `site_id`, and a range aligned to a UTC day. These need a list and a window of
+ * whole ISO weeks — Monday to Monday — and every schema here is a `strictObject`,
+ * so a `site_id` bound to one of them is refused as loudly as a missing
+ * parameter. What is asserted is the same property: every placeholder bound,
+ * nothing bound that the statement ignores.
+ */
+const MULTI_SITE: Readonly<Record<string, Record<string, unknown>>> = {
+  // 2024-01-01 and 2024-02-05 are Mondays, five weeks apart.
+  'analytics.sites_all_time': {
+    site_ids: [SITE],
+    from: '2024-01-01T00:00:00.000Z',
+    to: '2024-02-05T00:00:00.000Z',
+  },
+  'analytics.sites_all_time_revenue': {
+    site_ids: [SITE],
+    from: '2024-01-01T00:00:00.000Z',
+    to: '2024-02-05T00:00:00.000Z',
+  },
+}
+
 describe('operation parameters resolve from the operation id alone', () => {
   it('leaves no operation with an unbound or an unused parameter', () => {
     // One UTC day: aligned to every boundary in the registry and inside every
@@ -71,6 +96,24 @@ describe('operation parameters resolve from the operation id alone', () => {
 
     for (const operation of QUERY_OPERATIONS.values()) {
       if (operation.id === 'health.clickhouse_roundtrip') continue
+      const listed = MULTI_SITE[operation.id]
+      if (listed !== undefined) {
+        expect(() => operation.bindParams(listed), operation.id).not.toThrow()
+        // And the single-site shape the loop below would have sent is refused,
+        // which is what keeps "site scope" a real constraint on this pair rather
+        // than a naming convention.
+        expect(
+          () =>
+            operation.bindParams({
+              site_id: SITE,
+              from: '2024-01-01T00:00:00.000Z',
+              to: '2024-02-05T00:00:00.000Z',
+            }),
+          operation.id,
+        ).toThrow()
+        continue
+      }
+
       const subject = SUBJECT_ONLY[operation.id]
       if (subject !== undefined) {
         // No range, no zone, no import — the site plus the operation's subject.

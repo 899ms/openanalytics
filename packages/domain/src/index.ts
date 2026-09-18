@@ -775,3 +775,11 @@ export {
   type SiteRole,
   type SiteState,
 } from './authz.ts'
+
+export {
+  SITE_CARD_SPARKLINE_WEEKS,
+  assembleSparkline,
+  siteCardWindow,
+  startOfUtcIsoWeek,
+  type SiteCardWindow,
+} from './site-cards.ts'

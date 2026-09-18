@@ -350,6 +350,17 @@ const SECTIONS = [
     ],
   },
   {
+    title: 'Site cards on GET /v1/sites',
+    blurb: [
+      'The all-time figures and sparkline the sites grid renders (ADR-0080).',
+      'All three have working defaults. The timeout is deliberately far below',
+      'QUERY_GATEWAY_TIMEOUT_MS: the site list is the dashboard shell load and',
+      'these figures only decorate it, so past the deadline the list still',
+      'answers with null figures rather than making the shell wait.',
+    ],
+    keys: ['SITES_CARD_CACHE_TTL_MS', 'SITES_CARD_GATEWAY_TIMEOUT_MS', 'SITES_CARD_MAX_SITES'],
+  },
+  {
     title: 'Geo (optional)',
     blurb: ['A licensed deploy artifact, refreshed on the host and never committed.'],
     keys: ['GEOIP_DB_PATH'],

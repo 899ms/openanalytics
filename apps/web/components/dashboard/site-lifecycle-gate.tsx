@@ -159,9 +159,14 @@ function BlockedScreen({ site }: { site: SiteSummary }) {
   if (SuspendedSiteScreen) {
     return (
       <SuspendedSiteScreen
-        ingestGraceUntil={site.ingest_grace_until}
+        // `?? null` because these two are optional on `SiteSummary` since
+        // ADR-0080: the open-core split moved both deadlines to the hosted
+        // billing surface, and an open-source build simply does not send them.
+        // Absent and null mean the same thing to this screen — no deadline to
+        // count down — and it is the hosted deployment that fills them in.
+        ingestGraceUntil={site.ingest_grace_until ?? null}
         name={site.name}
-        retentionDeadline={site.retention_deadline}
+        retentionDeadline={site.retention_deadline ?? null}
         slug={site.slug}
         suspendedAt={site.suspended_at}
       />

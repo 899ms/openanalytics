@@ -26,6 +26,7 @@ import {
 import type { RealtimeCache } from '@openanalytics/redis'
 import { Hono } from 'hono'
 import type { AnalyticsService } from './analytics/service.ts'
+import type { SiteCardStatsReader } from './analytics/site-cards.ts'
 import { createAuthProviderRoutes } from './http/auth-providers.ts'
 import { credentialedCors, parseTrustedOrigins } from './http/cors.ts'
 import { createBusinessRoutes } from './http/routes.ts'
@@ -85,6 +86,9 @@ export interface AppDeps {
    * gateway URL and signing key are configured; the `/analytics` and `/public`
    * surfaces are not mounted otherwise (the optional-until-used rule). */
   readonly analytics?: AnalyticsService
+  /** The sites-grid card figures (ADR-0080). Built beside the analytics service,
+   * from the same gateway; absent, `GET /v1/sites` answers with `null` figures. */
+  readonly siteCards?: SiteCardStatsReader
   /** Public-dashboard read config. Mounted alongside the analytics service. */
   readonly publicDashboard?: {
     readonly rateLimiter: RateLimiter
@@ -660,6 +664,7 @@ export function createApp(deps: AppDeps) {
         env: deps.env,
         ...(recordCredentialUse ? { recordCredentialUse } : {}),
         ...(deps.analytics ? { analytics: deps.analytics } : {}),
+        ...(deps.siteCards ? { siteCards: deps.siteCards } : {}),
         ...(deps.realtime ? { realtime: deps.realtime } : {}),
         ...(deps.objectStorage ? { objectStorage: deps.objectStorage } : {}),
         ...(deps.revenue ? { revenue: deps.revenue } : {}),

@@ -44,9 +44,11 @@ import type { QueryParameterValue } from './clickhouse.ts'
  * parameter list must match the stored `AggregateFunction` column type
  * (migration 0012).
  *
- * Every analytics operation binds `site_id` and requires site scope, so the
- * registry is also the boundary that makes a cross-site read impossible: there
- * is no operation that omits the site filter.
+ * Every analytics operation binds `site_id` — or, since ADR-0080, the explicit
+ * `site_ids` list a single screen reads its whole account through — and requires
+ * site scope, so the registry is also the boundary that makes a cross-site read
+ * impossible: there is no operation that omits the site filter, and the api
+ * passes only ids the caller is already a member of.
  */
 
 const CONFIG = DEFAULT_ANALYTICS_QUERY_CONFIG
@@ -125,8 +127,20 @@ function defineOperation<TSchema extends z.ZodType>(definition: {
   if (/;|--|\/\*/.test(definition.sql)) {
     throw new Error(`operation "${definition.id}" sql must be a single statement without comments`)
   }
-  if (definition.requiresSiteScope && !placeholders.has('site_id')) {
-    throw new Error(`operation "${definition.id}" is site-scoped but never binds {site_id:...}`)
+  // Site scope is "names its sites", not "names one site" (ADR-0080). The site
+  // card operations bind `{site_ids:Array(UUID)}` because one screen reads the
+  // whole account; either placeholder satisfies the boundary, because the
+  // boundary is that the api decides the id set and the statement cannot widen
+  // it. An operation binding neither could read every site in the cluster, which
+  // is what this assertion has always existed to make impossible.
+  if (
+    definition.requiresSiteScope &&
+    !placeholders.has('site_id') &&
+    !placeholders.has('site_ids')
+  ) {
+    throw new Error(
+      `operation "${definition.id}" is site-scoped but never binds {site_id:...} or {site_ids:...}`,
+    )
   }
   // No analytics operation may read the raw event table (docs snapshot 02 §15,
   // plan Milestone 7 acceptance criterion). Asserted structurally so a future
@@ -2724,6 +2738,232 @@ const revenueOperations: readonly QueryOperation[] = [
 ]
 
 // ---------------------------------------------------------------------------
+// Site cards — the whole account's list figures in one read (ADR-0080).
+//
+// The first operations in this registry that bind `{site_ids:Array(UUID)}`
+// instead of `{site_id:UUID}`, and the invariant they widen is worth stating
+// precisely, because "every operation binds site_id" was the sentence that made
+// a cross-site read impossible:
+//
+//   every analytics operation binds `{site_id:UUID}` **or**
+//   `{site_ids:Array(UUID)}`; the api passes only ids the caller is a member of,
+//   so the gateway still never reads a site nobody bound.
+//
+// The boundary is unchanged — it is still the api that decides which sites a
+// request may see, and still impossible here to read a site that was not named.
+// What changes is arity, and the reason it changes is that `GET /v1/sites` is
+// one screen: the alternative was N × `analytics.overview_day` plus N ×
+// `analytics.timeseries_week_utc` per dashboard load, which is the frontend's
+// N+1 moved one hop down rather than removed.
+//
+// Both read the UTC-day rollups only. That is a deliberate departure from
+// ADR-0079 D5 ("every window is cut on the site's own zone"), written down in
+// ADR-0080 D3: `toStartOfWeek` takes one constant timezone per statement, so a
+// single query cannot cut each site's weeks on that site's own clock, and the
+// 15m path that could is capped at MAX_SPAN_HOUR_DAYS (400 days) — far short of
+// "all time". The card is an unlabelled, axis-less line, so the week boundary's
+// zone is not a thing its reader can see; the all-time totals have no zone to be
+// wrong about at all.
+// ---------------------------------------------------------------------------
+
+/**
+ * Ceiling on how many sites one call may name.
+ *
+ * Not a tuning knob for the api's own cap (`SITES_CARD_MAX_SITES`) but the
+ * structural one under it: `maxRows` is derived from it, so a request naming
+ * more sites than this would come back capped by row truncation — a silently
+ * short answer — rather than refused. Prod's largest account has 4 sites
+ * (measured 2026-09-12), so this is headroom, not a limit anyone meets.
+ */
+const SITES_CARD_MAX_SITE_IDS = 100
+
+/** Sparkline width, in whole ISO weeks — the span bound on the week branch. */
+const SITES_CARD_MAX_WEEKS = 40
+
+/** Rows one site can contribute: one per week in the window, plus its total. */
+const SITES_CARD_ROWS_PER_SITE = SITES_CARD_MAX_WEEKS + 1
+
+/**
+ * `['<uuid>','<uuid>']` — the text form ClickHouse parses an `Array(UUID)`
+ * parameter from.
+ *
+ * Still a bound parameter, not interpolation: this string is the *value* of
+ * `param_site_ids`, never part of the statement, and ClickHouse parses it
+ * server-side against the declared `Array(UUID)` type. The quoting is safe
+ * because every element has already been through `z.uuid()`, which admits hex
+ * digits and hyphens and nothing else — there is no element that could carry a
+ * quote to close.
+ */
+function toClickHouseUuidArray(ids: readonly string[]): string {
+  return `[${ids.map((id) => `'${id}'`).join(',')}]`
+}
+
+/** UTC Monday midnight — the ISO week boundary `toStartOfWeek(x, 1)` produces. */
+function isUtcMondayAligned(instant: string): boolean {
+  return isUtcDayAligned(instant) && new Date(instant).getUTCDay() === 1
+}
+
+const siteCardsParamsSchema = z
+  .strictObject({
+    site_ids: z
+      .array(z.uuid())
+      .min(1)
+      .max(SITES_CARD_MAX_SITE_IDS)
+      // De-duplicated rather than de-duplicating: a repeated id is a caller bug
+      // (a membership list built twice), and answering it would return one
+      // site's rows twice under a key the api then has to reconcile.
+      .refine((ids) => new Set(ids).size === ids.length, {
+        message: 'site_ids must not repeat an id',
+      }),
+    from: utcInstantSchema,
+    to: utcInstantSchema,
+  })
+  .superRefine((value, ctx) => {
+    const fromMs = Date.parse(value.from)
+    const toMs = Date.parse(value.to)
+    if (fromMs >= toMs) {
+      ctx.addIssue({ code: 'custom', message: 'range must be half-open with from < to' })
+      return
+    }
+    // Monday-aligned, not merely day-aligned. The week branch groups with
+    // `toStartOfWeek(…, 1)`, so an endpoint mid-week would produce a first or
+    // last bucket holding a fraction of a week beside six whole ones — a
+    // sparkline point that is short for a reason no reader can see. Refusing
+    // the range is the only way to keep every plotted point the same width.
+    if (!isUtcMondayAligned(value.from) || !isUtcMondayAligned(value.to)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'range endpoints must be UTC Monday midnights (ISO week boundaries)',
+      })
+    }
+    if (toMs - fromMs > SITES_CARD_MAX_WEEKS * 7 * MS_PER_DAY) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `range span exceeds this operation's ${SITES_CARD_MAX_WEEKS}-week maximum`,
+      })
+    }
+  })
+
+/**
+ * Per-site all-time totals and the trailing weekly series, in one statement.
+ *
+ * Two branches of a `UNION ALL` with *different* filters, which is the whole
+ * point of unioning them rather than deriving one from the other:
+ *
+ *   * the total branch has **no lower bound** — "all time" read literally, the
+ *     same span `analytics.overview_day` covers when the dashboard anchors its
+ *     widest interval at `created_at`;
+ *   * the week branch is bounded to `[from, to)`, the trailing 40 ISO weeks.
+ *
+ * And a total is emphatically **not** the sum of the weeks. `visitors` is a
+ * `uniqMerge` of the stored states (ADR-0036: filtered to the page-view
+ * population, so `visitors <= pageviews` holds on every row), and a person who
+ * visited in two different weeks is one visitor in the total and one in each of
+ * those two weeks. Summing the weekly numbers would over-count them; the
+ * migration suite pins exactly that case against a live ClickHouse.
+ *
+ * `is_total` rather than a nullable `week`: the branches of a `UNION ALL` have
+ * to agree on column types, and a discriminator the api reads is clearer at both
+ * ends than widening the week column to `Nullable` so one branch can put a
+ * `NULL` in it.
+ */
+const sitesAllTimeOperation = defineOperation({
+  id: 'analytics.sites_all_time',
+  summary:
+    'All-time pageviews and unique visitors per site, plus the trailing ISO-week series (metrics_1d, UTC).',
+  requiresSiteScope: true,
+  params: siteCardsParamsSchema,
+  sql: [
+    'SELECT',
+    '  t.site_id AS site_id,',
+    '  toUInt8(0) AS is_total,',
+    "  toDateTime64(toStartOfWeek(t.bucket_start, 1), 3, 'UTC') AS week,",
+    "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
+    "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
+    'FROM metrics_1d AS t',
+    'WHERE t.site_id IN {site_ids:Array(UUID)}',
+    "  AND t.bucket_start >= toDateTime64({from:String}, 3, 'UTC')",
+    "  AND t.bucket_start < toDateTime64({to:String}, 3, 'UTC')",
+    'GROUP BY t.site_id, week',
+    'UNION ALL',
+    'SELECT',
+    '  t.site_id AS site_id,',
+    '  toUInt8(1) AS is_total,',
+    // A constant the api never reads, present only so both branches project the
+    // same column type. The discriminator is what says this row has no week.
+    "  toDateTime64(0, 3, 'UTC') AS week,",
+    "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
+    "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
+    'FROM metrics_1d AS t',
+    'WHERE t.site_id IN {site_ids:Array(UUID)}',
+    "  AND t.bucket_start < toDateTime64({to:String}, 3, 'UTC')",
+    'GROUP BY t.site_id',
+  ].join('\n'),
+  maxRows: SITES_CARD_MAX_SITE_IDS * SITES_CARD_ROWS_PER_SITE,
+  // The api caches this one, keyed by the caller's membership set and held for
+  // minutes rather than the gateway cache's seconds (ADR-0080 D5). Caching it
+  // here as well would put two TTLs on one answer, the shorter of which decides
+  // nothing.
+  cacheable: false,
+  bind: (params) => ({
+    site_ids: toClickHouseUuidArray(params.site_ids),
+    from: toClickHouseInstant(params.from),
+    to: toClickHouseInstant(params.to),
+  }),
+})
+
+/**
+ * All-time net revenue per site, in each site's own reporting currency.
+ *
+ * `revenue_1d` is a `ReplacingMergeTree(generation)`, so every read takes the
+ * current generation of each bucket with `argMax(…, generation)` before summing
+ * — never `FINAL`, and never a bare `sum` over the table, which would add every
+ * superseded generation of every recomputed bucket (the D-212 read rule).
+ *
+ * There is no `currency` column and there must not be one: the worker converts
+ * into the site's reporting currency when it writes the rollup (ADR-0033 D2c),
+ * so the label belongs to `sites.reporting_currency` and the api attaches it.
+ * The api also calls this only for sites that actually have a revenue credential
+ * row — a site with no provider connected is not a zero, it is a different
+ * answer, and ADR-0080 D4 keeps the two apart above this query.
+ */
+const sitesAllTimeRevenueOperation = defineOperation({
+  id: 'analytics.sites_all_time_revenue',
+  summary: 'All-time net revenue per site, in the site reporting currency (revenue_1d).',
+  requiresSiteScope: true,
+  params: siteCardsParamsSchema,
+  sql: [
+    'SELECT',
+    '  cur.site_id AS site_id,',
+    '  sum(cur.net_minor) AS net_minor',
+    'FROM (',
+    '  SELECT',
+    '    rr.site_id AS site_id,',
+    '    argMax(rr.net_minor, rr.generation) AS net_minor',
+    '  FROM revenue_1d AS rr',
+    '  WHERE rr.site_id IN {site_ids:Array(UUID)}',
+    "    AND rr.bucket_start < toDateTime64({to:String}, 3, 'UTC')",
+    '  GROUP BY rr.site_id, rr.bucket_start',
+    ') AS cur',
+    'GROUP BY cur.site_id',
+  ].join('\n'),
+  maxRows: SITES_CARD_MAX_SITE_IDS,
+  cacheable: false,
+  // `from` is validated and deliberately not bound: this half is all-time only,
+  // and `defineOperation` rejects a bound value the statement ignores. Sharing
+  // the schema is what keeps one window definition for both halves of the card.
+  bind: (params) => ({
+    site_ids: toClickHouseUuidArray(params.site_ids),
+    to: toClickHouseInstant(params.to),
+  }),
+})
+
+const siteCardOperations: readonly QueryOperation[] = [
+  sitesAllTimeOperation,
+  sitesAllTimeRevenueOperation,
+]
+
+// ---------------------------------------------------------------------------
 // Freshness watermark (docs snapshot 02 §18: analytics responses carry
 // freshness). The latest occurred_at bucket a site has rolled up, read from the
 // finest rollup, plus a bucket count so "no data" is distinguishable from
@@ -3347,6 +3587,7 @@ const OPERATIONS: readonly QueryOperation[] = [
   ...recentVisitorOperations,
   ...filteredOperations,
   ...revenueOperations,
+  ...siteCardOperations,
   freshnessOperation,
 ]
 

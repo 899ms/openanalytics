@@ -88,6 +88,7 @@ import { requireCapability, siteMembership, type ApiVariables } from './middlewa
 import { createSiteToApiError, ownershipToApiError } from './ownership-errors.ts'
 import { principalAuth } from './grant-arm.ts'
 import type { CredentialUseRecorder } from './credential-events.ts'
+import type { SiteCardStatsReader, SiteCardSubject } from '../analytics/site-cards.ts'
 import type { ApiCloudExtension } from '../cloud-extension.ts'
 
 /**
@@ -108,6 +109,14 @@ export interface RoutesDeps {
   /** Analytics read service. Present only when a query gateway is configured; the
    * `/analytics` surface is not mounted otherwise (the optional-until-used rule). */
   readonly analytics?: AnalyticsService
+  /**
+   * The sites-grid card figures (ADR-0080). Present only when the query gateway
+   * is, for the same reason `analytics` is — and absent it the list still
+   * answers, with `null` figures, which the contract defines as "not computed"
+   * rather than zero. A deployment with no gateway therefore serves a correct
+   * site list rather than a wrong one.
+   */
+  readonly siteCards?: SiteCardStatsReader
   /** Realtime cache. Present only when the realtime cache client is configured; it
    * mints the private realtime token (epoch seed) and drives the best-effort
    * revocation bumps (docs snapshot 02 §17, 05 D-213). */
@@ -683,10 +692,36 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
     )
   }
 
+  /**
+   * The caller's sites, each with the figures its card renders (ADR-0080).
+   *
+   * The figures are a decoration on a list that must always answer: the whole
+   * dashboard shell loads through this route, so `SiteCardStatsReader` never
+   * throws and a site it could not compute comes back with `null` figures rather
+   * than a missing key or a 5xx. `null` is a statement in this contract — "not
+   * computed for this response" — and is never the same claim as zero.
+   */
   authed.get('/sites', async (c) => {
     const user = c.get('user')
     const sites = await listSitesForUser(db, user.id)
-    return c.json({ items: sites.map(siteJson) })
+    const cards = deps.siteCards
+      ? await deps.siteCards.read(
+          user.id,
+          sites.map((site): SiteCardSubject => ({
+            siteId: site.siteId,
+            role: site.role,
+            status: site.status,
+            firstEventAt: site.firstEventAt,
+            reportingCurrency: site.reportingCurrency,
+          })),
+        )
+      : undefined
+    return c.json({
+      items: sites.map((site) => ({
+        ...siteJson(site),
+        ...(cards?.get(site.siteId) ?? { all_time: null, sparkline: null }),
+      })),
+    })
   })
 
   /**

@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
+  assembleSparkline,
   chooseResolution,
   classifyTimezoneAlignment,
   derivePreviousPeriod,
+  siteCardWindow,
   timezoneOffsetMinutes,
 } from '@openanalytics/domain'
 import { isHalfOpenContained } from '@openanalytics/contracts'
+import { findOperation } from '../../apps/query-gateway/src/operations.ts'
 
 /**
  * Milestone 7 acceptance criterion 4 (docs snapshot 04): "the timezone, DST,
@@ -185,5 +188,149 @@ describe('UTC and non-UTC agree where they must', () => {
     )
     expect(a).toBe('utc')
     expect(b).toBe('utc')
+  })
+})
+
+/**
+ * The site-card reads, frozen (ADR-0080).
+ *
+ * Two golden cases, and they pin the two things that are silently wrong rather
+ * than loudly broken when they drift:
+ *
+ *   * the **statement**, because the total branch and the week branch differ
+ *     only by one filter line, and a copy-paste that gave the totals the week
+ *     window's lower bound would return plausible numbers that are simply not
+ *     all-time;
+ *   * the **window**, because "the last 40 ISO weeks including this one" is
+ *     arithmetic with an off-by-one in every direction and nothing downstream
+ *     can tell a 39-week window from a 40-week one.
+ */
+describe('site card reads (ADR-0080)', () => {
+  it('freezes the per-site all-time + weekly statement', () => {
+    expect(findOperation('analytics.sites_all_time')?.sql).toMatchInlineSnapshot(`
+      "SELECT
+        t.site_id AS site_id,
+        toUInt8(0) AS is_total,
+        toDateTime64(toStartOfWeek(t.bucket_start, 1), 3, 'UTC') AS week,
+        sumIf(t.events, t.event_type = 'page_view') AS pageviews,
+        uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors
+      FROM metrics_1d AS t
+      WHERE t.site_id IN {site_ids:Array(UUID)}
+        AND t.bucket_start >= toDateTime64({from:String}, 3, 'UTC')
+        AND t.bucket_start < toDateTime64({to:String}, 3, 'UTC')
+      GROUP BY t.site_id, week
+      UNION ALL
+      SELECT
+        t.site_id AS site_id,
+        toUInt8(1) AS is_total,
+        toDateTime64(0, 3, 'UTC') AS week,
+        sumIf(t.events, t.event_type = 'page_view') AS pageviews,
+        uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors
+      FROM metrics_1d AS t
+      WHERE t.site_id IN {site_ids:Array(UUID)}
+        AND t.bucket_start < toDateTime64({to:String}, 3, 'UTC')
+      GROUP BY t.site_id"
+    `)
+  })
+
+  it('freezes the per-site all-time revenue statement', () => {
+    expect(findOperation('analytics.sites_all_time_revenue')?.sql).toMatchInlineSnapshot(`
+      "SELECT
+        cur.site_id AS site_id,
+        sum(cur.net_minor) AS net_minor
+      FROM (
+        SELECT
+          rr.site_id AS site_id,
+          argMax(rr.net_minor, rr.generation) AS net_minor
+        FROM revenue_1d AS rr
+        WHERE rr.site_id IN {site_ids:Array(UUID)}
+          AND rr.bucket_start < toDateTime64({to:String}, 3, 'UTC')
+        GROUP BY rr.site_id, rr.bucket_start
+      ) AS cur
+      GROUP BY cur.site_id"
+    `)
+  })
+
+  it('spans exactly forty Mondays and ends on the week in progress', () => {
+    // A Saturday, so `now` is mid-week: the window must still close on the
+    // *next* Monday, and the current, half-filled week must be the last point.
+    const window = siteCardWindow(new Date('2026-09-12T18:30:00.000Z'))
+
+    expect(window.from).toBe('2025-12-08T00:00:00.000Z')
+    expect(window.to).toBe('2026-09-14T00:00:00.000Z')
+    expect(window.weekStarts).toHaveLength(40)
+    expect(window.weekStarts.at(0)).toBe('2025-12-08T00:00:00.000Z')
+    // The Monday of the week containing `now` — present, not excluded for being
+    // incomplete.
+    expect(window.weekStarts.at(-1)).toBe('2026-09-07T00:00:00.000Z')
+    // Every endpoint is a UTC Monday midnight, which is what the gateway's
+    // parameter schema refuses anything else for.
+    for (const start of [...window.weekStarts, window.to]) {
+      expect(new Date(start).getUTCDay(), start).toBe(1)
+      expect(start.endsWith('T00:00:00.000Z'), start).toBe(true)
+    }
+  })
+
+  it('anchors on Monday itself without sliding a week', () => {
+    // The boundary case: `now` IS a Monday midnight. The current week is the one
+    // starting at that instant, so `to` is seven days later — not that instant.
+    const window = siteCardWindow(new Date('2026-09-07T00:00:00.000Z'))
+    expect(window.to).toBe('2026-09-14T00:00:00.000Z')
+    expect(window.weekStarts.at(-1)).toBe('2026-09-07T00:00:00.000Z')
+  })
+
+  it('starts a young site at its first event and zero-fills only inside its life', () => {
+    const window = siteCardWindow(new Date('2026-09-12T18:30:00.000Z'))
+    const weekly = new Map([
+      ['2026-08-24T00:00:00.000Z', 140],
+      // 2026-08-31 deliberately absent — a real week with no visitors.
+      ['2026-09-07T00:00:00.000Z', 12],
+    ])
+
+    const series = assembleSparkline({
+      window,
+      // Mid-week, three weeks back: the series starts at that week's Monday.
+      firstEventAt: new Date('2026-08-26T11:04:00.000Z'),
+      weekly,
+    })
+
+    // Three points, not forty. The 37 weeks before this site existed are not
+    // zeros — nothing was measured in them — and drawing them as zeros would
+    // show a launch spike that is really just the site's birth.
+    expect(series).toEqual([140, 0, 12])
+  })
+
+  it('starts at data older than first_event_at rather than trimming it away', () => {
+    const window = siteCardWindow(new Date('2026-09-12T18:30:00.000Z'))
+    const series = assembleSparkline({
+      window,
+      // Later than the data below — the ADR-0027 non-backfill case, measured
+      // live on one production site in six.
+      firstEventAt: new Date('2026-08-26T11:04:00.000Z'),
+      weekly: new Map([
+        ['2026-08-17T00:00:00.000Z', 7],
+        ['2026-09-07T00:00:00.000Z', 12],
+      ]),
+    })
+    // Starts at the data (08-17), not at the field's week (08-24), and the two
+    // weeks between are real zeros.
+    expect(series).toEqual([7, 0, 0, 12])
+  })
+
+  it('gives a site that never received an event an empty series', () => {
+    const window = siteCardWindow(new Date('2026-09-12T18:30:00.000Z'))
+    expect(assembleSparkline({ window, firstEventAt: null, weekly: new Map() })).toEqual([])
+  })
+
+  it('clips a site older than the window to the window', () => {
+    const window = siteCardWindow(new Date('2026-09-12T18:30:00.000Z'))
+    const series = assembleSparkline({
+      window,
+      firstEventAt: new Date('2019-03-01T00:00:00.000Z'),
+      weekly: new Map([['2026-09-07T00:00:00.000Z', 5]]),
+    })
+    expect(series).toHaveLength(40)
+    expect(series.at(-1)).toBe(5)
+    expect(series.slice(0, 39).every((value) => value === 0)).toBe(true)
   })
 })

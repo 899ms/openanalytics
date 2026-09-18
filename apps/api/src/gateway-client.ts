@@ -49,6 +49,22 @@ export interface GatewayResult<TRow = Record<string, unknown>> {
  */
 export interface GatewayQueryOptions {
   readonly cacheEpoch?: number | undefined
+  /**
+   * A deadline for this call alone, overriding the client's configured one.
+   *
+   * The constructed timeout is the backstop for a dashboard read, where waiting
+   * is better than failing — the viewer asked for that number and has nothing
+   * else to look at. `GET /v1/sites` is the opposite shape (ADR-0080 D6): it is
+   * the dashboard shell's own load, its card figures are a decoration, and
+   * twenty seconds of shell waiting on a decoration is a broken product. So that
+   * caller passes a short one and renders `null` when it expires.
+   *
+   * It can only ever be shorter in practice — nothing in the product raises it —
+   * but nothing structural enforces that, because the gateway and ClickHouse
+   * have their own ceilings underneath and a longer value here would simply be
+   * unreachable.
+   */
+  readonly timeoutMs?: number | undefined
 }
 
 /** The narrow contract the read routes depend on, so tests inject a fake. */
@@ -138,7 +154,7 @@ export class HttpAnalyticsGateway implements AnalyticsGateway {
     })
 
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), this.#timeoutMs)
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? this.#timeoutMs)
     let response: Response
     try {
       response = await this.#fetch(this.#url, {

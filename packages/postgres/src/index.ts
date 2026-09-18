@@ -228,6 +228,7 @@ export {
   createRevenueCredential,
   disconnectRevenueCredential,
   eraseSiteRevenueCredentials,
+  listSitesWithRevenueCredential,
   mintWebhookToken,
   readLiveRevenueCredential,
   readRevenueCredential,

@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { and, desc, eq, ne, sql, type SQL } from 'drizzle-orm'
+import { and, desc, eq, inArray, ne, sql, type SQL } from 'drizzle-orm'
 import type { RevenueCredentialStatus } from '@openanalytics/domain'
 import type { Database, Executor } from '../client.ts'
 import { writeAudit } from './audit.ts'
@@ -254,6 +254,35 @@ export async function readRevenueCredential(
     .limit(1)
 
   return row ?? null
+}
+
+/**
+ * Which of these sites have ever connected a revenue provider (ADR-0080 D4).
+ *
+ * One statement for a whole account, because the caller is the site list and a
+ * `readRevenueCredential` per site would put the N+1 this feature exists to
+ * remove back into the same route, one layer down.
+ *
+ * **Existence, at any status.** The card's rule is the revenue tile's rule read
+ * literally: a site with a `degraded` or `disabled` credential still shows its
+ * figure, because the money it already took was real and the tile has its own
+ * vocabulary for the connection's health. Only a site that never connected one
+ * gets no figure at all — and that is the distinction this returns, so there is
+ * nothing here to rank rows by and no status to return.
+ *
+ * An empty input is answered without a query: `IN ()` is not valid SQL, and
+ * "none of no sites" needs no round trip to establish.
+ */
+export async function listSitesWithRevenueCredential(
+  db: Executor,
+  siteIds: readonly string[],
+): Promise<Set<string>> {
+  if (siteIds.length === 0) return new Set()
+  const rows = await db
+    .selectDistinct({ siteId: revenueCredentials.siteId })
+    .from(revenueCredentials)
+    .where(inArray(revenueCredentials.siteId, [...siteIds]))
+  return new Set(rows.map((row) => row.siteId))
 }
 
 /** The live credential only — what a rotation or a disconnect may act on. */

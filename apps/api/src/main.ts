@@ -35,6 +35,7 @@ import { apiCloudExtension } from './cloud-extension.ts'
 import { AnalyticsService } from './analytics/service.ts'
 import { bootstrapService } from './bootstrap.ts'
 import { HttpAnalyticsGateway } from './gateway-client.ts'
+import { SiteCardStatsReader } from './analytics/site-cards.ts'
 import { InProcessRateLimiter } from './http/rate-limit.ts'
 
 const { env, logger, service } = bootstrapService()
@@ -84,6 +85,7 @@ if (cloud) {
 // /public surfaces stay off rather than half-wired (the optional-until-used
 // rule); the API never reaches ClickHouse except through this signed hop (D-208).
 let analytics: AnalyticsService | undefined
+let siteCards: SiteCardStatsReader | undefined
 if (env.QUERY_GATEWAY_URL && env.QUERY_SIGNING_PRIVATE_KEY && env.QUERY_SIGNING_KEY_ID) {
   const gateway = new HttpAnalyticsGateway({
     gatewayUrl: env.QUERY_GATEWAY_URL,
@@ -103,7 +105,24 @@ if (env.QUERY_GATEWAY_URL && env.QUERY_SIGNING_PRIVATE_KEY && env.QUERY_SIGNING_
       ? { pipelineHeartbeat: () => getWorkerHeartbeat(heartbeatDb, INGEST_PIPELINE_ID) }
       : {}),
   })
-  logger.info('analytics_mounted', { pipeline_heartbeat: Boolean(heartbeatDb) })
+  // The sites-grid card figures (ADR-0080), over the same signed gateway. Built
+  // only when the database is there too, because the revenue half asks Postgres
+  // which sites have a provider connected — and a reader that could answer the
+  // traffic half but never the money half would show every owner `revenue: null`
+  // on every site, which reads as "nothing connected" rather than "not wired".
+  if (heartbeatDb) {
+    siteCards = new SiteCardStatsReader(gateway, {
+      db: heartbeatDb,
+      cacheTtlMs: env.SITES_CARD_CACHE_TTL_MS,
+      gatewayTimeoutMs: env.SITES_CARD_GATEWAY_TIMEOUT_MS,
+      maxSites: env.SITES_CARD_MAX_SITES,
+      logger,
+    })
+  }
+  logger.info('analytics_mounted', {
+    pipeline_heartbeat: Boolean(heartbeatDb),
+    site_cards: Boolean(siteCards),
+  })
 } else {
   logger.warn('analytics_not_mounted', { reason: 'query gateway URL or signing key missing' })
 }
@@ -325,6 +344,7 @@ const app = createApp({
   ...(db ? { db } : {}),
   ...(cloud ? { cloud } : {}),
   ...(analytics ? { analytics } : {}),
+  ...(siteCards ? { siteCards } : {}),
   ...(analytics ? { publicDashboard } : {}),
   // Always passed: the read-key surface mounts whether or not a gateway is
   // configured, so its budget is not conditional either (ADR-0042, D5).

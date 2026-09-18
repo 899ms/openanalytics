@@ -103,6 +103,26 @@ const serviceSchemas = {
     // gateway's own QUERY_TIMEOUT_MS so the gateway's typed timeout normally
     // surfaces first and the API's is the backstop against a hung socket.
     QUERY_GATEWAY_TIMEOUT_MS: z.coerce.number().int().min(100).max(60_000).default(20_000),
+    /**
+     * The sites-grid card figures (ADR-0080). Three numbers, all with working
+     * defaults, so a deployment that sets none still gets the feature.
+     *
+     * `SITES_CARD_GATEWAY_TIMEOUT_MS` is deliberately far below
+     * `QUERY_GATEWAY_TIMEOUT_MS` above: `GET /v1/sites` is the dashboard shell's
+     * own load and these figures decorate it, so the shell must never wait on
+     * them the way a chart the viewer asked for is allowed to (D6). Past the
+     * deadline the list still answers — with `null` figures, which the contract
+     * defines as "not computed" rather than zero.
+     *
+     * `SITES_CARD_CACHE_TTL_MS` is the per-account cache (D5); `0` disables it.
+     * `SITES_CARD_MAX_SITES` is the fan-out ceiling: an account with more sites
+     * than this gets figures for the first N and `null` for the rest, which is
+     * an interpretable partial answer rather than a refused list. Prod's largest
+     * account held 4 sites when this shipped.
+     */
+    SITES_CARD_CACHE_TTL_MS: z.coerce.number().int().min(0).max(3_600_000).default(300_000),
+    SITES_CARD_GATEWAY_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(3_000),
+    SITES_CARD_MAX_SITES: z.coerce.number().int().min(1).max(100).default(100),
     REALTIME_TOKEN_SIGNING_KEY: secret.optional(),
     REALTIME_CACHE_REDIS_URL: url.optional(),
     // Social login runs in the API (Better Auth). Providers are env-gated: a

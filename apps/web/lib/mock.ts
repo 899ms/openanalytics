@@ -27,6 +27,7 @@ import type {
   RevenueSummaryResponse,
   SiteInvite,
   SiteMember,
+  SiteListItem,
   SiteSummary,
 } from "@/lib/api";
 
@@ -37,7 +38,7 @@ import type {
  * flipping to live changes the data source, never the shapes.
  */
 
-export const MOCK_SITES: SiteSummary[] = [
+export const MOCK_SITES: SiteListItem[] = [
   {
     site_id: "019f8740-2b3c-7a10-9c1d-4e5f6a7b8c9d",
     slug: "openanalytics",
@@ -58,6 +59,20 @@ export const MOCK_SITES: SiteSummary[] = [
     // This one's owner picked it; the two below carry the 'UTC' a site gets
     // when nobody ever named one.
     reporting_timezone: "Europe/Istanbul",
+    // The card figures (ADR-0080). Set, not null: null would mean "could not be
+    // computed", which is a different card from one showing real numbers.
+    all_time: {
+      visitors: 48_213,
+      pageviews: 191_804,
+      // An owner with a provider connected — the only case that gets a figure.
+      revenue: { net_minor: 1_284_500, currency: "USD" },
+    },
+    sparkline: [
+      412, 508, 466, 613, 702, 688, 754, 810, 905, 862, 940, 1012, 1108, 1044,
+      1186, 1240, 1302, 1288, 1355, 1420, 1398, 1476, 1533, 1610, 1588, 1672,
+      1740, 1705, 1811, 1890, 1854, 1922, 2008, 2071, 2044, 2130, 2215, 2189,
+      2274, 1160,
+    ],
   },
   {
     site_id: "019f8740-2b3c-7a10-9c1d-4e5f6a7b8d01",
@@ -74,6 +89,16 @@ export const MOCK_SITES: SiteSummary[] = [
     retention_deadline: null,
     reporting_currency: "USD",
     reporting_timezone: "UTC",
+    all_time: {
+      visitors: 6_104,
+      pageviews: 14_982,
+      // `admin`, not `owner`: `revenue:read` is an owner capability, so this
+      // caller gets no figure at all rather than a zero.
+      revenue: null,
+    },
+    // Younger than the window: the series starts at the site's first event,
+    // rather than padding 34 weeks of leading zeros nobody measured.
+    sparkline: [88, 142, 166, 201, 255, 0, 312, 340],
   },
   {
     site_id: "019f8740-2b3c-7a10-9c1d-4e5f6a7b8d02",
@@ -91,6 +116,10 @@ export const MOCK_SITES: SiteSummary[] = [
     retention_deadline: null,
     reporting_currency: "USD",
     reporting_timezone: "UTC",
+    // Waiting for its first event. Zero is the measurement here — nothing has
+    // ever arrived — so the card says so instead of showing nothing.
+    all_time: { visitors: 0, pageviews: 0, revenue: null },
+    sparkline: [],
   },
 ];
 

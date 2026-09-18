@@ -103,18 +103,25 @@ function SiteCardSkeleton() {
     <SquircleSurface className="flex flex-col rounded-[24px] border border-border p-1 shadow-[0_1px_2px_rgba(0,0,0,0.06)] [--card-clip-radius:13px] sm:rounded-[30px] sm:[--card-clip-handle:2.5px] sm:[--card-clip-radius:17px]">
       <div className="flex items-center gap-2.5 pb-1.5 pl-3.5 pr-3 pt-1">
         <span className="size-2 shrink-0 rounded-full bg-muted-foreground/20" />
+        <span className="size-4 shrink-0 rounded-[5px] bg-muted-foreground/15" />
         <span className="h-3 w-28 rounded bg-muted-foreground/15" />
       </div>
-      <SquircleSurface className="flex-1 rounded-[20px] border border-border bg-[#f6f6f6] px-4 py-3 shadow-[0_1px_2px_rgba(0,0,0,0.06)] [--card-clip-radius:11px] sm:rounded-[26px] sm:[--card-clip-handle:2.5px] sm:[--card-clip-radius:14px]">
-        {/* the mark, the domain and the slug under it — the ready anatomy */}
-        <div className="flex h-12 items-center gap-3">
-          <span className="size-7 shrink-0 rounded-lg bg-muted-foreground/15" />
-          <div className="min-w-0 flex-1">
-            <span className="block h-3.5 w-32 rounded bg-muted-foreground/15" />
-            <span className="mt-1 block h-3 w-20 rounded bg-muted-foreground/10" />
-          </div>
+      <SquircleSurface className="flex-1 rounded-[20px] border border-border bg-[#f6f6f6] shadow-[0_1px_2px_rgba(0,0,0,0.06)] [--card-clip-radius:11px] sm:rounded-[26px] sm:[--card-clip-handle:2.5px] sm:[--card-clip-radius:14px]">
+        {/* two figures with their labels, the line under them, the footer:
+            the ready anatomy */}
+        <div className="flex items-start gap-6 px-4 pt-3">
+          {[0, 1].map((index) => (
+            <div className="flex flex-col gap-1.5 pb-1" key={index}>
+              <span className="block h-5 w-14 rounded bg-muted-foreground/15" />
+              <span className="block h-2 w-10 rounded bg-muted-foreground/10" />
+            </div>
+          ))}
         </div>
-        <div className="mt-3 h-3 w-full rounded bg-muted-foreground/10" />
+        <div className="mx-4 mt-1 h-9 border-b border-dotted border-muted-foreground/20" />
+        <div className="flex items-center justify-between gap-2 px-4 pb-3 pt-1">
+          <span className="h-3 w-24 rounded bg-muted-foreground/10" />
+          <span className="h-3 w-16 rounded bg-muted-foreground/10" />
+        </div>
       </SquircleSurface>
     </SquircleSurface>
   );

@@ -452,10 +452,22 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Sites the authenticated user is a member of.
+         * Sites the authenticated user is a member of, with their card figures.
          * @description Each entry carries the internal `site_id` used by every other operation,
          *     the public `slug`, the caller's `role` and whether the caller is this
          *     site's billing owner (docs snapshot 03 §8, §16).
+         *
+         *     Since ADR-0080 each entry also carries the figures the sites grid puts on
+         *     a card — all-time visitors, pageviews and revenue, plus a 40-week
+         *     sparkline — so the grid renders from this one response instead of issuing
+         *     a pair of analytics requests per site. Read `all_time` and `sparkline`
+         *     together with the null rules on `SiteCardStats`: `null` there means "not
+         *     computed for this response", which is never the same statement as zero.
+         *
+         *     The figures are served from a short per-account cache (five minutes by
+         *     default), so this response is a recent reading rather than a live one.
+         *     The dashboard's own analytics endpoints are what a viewer watching a
+         *     number change should be reading.
          */
         get: operations["listSites"];
         put?: never;
@@ -4906,7 +4918,7 @@ export interface components {
              *     refused from the moment it blocked. On an active site it simply means
              *     no block is in force. `status` is what tells the two apart.
              */
-            ingest_grace_until: components["schemas"]["UtcInstant"] | null;
+            ingest_grace_until?: components["schemas"]["UtcInstant"] | null;
             /**
              * @description When this blocked site's retained analytics fall due for deletion
              *     (docs snapshot 05, D-007: 90 days after the block), or `null` while
@@ -4917,7 +4929,7 @@ export interface components {
              *     was decided when the site blocked and does not move if the policy
              *     changes afterwards.
              */
-            retention_deadline: components["schemas"]["UtcInstant"] | null;
+            retention_deadline?: components["schemas"]["UtcInstant"] | null;
             /**
              * @description The currency every money figure this product shows for the site is
              *     denominated in (ADR-0033, D2c). Defaults to `USD`; changed with
@@ -4972,6 +4984,123 @@ export interface components {
          * @example shop.example.com
          */
         SiteDomain: string;
+        /**
+         * @description One row of `GET /v1/sites`: the site summary every other site operation
+         *     returns, plus the figures the sites grid renders a card from (ADR-0080).
+         *
+         *     Composed rather than a second copy of `SiteSummary`, so a field added to
+         *     the summary appears here without being added twice. The card figures are
+         *     on the **list only** — `GET /v1/sites/{site_id}` and `PATCH` answer with
+         *     a bare `SiteSummary`, because a single-site screen already has the
+         *     analytics surface and does not need a second, cached copy of two numbers.
+         */
+        SiteListItem: components["schemas"]["SiteSummary"] & components["schemas"]["SiteCardStats"];
+        /**
+         * @description The figures a site card shows, computed once per account rather than per
+         *     site (ADR-0080).
+         *
+         *     **`null` and zero are different answers, and the card must render them
+         *     differently.** Zero is a measurement: this site exists and nothing has
+         *     been counted for it. `null` is the absence of a measurement: the analytics
+         *     service did not answer in time, is not configured in this deployment, or
+         *     the site is suspended and its analytics are refused. A card showing "0
+         *     visitors" for a site whose numbers merely failed to load would be stating
+         *     something false about the customer's traffic, which is why the two travel
+         *     as different values instead of one number and a flag.
+         *
+         *     `all_time` and `sparkline` are always `null` together or set together.
+         */
+        SiteCardStats: {
+            /**
+             * @description Totals over the site's whole history, or `null` when they could not
+             *     be computed for this response (see above).
+             *
+             *     A site whose `first_event_at` is `null` has never received an event,
+             *     which is a measurement rather than a failure: it reads back as
+             *     `visitors: 0, pageviews: 0` without any analytics query being issued
+             *     at all.
+             */
+            all_time: components["schemas"]["SiteCardTotals"] | null;
+            /**
+             * @description Weekly unique visitors (ADR-0036 population) over the trailing 40 ISO
+             *     weeks, oldest first, or `null` when the figures could not be computed
+             *     (see above).
+             *
+             *     The same measure as `all_time.visitors`, cut per week rather than
+             *     over the whole history — which is exactly why the points add up to
+             *     more than the total (see `SiteCardTotals`), and why they are not page
+             *     views.
+             *
+             *     Fewer than 40 points is normal and carries meaning: the series starts
+             *     where the site's history does, so a site that has been collecting for
+             *     three weeks has three points rather than 37 leading zeros. That start
+             *     is the **earlier** of the site's `first_event_at` week and the oldest
+             *     week it has data in — a site whose data predates `first_event_at`
+             *     (ADR-0027 shipped after some sites already had traffic, and those were
+             *     not backfilled) is plotted from its data, never trimmed to the field.
+             *     Empty weeks **inside** the series are zeros, because there the zero is
+             *     a measurement. The last point is the current, still-filling week. An
+             *     empty array is the shape for a site that has never received an event.
+             *
+             *     **The weeks are ISO weeks in UTC** (Monday start), not in the site's
+             *     reporting timezone, and this is the one figure in the product that is
+             *     not cut on the site's own clock (ADR-0080 D3): one query answers the
+             *     whole account and a week boundary can only be computed in one zone at
+             *     a time. The card draws an unlabelled line with no axis, so the
+             *     boundary's zone is not observable in it; every dated surface stays on
+             *     the site's zone.
+             */
+            sparkline: number[] | null;
+        };
+        /**
+         * @description All-time totals for one site.
+         *
+         *     `visitors` is a merge of the stored unique-visitor states over the whole
+         *     history, never a sum of the weekly numbers (ADR-0036): a person who
+         *     visited in two weeks counts once here and once in each of those weeks, so
+         *     the sparkline's points add up to more than this figure and are supposed
+         *     to. Both counts are over the page-view population, so `visitors` is
+         *     never greater than `pageviews`.
+         */
+        SiteCardTotals: {
+            /** @description Distinct visitors with at least one page view, all time. */
+            visitors: number;
+            /** @description Page views, all time. */
+            pageviews: number;
+            /**
+             * @description All-time net revenue, or `null` — which here means "this caller does
+             *     not get a revenue figure for this site", and again is not zero.
+             *
+             *     It is an object only when the caller holds `revenue:read` on the site
+             *     (owner) **and** the site has a revenue provider connected. A site
+             *     whose provider is degraded or disconnected still reports its figure:
+             *     the money was real, and the revenue surface already distinguishes the
+             *     connection states. A site that never connected one has no revenue to
+             *     report, and saying `0` would claim it earned nothing.
+             */
+            revenue: components["schemas"]["SiteCardRevenue"] | null;
+        };
+        /**
+         * @description Net revenue in minor units of the site's reporting currency.
+         *
+         *     Net is the ADR-0033 D2d arithmetic: charges, less refunds, less disputes
+         *     withdrawn, plus disputes reinstated, less fees. It can be negative in a
+         *     period whose refunds outweigh its charges.
+         */
+        SiteCardRevenue: {
+            /**
+             * @description Minor units (cents for `USD`), signed. **Not divisible by 100 in
+             *     general** — `JPY` has no minor unit and `KWD` has three — so format
+             *     it against the currency rather than dividing by a hundred.
+             */
+            net_minor: number;
+            /**
+             * @description The site's `reporting_currency`, repeated here so a figure and its
+             *     unit never travel apart. The rollup is already converted into it
+             *     (ADR-0033 D2c); there is no per-transaction currency in this number.
+             */
+            currency: components["schemas"]["ReportingCurrency"];
+        };
         /**
          * @description A new site. The origin allowlist is not set here — configure it with
          *     `PATCH /v1/sites/{site_id}` once the site exists.
@@ -9723,7 +9852,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        items: components["schemas"]["SiteSummary"][];
+                        items: components["schemas"]["SiteListItem"][];
                     };
                 };
             };

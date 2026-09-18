@@ -24,6 +24,10 @@ import {
 } from '@openanalytics/auth'
 
 const SITE = '3f2a1c64-9a1a-4e2f-9c1e-2a0f1d3b5c77'
+const SITE_B = '7c4e9a12-0b55-4d31-8f6a-1e2d3c4b5a60'
+
+/** The ADR-0080 pair: the only operations that bind a list of sites. */
+const MULTI_SITE_OPERATIONS = ['analytics.sites_all_time', 'analytics.sites_all_time_revenue']
 
 /** A range whose endpoints are UTC-day (and therefore hour and minute) aligned. */
 const DAY_RANGE = { from: '2026-07-01T00:00:00.000Z', to: '2026-07-08T00:00:00.000Z' }
@@ -137,6 +141,12 @@ describe('operation registry', () => {
       'analytics.sessions_provisional_day',
       'analytics.sessions_provisional_day_local',
       'analytics.sessions_provisional_hour',
+      // The two multi-site reads (ADR-0080). They bind `site_ids`, not
+      // `site_id`, and they are the only entries here that do — the site-scope
+      // assertion below is what keeps that a widening of arity rather than a
+      // hole in the boundary.
+      'analytics.sites_all_time',
+      'analytics.sites_all_time_revenue',
       'analytics.sources_day',
       'analytics.sources_hour',
       'analytics.timeseries_day',
@@ -422,11 +432,34 @@ describe('operation registry', () => {
     }
   })
 
-  it('binds site_id on every analytics operation, so no operation is cross-site', () => {
+  it('names its sites on every analytics operation, so no operation is cross-site', () => {
+    // ADR-0080 widened this from "binds `site_id`" to "binds `site_id` **or**
+    // `site_ids`". What it did not widen is the boundary: the statement can only
+    // read sites the caller named, and the api only ever names sites the
+    // requesting user is a member of. An operation that bound neither could read
+    // every site in the cluster, which is what this assertion exists to make
+    // impossible.
     for (const operation of QUERY_OPERATIONS.values()) {
       if (operation.id === 'health.clickhouse_roundtrip') continue
       expect(operation.requiresSiteScope).toBe(true)
-      expect(operation.sql).toContain('{site_id:UUID}')
+      if (MULTI_SITE_OPERATIONS.includes(operation.id)) {
+        expect(operation.sql, operation.id).toContain('{site_ids:Array(UUID)}')
+        // Exactly one of the two forms — never a statement that filters by a
+        // single id while claiming to answer for a list.
+        expect(operation.sql, operation.id).not.toContain('{site_id:UUID}')
+      } else {
+        expect(operation.sql, operation.id).toContain('{site_id:UUID}')
+      }
+    }
+  })
+
+  it('keeps the multi-site binding off every single-site family', () => {
+    // The inverse, and the one a careless refactor breaks: no ordinary report
+    // may quietly grow a `site_ids` binding, because every authorization check
+    // above the gateway is written for one site at a time.
+    for (const operation of QUERY_OPERATIONS.values()) {
+      if (MULTI_SITE_OPERATIONS.includes(operation.id)) continue
+      expect(operation.sql, operation.id).not.toContain('{site_ids:')
     }
   })
 
@@ -478,6 +511,126 @@ describe('operation registry', () => {
     // for are present and carry the filtered merge.
     for (const id of ['analytics.timeseries_hour', 'analytics.overview_day']) {
       expect(findOperation(id)?.sql).toContain('uniqMergeIf(')
+    }
+  })
+})
+
+/**
+ * The multi-site site-card reads (ADR-0080).
+ *
+ * These are the first operations in the registry whose parameter is a *list* of
+ * sites, so the parameter schema is carrying weight the single-site ones never
+ * had to: it is what bounds the fan-out, and it is what keeps `maxRows` an
+ * honest ceiling rather than a truncation waiting to happen.
+ */
+describe('site card operations bind a list of sites (ADR-0080)', () => {
+  /** A Monday-aligned 40-week window, the shape the api computes. */
+  const WEEK_MS = 7 * 86_400_000
+  const TO = '2026-09-14T00:00:00.000Z' // a Monday
+  const FROM = new Date(Date.parse(TO) - 40 * WEEK_MS).toISOString()
+  const base = { site_ids: [SITE, SITE_B], from: FROM, to: TO }
+
+  it('binds the id list as a ClickHouse Array(UUID) literal, never into the statement', () => {
+    const operation = findOperation('analytics.sites_all_time')
+    const parameters = operation?.bindParams(base)
+
+    // The value travels as `param_site_ids`; ClickHouse parses it against the
+    // declared `Array(UUID)` type server-side. The quoting is safe only because
+    // every element passed `z.uuid()` first, which is asserted below.
+    expect(parameters).toEqual({
+      site_ids: `['${SITE}','${SITE_B}']`,
+      from: '2025-12-08 00:00:00.000',
+      to: '2026-09-14 00:00:00.000',
+    })
+    expect(operation?.sql).toContain('{site_ids:Array(UUID)}')
+    expect(operation?.sql).not.toContain(SITE)
+  })
+
+  it('refuses an empty list, a non-uuid element and a repeated id', () => {
+    const operation = findOperation('analytics.sites_all_time')
+    // Empty is not "all sites" and must never be readable as such.
+    expect(() => operation?.bindParams({ ...base, site_ids: [] })).toThrow(ApiError)
+    expect(() => operation?.bindParams({ ...base, site_ids: ["' OR 1=1 --"] })).toThrow(ApiError)
+    expect(() => operation?.bindParams({ ...base, site_ids: [SITE, SITE] })).toThrow(ApiError)
+  })
+
+  it('caps the fan-out below its own row ceiling', () => {
+    const operation = findOperation('analytics.sites_all_time')
+    const ids = (count: number) =>
+      Array.from(
+        { length: count },
+        (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      )
+
+    expect(() => operation?.bindParams({ ...base, site_ids: ids(100) })).not.toThrow()
+    expect(() => operation?.bindParams({ ...base, site_ids: ids(101) })).toThrow(ApiError)
+
+    // The cap and the row ceiling are the same statement said twice: 100 sites ×
+    // (40 weeks + 1 total). A request that could exceed `maxRows` would come
+    // back truncated — a silently short answer — instead of refused.
+    expect(operation?.maxRows).toBe(100 * 41)
+  })
+
+  it('requires UTC Monday endpoints, because every plotted week must be whole', () => {
+    const operation = findOperation('analytics.sites_all_time')
+    // Day-aligned but a Tuesday: `toStartOfWeek(…, 1)` would fold six days into
+    // the first bucket and one into the last, producing two short points the
+    // card draws at full width.
+    expect(() => operation?.bindParams({ ...base, from: '2025-12-09T00:00:00.000Z' })).toThrow(
+      ApiError,
+    )
+    // Monday, but not midnight.
+    expect(() => operation?.bindParams({ ...base, from: '2025-12-08T01:00:00.000Z' })).toThrow(
+      ApiError,
+    )
+    expect(() => operation?.bindParams({ ...base, from: TO, to: FROM })).toThrow(ApiError)
+  })
+
+  it('bounds the window at forty weeks', () => {
+    const operation = findOperation('analytics.sites_all_time')
+    const tooEarly = new Date(Date.parse(TO) - 41 * WEEK_MS).toISOString()
+    expect(() => operation?.bindParams({ ...base, from: tooEarly })).toThrow(ApiError)
+  })
+
+  it('reads visitors as a page-view-filtered merge, and totals without a lower bound', () => {
+    const sql = findOperation('analytics.sites_all_time')?.sql ?? ''
+    // ADR-0036: the same population `pageviews` counts, so `visitors <=
+    // pageviews` holds on the total row and on every week.
+    expect(sql).toContain("uniqMergeIf(t.visitors, t.event_type = 'page_view')")
+    expect(sql).not.toMatch(/uniqMerge\(/)
+    expect(sql).not.toMatch(/sum\((?:t\.)?visitors\)/)
+
+    // "All time" is literal: the total branch takes the upper bound only. Two
+    // `>=` filters would mean the week window silently clipped the totals too.
+    expect(sql.match(/AND t\.bucket_start >= /gu)).toHaveLength(1)
+    expect(sql.match(/AND t\.bucket_start < /gu)).toHaveLength(2)
+    expect(sql).toContain("toDateTime64(toStartOfWeek(t.bucket_start, 1), 3, 'UTC') AS week")
+  })
+
+  it('takes the current generation of each revenue bucket, never FINAL or a raw sum', () => {
+    const operation = findOperation('analytics.sites_all_time_revenue')
+    // `revenue_1d` is a ReplacingMergeTree: summing it directly would add every
+    // superseded generation of every recomputed bucket (the D-212 read rule).
+    expect(operation?.sql).toContain('argMax(rr.net_minor, rr.generation)')
+    expect(operation?.sql).not.toContain('FINAL')
+    expect(operation?.sql).toContain('GROUP BY rr.site_id, rr.bucket_start')
+
+    // All-time only: it validates the same window as its sibling — one window
+    // definition for both halves of the card — but binds no lower bound.
+    const parameters = operation?.bindParams(base)
+    expect(parameters).toEqual({
+      site_ids: `['${SITE}','${SITE_B}']`,
+      to: '2026-09-14 00:00:00.000',
+    })
+    expect(operation?.maxRows).toBe(100)
+  })
+
+  it('is not cached in the gateway, because the api holds the long TTL', () => {
+    // ADR-0080 D5 puts the cache in the api, keyed by the caller's membership
+    // set and held for minutes. A second TTL here would decide nothing and would
+    // make "why is this number stale" a two-place question.
+    for (const id of MULTI_SITE_OPERATIONS) {
+      expect(findOperation(id)?.cacheable, id).toBe(false)
     }
   })
 })

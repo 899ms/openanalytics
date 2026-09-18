@@ -62,6 +62,15 @@ export const api = new OpenAnalyticsClient({
 
 export type Schemas = components["schemas"];
 export type SiteSummary = Schemas["SiteSummary"];
+/**
+ * A row of `GET /v1/sites`: the summary plus the card figures (ADR-0080).
+ *
+ * `all_time`/`sparkline` are `null` when the figures could not be computed for
+ * that response — never the same thing as zero, which is a real measurement.
+ */
+export type SiteListItem = Schemas["SiteListItem"];
+export type SiteCardTotals = Schemas["SiteCardTotals"];
+export type SiteCardRevenue = Schemas["SiteCardRevenue"];
 export type SiteRole = Schemas["SiteRole"];
 export type SiteStatus = Schemas["SiteStatus"];
 export type SiteMember = Schemas["SiteMember"];
@@ -284,7 +293,7 @@ export async function send<T>(
 /* Endpoints — one function per operation the screens use. ------------------ */
 
 export const sites = {
-  list: () => api.get<{ items: SiteSummary[] }>("/v1/sites"),
+  list: () => api.get<{ items: SiteListItem[] }>("/v1/sites"),
   resolve: (slug: string) =>
     api.get<SiteResolution>(
       `/v1/sites/resolve?slug=${encodeURIComponent(slug)}`

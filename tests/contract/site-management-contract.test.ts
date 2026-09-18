@@ -31,6 +31,16 @@ async function spec(): Promise<string> {
   return readFile(SPEC_PATH, 'utf8')
 }
 
+/** One `components.schemas` entry, up to the next schema name at the same indent. */
+function schemaBlock(text: string, name: string): string {
+  const marker = `\n    ${name}:\n`
+  const at = text.indexOf(marker)
+  expect(at, `openapi.yaml is missing schema ${name}`).toBeGreaterThan(-1)
+  const rest = text.slice(at + marker.length)
+  const next = /\n {4}[A-Za-z][A-Za-z0-9]*:\n/u.exec(rest)
+  return rest.slice(0, next?.index ?? rest.length)
+}
+
 describe('OpenAPI documents the management operations', () => {
   it('declares all five new operationIds', async () => {
     const text = await spec()
@@ -165,7 +175,7 @@ describe('SiteSummary carries the origin allowlist', () => {
     expect(text).toContain('SiteDomain:')
   })
 
-  it('carries the lifecycle triple as required-and-nullable instants (ADR-0030)', async () => {
+  it('carries suspended_at as a required-and-nullable instant (ADR-0030)', async () => {
     const text = await spec()
     const block = text.slice(
       text.indexOf('SiteSummary:'),
@@ -173,16 +183,34 @@ describe('SiteSummary carries the origin allowlist', () => {
     )
     const required = block.slice(block.indexOf('required:'), block.indexOf('properties:'))
 
-    // Required *and* nullable, the ADR-0027 convention. The blocked screen and
-    // the retention countdown read these three plus `status`; an absent key
-    // would mean "the server did not say", and a client that cannot tell that
-    // from "not blocked" would either hide a real block or invent a fake one.
-    for (const field of ['suspended_at', 'ingest_grace_until', 'retention_deadline']) {
-      expect(required).toContain(field)
-      const property = block.slice(block.indexOf(`${field}:`))
-      const nullable = property.slice(0, property.indexOf('oneOf:') + 200)
-      expect(nullable).toContain("- $ref: '#/components/schemas/UtcInstant'")
-      expect(nullable).toContain("- type: 'null'")
+    // Required *and* nullable, the ADR-0027 convention. The blocked screen reads
+    // this plus `status`; an absent key would mean "the server did not say", and
+    // a client that cannot tell that from "not blocked" would either hide a real
+    // block or invent a fake one.
+    expect(required).toContain('suspended_at')
+    const property = block.slice(block.indexOf('suspended_at:'))
+    const nullable = property.slice(0, property.indexOf('oneOf:') + 200)
+    expect(nullable).toContain("- $ref: '#/components/schemas/UtcInstant'")
+    expect(nullable).toContain("- type: 'null'")
+  })
+
+  it('stopped requiring the two deadlines this build does not send (ADR-0080)', async () => {
+    const text = await spec()
+    const block = text.slice(
+      text.indexOf('SiteSummary:'),
+      text.indexOf('SiteDomain:', text.indexOf('SiteSummary:')),
+    )
+    const required = block.slice(block.indexOf('required:'), block.indexOf('properties:'))
+
+    // Drift, not a decision, and it had been in the document since the open-core
+    // split: the grace window and the retention deadline moved to the hosted
+    // billing surface with the sweeper that sets them, and `siteJson` has not
+    // written either since — so the contract was promising two keys every
+    // response was missing. They stay *declared*, because a hosted build's shape
+    // for them is unchanged; they are simply no longer promised.
+    for (const field of ['ingest_grace_until', 'retention_deadline']) {
+      expect(required).not.toContain(field)
+      expect(block).toContain(`${field}:`)
     }
   })
 
@@ -450,5 +478,99 @@ describe('ApiKeySummary says who holds the key', () => {
     // way it leans, because an integrator choosing wrongly here is choosing
     // between an outage and a live credential in a stranger's hands.
     expect(block).toContain('`user`')
+  })
+})
+
+/**
+ * The site card figures on the list response (ADR-0080).
+ *
+ * Asserted on the document rather than on a response, because the thing this
+ * feature can most easily get wrong is a *documentation* failure: a client that
+ * reads `null` as zero renders "0 visitors" over a site that merely failed to
+ * load, and nothing in a passing integration test would catch that. So what is
+ * pinned here is that the two values are structurally distinct and that the
+ * document says which is which.
+ */
+describe('site card figures on GET /v1/sites (ADR-0080)', () => {
+  it('answers the list with SiteListItem and leaves the single-site reads alone', async () => {
+    const text = await spec()
+    const list = text.slice(
+      text.indexOf('operationId: listSites'),
+      text.indexOf('operationId: createSite'),
+    )
+    expect(list).toContain("$ref: '#/components/schemas/SiteListItem'")
+    expect(list).not.toContain("$ref: '#/components/schemas/SiteSummary'")
+
+    // The single-site read and the settings write keep the bare summary: a
+    // screen that is already on one site has the analytics surface, and a second
+    // cached copy of two numbers there would be a second source of truth.
+    const single = text.slice(
+      text.indexOf('  /v1/sites/{site_id}:'),
+      text.indexOf('  /v1/sites/{site_id}/keys:'),
+    )
+    expect(single).toContain("$ref: '#/components/schemas/SiteSummary'")
+    expect(single).not.toContain('SiteListItem')
+  })
+
+  it('composes the item instead of copying the summary, and closes the composition', async () => {
+    const text = await spec()
+    const block = schemaBlock(text, 'SiteListItem')
+    expect(block).toContain("- $ref: '#/components/schemas/SiteSummary'")
+    expect(block).toContain("- $ref: '#/components/schemas/SiteCardStats'")
+    // `unevaluatedProperties`, not `additionalProperties`: the 3.1 keyword is
+    // the one that can see both branches of the allOf. `additionalProperties:
+    // false` on either branch would reject the other branch's properties and
+    // make the composed schema unsatisfiable.
+    expect(block).toContain('unevaluatedProperties: false')
+
+    const summary = schemaBlock(text, 'SiteSummary')
+    expect(summary).not.toContain('additionalProperties: false')
+  })
+
+  it('makes both figures required-and-nullable, so null is a statement', async () => {
+    const text = await spec()
+    const block = schemaBlock(text, 'SiteCardStats')
+    expect(block).toContain('required: [all_time, sparkline]')
+    for (const field of ['all_time', 'sparkline']) {
+      const property = block.slice(block.indexOf(`${field}:`))
+      expect(property.slice(0, property.indexOf('oneOf:') + 400)).toContain("- type: 'null'")
+    }
+    // The sentence a client implementer has to read before rendering a zero.
+    expect(block).toContain('`null` and zero are different answers')
+  })
+
+  it('bounds the sparkline at 40 weekly points and says which zone cuts them', async () => {
+    const text = await spec()
+    const block = schemaBlock(text, 'SiteCardStats')
+    expect(block).toContain('maxItems: 40')
+    // The deliberate ADR-0079 D5 departure: every other window in the product is
+    // cut on the site's own zone, and this one cannot be. A document that did
+    // not say so would leave the next reader to discover it from a query.
+    expect(block).toContain('ISO weeks in UTC')
+    expect(block).toContain('ADR-0080 D3')
+  })
+
+  it('keeps money in minor units with its own currency, and warns against /100', async () => {
+    const text = await spec()
+    const totals = schemaBlock(text, 'SiteCardTotals')
+    expect(totals).toContain('required: [visitors, pageviews, revenue]')
+    expect(totals).toContain("$ref: '#/components/schemas/SiteCardRevenue'")
+    expect(totals).toContain("- type: 'null'")
+
+    const revenue = schemaBlock(text, 'SiteCardRevenue')
+    expect(revenue).toContain('required: [net_minor, currency]')
+    expect(revenue).toContain("$ref: '#/components/schemas/ReportingCurrency'")
+    // A card that divided by a hundred is wrong twice: `JPY` has no minor unit and `KWD` has
+    // three, so the document has to say it outright.
+    expect(revenue).toContain('Not divisible by 100')
+  })
+
+  it('says the totals are a merge, not a sum of the weeks (ADR-0036)', async () => {
+    const text = await spec()
+    const block = schemaBlock(text, 'SiteCardTotals')
+    // Without this sentence the obvious client-side "check" — adding the
+    // sparkline up and comparing it to `visitors` — reads as a server bug.
+    expect(block).toContain('never a sum of the weekly numbers')
+    expect(block).toContain('never greater than `pageviews`')
   })
 })

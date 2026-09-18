@@ -170,6 +170,8 @@ describeIfClickHouse('query gateway registry over the rollups', () => {
   const siteB = randomUUID()
   const siteTz = randomUUID()
   const siteWeek = randomUUID()
+  /** ADR-0080: the multi-site card read, whose whole risk is merge-vs-sum. */
+  const siteCards = randomUUID()
 
   /** +03:00 all year — no DST since 2016, so every case below is offset-stable. */
   const ISTANBUL = 'Europe/Istanbul'
@@ -417,6 +419,89 @@ describeIfClickHouse('query gateway registry over the rollups', () => {
         occurred_at: '2026-07-07 09:00:00.000',
         anonymous_id: 'wv3',
         page_path: '/home',
+      },
+    ])
+
+    // ADR-0080's site-card read. Four events, each placed to break a different
+    // plausible-but-wrong implementation:
+    //
+    //   `cv0` in January — outside every window the card ever plots. It must
+    //     appear in the all-time total, which is what "no lower bound" means,
+    //     and in none of the weeks.
+    //   `cv1` and `cv3` each on two different ISO weeks. The total must count
+    //     each of them ONCE and each week must count them once, so the weekly
+    //     visitor numbers add up to MORE than the total. Summing the sparkline
+    //     to check the total is the check that must fail — and there are two
+    //     such people rather than one because `cv0`, sitting outside the window,
+    //     adds one to the total and would otherwise mask a single overlap
+    //     exactly (the first version of this fixture did, and said 3 === 3).
+    //   `cv2` in the second week only.
+    //   a `custom` event with its own anonymous id — never a visitor, because
+    //     the merge is filtered to the page-view population (ADR-0036).
+    await insertRaw('cards1', [
+      {
+        site_id: siteCards,
+        event_id: randomUUID(),
+        batch_id: 'cards',
+        type: 'page_view',
+        occurred_at: '2026-01-05 09:00:00.000',
+        anonymous_id: 'cv0',
+        page_path: '/old',
+      },
+      {
+        site_id: siteCards,
+        event_id: randomUUID(),
+        batch_id: 'cards',
+        type: 'page_view',
+        occurred_at: '2026-06-30 09:00:00.000',
+        anonymous_id: 'cv1',
+        page_path: '/home',
+      },
+      {
+        site_id: siteCards,
+        event_id: randomUUID(),
+        batch_id: 'cards',
+        type: 'page_view',
+        occurred_at: '2026-07-07 09:00:00.000',
+        anonymous_id: 'cv1',
+        page_path: '/home',
+      },
+      {
+        site_id: siteCards,
+        event_id: randomUUID(),
+        batch_id: 'cards',
+        type: 'page_view',
+        occurred_at: '2026-07-08 09:00:00.000',
+        anonymous_id: 'cv2',
+        page_path: '/pricing',
+      },
+      {
+        site_id: siteCards,
+        event_id: randomUUID(),
+        batch_id: 'cards',
+        type: 'page_view',
+        occurred_at: '2026-06-30 11:00:00.000',
+        anonymous_id: 'cv3',
+        page_path: '/home',
+      },
+      {
+        site_id: siteCards,
+        event_id: randomUUID(),
+        batch_id: 'cards',
+        type: 'page_view',
+        occurred_at: '2026-07-08 11:00:00.000',
+        anonymous_id: 'cv3',
+        page_path: '/home',
+      },
+      {
+        site_id: siteCards,
+        event_id: randomUUID(),
+        batch_id: 'cards',
+        type: 'custom',
+        name: 'signup',
+        occurred_at: '2026-07-08 10:00:00.000',
+        anonymous_id: 'cv-custom-only',
+        page_path: '/pricing',
       },
     ])
   }, 120_000)
@@ -880,6 +965,113 @@ describeIfClickHouse('query gateway registry over the rollups', () => {
       expect(pages.reduce((sum, row) => sum + Number(row['views']), 0)).toBe(expectedPageviews)
     },
   )
+
+  /**
+   * The multi-site card read (ADR-0080), against a real ClickHouse.
+   *
+   * This is the one assertion in the suite that cannot be made anywhere else: a
+   * `uniqMerge` over stored states is not arithmetic the api can check, and the
+   * failure it guards against — a total computed by summing the weeks — produces
+   * a *larger and entirely plausible* number rather than an error.
+   */
+  const CARD_WINDOW = { from: '2026-06-29T00:00:00.000Z', to: '2026-07-13T00:00:00.000Z' }
+
+  const cardRows = async (siteIds: string[]) =>
+    await run('analytics.sites_all_time', { site_ids: siteIds, ...CARD_WINDOW })
+
+  it('answers a total that is a merge of visitors, not a sum of the weeks', async () => {
+    const rows = await cardRows([siteCards])
+
+    const total = rows.find((row) => Number(row['is_total']) === 1)
+    const weeks = rows
+      .filter((row) => Number(row['is_total']) === 0)
+      .sort((a, b) => String(a['week']).localeCompare(String(b['week'])))
+
+    // Six page views all time, four people. January's is included — the total
+    // branch carries no lower bound, which is what "all time" has to mean.
+    expect(Number(total?.['pageviews'])).toBe(6)
+    expect(Number(total?.['visitors'])).toBe(4)
+
+    // The window holds two ISO weeks, Monday-started.
+    expect(weeks.map((row) => clock(row['week']))).toEqual([
+      '2026-06-29 00:00:00',
+      '2026-07-06 00:00:00',
+    ])
+    expect(weeks.map((row) => Number(row['pageviews']))).toEqual([2, 3])
+    expect(weeks.map((row) => Number(row['visitors']))).toEqual([2, 3])
+
+    // The point of the fixture: `cv1` and `cv3` each visited in both weeks, so
+    // the weekly visitor numbers add up to MORE than the all-time figure. A
+    // total computed by summing the sparkline would say 5 here and be wrong by
+    // two people — and wrong in the flattering direction, which is why that
+    // mistake survives review.
+    const summed = weeks.reduce((sum, row) => sum + Number(row['visitors']), 0)
+    expect(summed).toBe(5)
+    expect(Number(total?.['visitors'])).toBeLessThan(summed)
+
+    // And `visitors <= pageviews` on every row, total included (ADR-0036 D1) —
+    // the invariant the page-view filter on the merge exists to keep.
+    for (const row of rows) {
+      expect(Number(row['visitors']), String(row['week'])).toBeLessThanOrEqual(
+        Number(row['pageviews']),
+      )
+    }
+  })
+
+  it('never counts a custom-event-only identity as a visitor', async () => {
+    // `cv-custom-only` has a stored `uniq` state under the `custom` event type.
+    // A bare `uniqMerge(visitors)` would merge it in and mint a fifth visitor
+    // with zero page views — the ADR-0036 defect, here over a real rollup.
+    const [total] = (await cardRows([siteCards])).filter((row) => Number(row['is_total']) === 1)
+    expect(Number(total?.['visitors'])).toBe(4)
+  })
+
+  it('returns rows only for the sites it was given, and for all of them', async () => {
+    const one = await cardRows([siteCards])
+    expect(new Set(one.map((row) => String(row['site_id'])))).toEqual(new Set([siteCards]))
+
+    // The widened invariant in its positive form: naming two sites answers for
+    // two sites, in one statement — which is the whole reason the operation
+    // exists — while naming one still answers for exactly one.
+    const both = await cardRows([siteCards, siteWeek])
+    expect(new Set(both.map((row) => String(row['site_id'])))).toEqual(
+      new Set([siteCards, siteWeek]),
+    )
+
+    // A site with no rows at all is simply absent; the api reads that as zero
+    // for a site it knows exists, never as a failure.
+    const stranger = await cardRows([randomUUID()])
+    expect(stranger).toEqual([])
+  })
+
+  it('agrees with the single-site all-time overview it has to match', async () => {
+    // The live proof this feature ships with, made a test: the card's figure and
+    // the dashboard's "All time" total are the same number, because they read
+    // the same table with the same expression.
+    const [total] = (await cardRows([siteCards])).filter((row) => Number(row['is_total']) === 1)
+    const [overview] = await run('analytics.overview_day', {
+      site_id: siteCards,
+      from: '2025-01-01T00:00:00.000Z',
+      to: CARD_WINDOW.to,
+      timezone: 'UTC',
+    })
+
+    expect(Number(total?.['visitors'])).toBe(Number(overview?.['visitors']))
+    expect(Number(total?.['pageviews'])).toBe(Number(overview?.['pageviews']))
+  })
+
+  it('refuses a window that is not whole ISO weeks', async () => {
+    // Proven here as well as in the unit suite because the consequence is
+    // invisible in the data: a Tuesday endpoint returns rows, and two of them
+    // are short weeks the card draws at full width.
+    await expect(
+      run('analytics.sites_all_time', {
+        site_ids: [siteCards],
+        from: '2026-06-30T00:00:00.000Z',
+        to: CARD_WINDOW.to,
+      }),
+    ).rejects.toThrow()
+  })
 
   it('returns a freshness watermark from the finest rollup', async () => {
     const [row] = await run('analytics.freshness', { site_id: siteA })
