@@ -29,7 +29,7 @@ import { planRollupSwap, planSessionFacts } from './plan.ts'
  *      and release the lease.
  */
 
-const MS_PER_HOUR = 3_600_000
+const MS_PER_QUARTER_HOUR = 900_000
 const MS_PER_DAY = 86_400_000
 
 /**
@@ -66,7 +66,7 @@ export interface FinalizeSiteResult {
 }
 
 const UNIT_WIDTH_MS: Record<SessionRollupUnit, number> = {
-  '1h': MS_PER_HOUR,
+  '15m': MS_PER_QUARTER_HOUR,
   '1d': MS_PER_DAY,
 }
 
@@ -190,11 +190,15 @@ export async function finalizeSite(
 
     // 4. Swap every affected bucket at a higher generation.
     let rollupSwaps = 0
+    // Two grains since ADR-0079 step 4 (migration 0027): the hour rollup was
+    // read by nothing after step 3 moved every composition to the quarter, so
+    // writing it was a third of this loop's work for nobody. `session_rollups_1h`
+    // still exists and still holds what it held -- it is simply frozen.
     const unitBuckets: Record<SessionRollupUnit, readonly number[]> = {
-      '1h': plan.affectedHourBucketsMs,
+      '15m': plan.affectedQuarterBucketsMs,
       '1d': plan.affectedDayBucketsMs,
     }
-    for (const unit of ['1h', '1d'] as const) {
+    for (const unit of ['15m', '1d'] as const) {
       const affectedMs = unitBuckets[unit]
       if (affectedMs.length === 0) continue
 
@@ -216,10 +220,14 @@ export async function finalizeSite(
 
       if (rollupPlan.rows.length > 0) {
         await deps.store.insertRollups({ unit, rows: rollupPlan.rows })
+        // Labelled by unit, as the revenue counter already is. An unlabelled
+        // total cannot answer the one question a 15m rollout actually asks --
+        // "is the finalizer writing the new grain at all" -- because a healthy
+        // hour-and-day number hides a fifteen-minute zero.
+        deps.metrics.increment(WORKER_METRICS.sessionRollupSwaps, { unit }, rollupPlan.changed)
         rollupSwaps += rollupPlan.changed
       }
     }
-    if (rollupSwaps > 0) deps.metrics.increment(WORKER_METRICS.sessionRollupSwaps, {}, rollupSwaps)
 
     // 5. Advance the watermark (monotonic) and release the lease.
     const finalizedThroughMs = Math.max(fromMs, plan.finalizedThroughMs)

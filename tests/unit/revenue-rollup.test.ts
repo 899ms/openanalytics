@@ -25,16 +25,20 @@ import {
  */
 
 const SITE = '3f2a1c64-9a1a-4e2f-9c1e-2a0f1d3b5c77'
-const HOUR = '2026-07-20T10:00:00.000Z'
-const HOUR_MS = Date.parse(HOUR)
-const HOUR_SECONDS = HOUR_MS / 1000
+// A quarter-hour boundary that is also an hour boundary, so the cases below read
+// the same as they did before ADR-0079 step 4 took `'1h'` out of the unit union.
+// The atom grain is the fifteen-minute one now, and it is what these plan rules
+// are exercised at.
+const QUARTER = '2026-07-20T10:00:00.000Z'
+const QUARTER_MS = Date.parse(QUARTER)
+const QUARTER_SECONDS = QUARTER_MS / 1000
 const DAY_SECONDS = Date.parse('2026-07-20T00:00:00.000Z') / 1000
 
 function fact(overrides: Partial<RollupFact> = {}): RollupFact {
   return {
     objectKind: 'charge',
     status: 'succeeded',
-    occurredAtMs: HOUR_MS,
+    occurredAtMs: QUARTER_MS,
     conversionSource: 'ecb',
     reportingGrossMinor: 10_000,
     reportingNetMinor: 9_500,
@@ -42,15 +46,15 @@ function fact(overrides: Partial<RollupFact> = {}): RollupFact {
   }
 }
 
-function hourBucket(facts: readonly RollupFact[]) {
-  const bucket = aggregateRevenueBuckets(facts, '1h').get(HOUR_SECONDS)
-  expect(bucket, 'the hour bucket must exist').toBeDefined()
+function quarterBucket(facts: readonly RollupFact[]) {
+  const bucket = aggregateRevenueBuckets(facts, '15m').get(QUARTER_SECONDS)
+  expect(bucket, 'the quarter-hour bucket must exist').toBeDefined()
   return bucket!
 }
 
 describe('the sign rule (ADR-0033, D2d)', () => {
   it('adds a charge to gross, fee and net and counts it once', () => {
-    const bucket = hourBucket([fact()])
+    const bucket = quarterBucket([fact()])
     expect(bucket.chargeGrossMinor).toBe(10_000)
     // The fee is what the provider withheld: gross minus net, on the charge side.
     expect(bucket.feeMinor).toBe(500)
@@ -60,7 +64,7 @@ describe('the sign rule (ADR-0033, D2d)', () => {
   })
 
   it('subtracts a refund in the refund’s own bucket, not the charge’s', () => {
-    // The charge is in the 10:00 hour, the refund two hours later. D2d: the
+    // The charge is in the 10:00 quarter, the refund two hours later. D2d: the
     // refund reduces net in ITS bucket, so a July report read in July still
     // reads the same in September.
     const buckets = aggregateRevenueBuckets(
@@ -68,30 +72,30 @@ describe('the sign rule (ADR-0033, D2d)', () => {
         fact(),
         fact({
           objectKind: 'refund',
-          occurredAtMs: HOUR_MS + 2 * 3_600_000,
+          occurredAtMs: QUARTER_MS + 2 * 3_600_000,
           reportingGrossMinor: 4_000,
           reportingNetMinor: 4_000,
         }),
       ],
-      '1h',
+      '15m',
     )
 
-    const chargeHour = buckets.get(HOUR_SECONDS)!
-    expect(chargeHour.chargeGrossMinor).toBe(10_000)
-    expect(chargeHour.refundMinor).toBe(0)
-    expect(chargeHour.netMinor).toBe(9_500)
+    const chargeBucket = buckets.get(QUARTER_SECONDS)!
+    expect(chargeBucket.chargeGrossMinor).toBe(10_000)
+    expect(chargeBucket.refundMinor).toBe(0)
+    expect(chargeBucket.netMinor).toBe(9_500)
 
-    const refundHour = buckets.get(HOUR_SECONDS + 7_200)!
-    expect(refundHour.chargeGrossMinor).toBe(0)
-    expect(refundHour.refundMinor).toBe(4_000)
-    expect(refundHour.netMinor).toBe(-4_000)
+    const refundBucket = buckets.get(QUARTER_SECONDS + 7_200)!
+    expect(refundBucket.chargeGrossMinor).toBe(0)
+    expect(refundBucket.refundMinor).toBe(4_000)
+    expect(refundBucket.netMinor).toBe(-4_000)
   })
 
   it('keeps a refunded charge’s FULL gross — the refund is not counted twice', () => {
     // The single most tempting mistake in this file. The charge's status moved
     // to `refunded`, which is a description of what later happened to it, not a
     // second money movement — the refund object carries the negative.
-    const bucket = hourBucket([
+    const bucket = quarterBucket([
       fact({ status: 'refunded' }),
       fact({
         objectKind: 'refund',
@@ -107,13 +111,13 @@ describe('the sign rule (ADR-0033, D2d)', () => {
   })
 
   it('keeps a partially refunded charge whole too', () => {
-    const bucket = hourBucket([fact({ status: 'partially_refunded' })])
+    const bucket = quarterBucket([fact({ status: 'partially_refunded' })])
     expect(bucket.chargeGrossMinor).toBe(10_000)
     expect(bucket.chargeCount).toBe(1)
   })
 
   it('excludes failed and canceled objects entirely, money and count', () => {
-    const bucket = hourBucket([
+    const bucket = quarterBucket([
       fact({ status: 'failed' }),
       fact({ objectKind: 'refund', status: 'canceled', reportingGrossMinor: 500 }),
       fact({ objectKind: 'refund', status: 'cancelled', reportingGrossMinor: 500 }),
@@ -127,13 +131,13 @@ describe('the sign rule (ADR-0033, D2d)', () => {
   })
 
   it('counts a pending charge, because the money is genuinely in flight', () => {
-    const bucket = hourBucket([fact({ status: 'pending' })])
+    const bucket = quarterBucket([fact({ status: 'pending' })])
     expect(bucket.chargeCount).toBe(1)
     expect(bucket.chargeGrossMinor).toBe(10_000)
   })
 
   it('closes the net identity across every kind', () => {
-    const bucket = hourBucket([
+    const bucket = quarterBucket([
       fact({ reportingGrossMinor: 10_000, reportingNetMinor: 9_500 }),
       fact({ objectKind: 'refund', reportingGrossMinor: 2_000, reportingNetMinor: 1_900 }),
       fact({
@@ -176,7 +180,7 @@ describe('the dispute lifecycle', () => {
   })
 
   it('moves a won dispute through BOTH columns so the event stays visible', () => {
-    const bucket = hourBucket([
+    const bucket = quarterBucket([
       fact({
         objectKind: 'dispute',
         status: 'won',
@@ -192,7 +196,7 @@ describe('the dispute lifecycle', () => {
   })
 
   it('counts an early-warning dispute with zero money', () => {
-    const bucket = hourBucket([
+    const bucket = quarterBucket([
       fact({ objectKind: 'dispute', status: 'warning_under_review', reportingGrossMinor: 5_000 }),
     ])
     expect(bucket.disputeCount).toBe(1)
@@ -203,7 +207,7 @@ describe('the dispute lifecycle', () => {
 
 describe('the unconverted remainder (ADR-0033, D2c)', () => {
   it('contributes zero money and zero kind count, and increments its own counter', () => {
-    const bucket = hourBucket([
+    const bucket = quarterBucket([
       fact(),
       fact({
         conversionSource: 'unavailable',
@@ -221,30 +225,30 @@ describe('the unconverted remainder (ADR-0033, D2c)', () => {
   })
 
   it('treats `none` (same currency, no conversion needed) as fully converted', () => {
-    const bucket = hourBucket([fact({ conversionSource: 'none' })])
+    const bucket = quarterBucket([fact({ conversionSource: 'none' })])
     expect(bucket.chargeGrossMinor).toBe(10_000)
     expect(bucket.unconvertedCount).toBe(0)
   })
 })
 
 describe('bucketing', () => {
-  it('floors to the UTC hour and the UTC day', () => {
+  it('floors to the UTC quarter-hour and the UTC day', () => {
     const ms = Date.parse('2026-07-20T10:37:41.500Z')
-    expect(bucketSecondsOf(ms, '1h')).toBe(HOUR_SECONDS)
+    expect(bucketSecondsOf(ms, '15m')).toBe(Date.parse('2026-07-20T10:30:00.000Z') / 1000)
     expect(bucketSecondsOf(ms, '1d')).toBe(DAY_SECONDS)
   })
 
-  it('sums a day from the hours inside it', () => {
-    const facts = [fact(), fact({ occurredAtMs: HOUR_MS + 5 * 3_600_000 })]
-    const hours = aggregateRevenueBuckets(facts, '1h')
+  it('sums a day from the quarters inside it', () => {
+    const facts = [fact(), fact({ occurredAtMs: QUARTER_MS + 5 * 3_600_000 })]
+    const quarters = aggregateRevenueBuckets(facts, '15m')
     const days = aggregateRevenueBuckets(facts, '1d')
-    expect(hours.size).toBe(2)
+    expect(quarters.size).toBe(2)
     expect(days.size).toBe(1)
     expect(days.get(DAY_SECONDS)!.chargeGrossMinor).toBe(20_000)
   })
 
   it('renders the bucket start as a ClickHouse DateTime literal', () => {
-    expect(hourBucket([fact()]).bucketStart).toBe('2026-07-20 10:00:00')
+    expect(quarterBucket([fact()]).bucketStart).toBe('2026-07-20 10:00:00')
   })
 })
 
@@ -264,7 +268,7 @@ describe('the swap plan (0014’s idiom)', () => {
 
   function stored(overrides: Partial<StoredRevenueRollupBucket> = {}): StoredRevenueRollupBucket {
     return {
-      bucketSeconds: HOUR_SECONDS,
+      bucketSeconds: QUARTER_SECONDS,
       bucketStart: '2026-07-20 10:00:00',
       generation: 7,
       chargeGrossMinor: 10_000,
@@ -287,9 +291,9 @@ describe('the swap plan (0014’s idiom)', () => {
     // generation per bucket four times an hour, forever.
     const plan = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets([fact()], '1h'),
+      recomputed: aggregateRevenueBuckets([fact()], '15m'),
       stored: [stored()],
-      affectedBucketSeconds: [HOUR_SECONDS],
+      affectedBucketSeconds: [QUARTER_SECONDS],
       generation: GENERATION,
       computedAtMs,
     })
@@ -300,14 +304,14 @@ describe('the swap plan (0014’s idiom)', () => {
   it('writes the claim’s generation, never one derived from what is stored', () => {
     const plan = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets([fact(), fact()], '1h'),
+      recomputed: aggregateRevenueBuckets([fact(), fact()], '15m'),
       // Deliberately BELOW the run's generation, and deliberately uneven across
       // buckets: nothing about the stored rows may influence what is written.
       stored: [
         stored({ generation: 3 }),
-        stored({ bucketSeconds: HOUR_SECONDS + 3_600, generation: 11 }),
+        stored({ bucketSeconds: QUARTER_SECONDS + 3_600, generation: 11 }),
       ],
-      affectedBucketSeconds: [HOUR_SECONDS],
+      affectedBucketSeconds: [QUARTER_SECONDS],
       generation: GENERATION,
       computedAtMs,
     })
@@ -326,17 +330,17 @@ describe('the swap plan (0014’s idiom)', () => {
     const storedState = [stored({ generation: 7 })]
     const victim = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets([fact(), fact()], '1h'),
+      recomputed: aggregateRevenueBuckets([fact(), fact()], '15m'),
       stored: storedState,
-      affectedBucketSeconds: [HOUR_SECONDS],
+      affectedBucketSeconds: [QUARTER_SECONDS],
       generation: 8,
       computedAtMs,
     })
     const thief = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets([fact(), fact(), fact()], '1h'),
+      recomputed: aggregateRevenueBuckets([fact(), fact(), fact()], '15m'),
       stored: storedState,
-      affectedBucketSeconds: [HOUR_SECONDS],
+      affectedBucketSeconds: [QUARTER_SECONDS],
       generation: 9,
       computedAtMs,
     })
@@ -347,9 +351,9 @@ describe('the swap plan (0014’s idiom)', () => {
   it('uses the claim’s generation on a site with no stored buckets at all', () => {
     const plan = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets([fact()], '1h'),
+      recomputed: aggregateRevenueBuckets([fact()], '15m'),
       stored: [],
-      affectedBucketSeconds: [HOUR_SECONDS],
+      affectedBucketSeconds: [QUARTER_SECONDS],
       generation: 1,
       computedAtMs,
     })
@@ -363,7 +367,7 @@ describe('the swap plan (0014’s idiom)', () => {
       siteId: SITE,
       recomputed: new Map(),
       stored: [],
-      affectedBucketSeconds: [HOUR_SECONDS, HOUR_SECONDS + 3_600],
+      affectedBucketSeconds: [QUARTER_SECONDS, QUARTER_SECONDS + 3_600],
       generation: GENERATION,
       computedAtMs,
     })
@@ -376,12 +380,12 @@ describe('the swap plan (0014’s idiom)', () => {
     // affected set includes the stored side.
     const plan = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets([fact({ status: 'failed' })], '1h'),
+      recomputed: aggregateRevenueBuckets([fact({ status: 'failed' })], '15m'),
       stored: [stored()],
       affectedBucketSeconds: affectedBucketSecondsOf({
         facts: [fact({ status: 'failed' })],
         stored: [stored()],
-        unit: '1h',
+        unit: '15m',
       }),
       generation: GENERATION,
       computedAtMs,
@@ -393,14 +397,14 @@ describe('the swap plan (0014’s idiom)', () => {
   })
 
   it('emits rows in bucket order, so the dedup token is stable', () => {
-    const facts = [fact({ occurredAtMs: HOUR_MS + 3_600_000 }), fact()]
+    const facts = [fact({ occurredAtMs: QUARTER_MS + 3_600_000 }), fact()]
     const plan = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets(facts, '1h'),
+      recomputed: aggregateRevenueBuckets(facts, '15m'),
       stored: [],
       // Deliberately out of order, and duplicated: the planner sorts and
       // de-duplicates, so a retry rebuilds byte-identical rows.
-      affectedBucketSeconds: [HOUR_SECONDS + 3_600, HOUR_SECONDS, HOUR_SECONDS],
+      affectedBucketSeconds: [QUARTER_SECONDS + 3_600, QUARTER_SECONDS, QUARTER_SECONDS],
       generation: GENERATION,
       computedAtMs,
     })
@@ -427,7 +431,7 @@ describe('a window whose ONLY change is not a charge (M12 CP7 defect 2)', () => 
   const stored = (
     overrides: Partial<StoredRevenueRollupBucket> = {},
   ): StoredRevenueRollupBucket => ({
-    bucketSeconds: HOUR_SECONDS,
+    bucketSeconds: QUARTER_SECONDS,
     bucketStart: '2026-07-20 10:00:00',
     generation: 3,
     chargeGrossMinor: 10_000,
@@ -454,9 +458,9 @@ describe('a window whose ONLY change is not a charge (M12 CP7 defect 2)', () => 
     ]
     const plan = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets(facts, '1h'),
+      recomputed: aggregateRevenueBuckets(facts, '15m'),
       stored: [stored()],
-      affectedBucketSeconds: affectedBucketSecondsOf({ facts, stored: [stored()], unit: '1h' }),
+      affectedBucketSeconds: affectedBucketSecondsOf({ facts, stored: [stored()], unit: '15m' }),
       generation: 4,
       computedAtMs: Date.parse('2026-07-20T11:00:00.000Z'),
     })
@@ -482,7 +486,7 @@ describe('a window whose ONLY change is not a charge (M12 CP7 defect 2)', () => 
         reportingNetMinor: 3_000,
       }),
     ]
-    const withdrawn = aggregateRevenueBuckets(opened, '1h').get(HOUR_SECONDS)
+    const withdrawn = aggregateRevenueBuckets(opened, '15m').get(QUARTER_SECONDS)
     expect(withdrawn?.disputeWithdrawnMinor).toBe(3_000)
     expect(withdrawn?.disputeReinstatedMinor).toBe(0)
     expect(withdrawn?.netMinor).toBe(-3_000)
@@ -497,7 +501,7 @@ describe('a window whose ONLY change is not a charge (M12 CP7 defect 2)', () => 
     ]
     const plan = planRevenueRollupSwap({
       siteId: SITE,
-      recomputed: aggregateRevenueBuckets(won, '1h'),
+      recomputed: aggregateRevenueBuckets(won, '15m'),
       stored: [
         stored({
           chargeGrossMinor: 0,
@@ -508,7 +512,7 @@ describe('a window whose ONLY change is not a charge (M12 CP7 defect 2)', () => 
           netMinor: -3_000,
         }),
       ],
-      affectedBucketSeconds: [HOUR_SECONDS],
+      affectedBucketSeconds: [QUARTER_SECONDS],
       generation: 4,
       computedAtMs: Date.parse('2026-07-20T11:00:00.000Z'),
     })

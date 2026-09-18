@@ -215,7 +215,29 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     //
     // ADR-0068 removed `events_preview` (migration 0022) — the first time the
     // ClickHouse set has ever shrunk.
-    expect(DELETION_CLICKHOUSE_TARGETS).toHaveLength(34)
+    // ADR-0079 D1 books the eight `*_15m` rollups (ClickHouse migration 0025),
+    // taking ClickHouse 34 -> 42 and the total 62 -> 70. One 15m twin per
+    // additive 1h family, nothing on the Postgres side: the read path does not
+    // change in that step, so no row, key or object moved with it.
+    // ADR-0079's second step books the other two 15m grains -- the session
+    // finalizer's `session_rollups_15m` and the attribution job's `revenue_15m`
+    // (ClickHouse migration 0026) -- taking ClickHouse 42 -> 44 and the total
+    // 70 -> 72. Written by the worker rather than by a materialized view, which
+    // changes how they are granted and filled and changes nothing about how
+    // they are purged.
+    expect(DELETION_CLICKHOUSE_TARGETS).toHaveLength(44)
+    for (const family of [
+      'metrics',
+      'pages',
+      'sources',
+      'geography',
+      'devices',
+      'custom_events',
+      'performance',
+      'custom_event_samples',
+    ]) {
+      expect(DELETION_CLICKHOUSE_TARGETS).toContain(`${family}_15m`)
+    }
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_events')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_attributions')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_1h')
@@ -249,7 +271,7 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     // the `sites` cascade.
     expect(DELETION_POSTGRES_TARGETS).toContain('widgets')
     expect(DELETION_POSTGRES_TARGETS).toHaveLength(22)
-    expect(SITE_DELETION_TARGETS).toHaveLength(62)
+    expect(SITE_DELETION_TARGETS).toHaveLength(72)
   })
 })
 

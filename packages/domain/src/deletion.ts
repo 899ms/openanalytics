@@ -147,6 +147,37 @@ export const DELETION_CLICKHOUSE_TARGETS = [
   // property bag readable, per event name, from a table nothing else points at.
   'custom_event_samples_1h',
   'custom_event_samples_1d',
+  // The fifteen-minute rollup family (ADR-0079, D1; ClickHouse migration 0025).
+  //
+  // Eight tables, one per additive family, each the 15m twin of a 1h target
+  // above with the same columns and the same site_id key, so the existing
+  // delete-by-site statement covers them unchanged. They are targets in their
+  // own right for the reason every rollup is: an aggregate outlives the raw
+  // rows it came from, and nothing recomputes a bucket whose events are gone.
+  // Listed as literals rather than derived from the 1h names, per this list's
+  // standing rule -- a derived name would silently stop being purged.
+  'metrics_15m',
+  'pages_15m',
+  'sources_15m',
+  'geography_15m',
+  'devices_15m',
+  'custom_events_15m',
+  'performance_15m',
+  'custom_event_samples_15m',
+  // The fifteen-minute grain of the two SWAP rollups (ADR-0079, step 2;
+  // ClickHouse migration 0026).
+  //
+  // The eight above are materialized views. These two the worker writes: the
+  // session finalizer and the revenue attribution job. That difference decides
+  // how they are filled and who is granted what, and decides nothing at all
+  // here -- both are site-keyed derived rows that outlive the facts they came
+  // from, so both are purge targets on exactly the argument their hour twins
+  // are. A deleted site whose `session_rollups_15m` survived would leave its
+  // session counts, and one whose `revenue_15m` survived would leave its
+  // revenue totals, readable at a finer grain than the hour tables that WERE
+  // purged. Listed as literals, per this list's standing rule.
+  'session_rollups_15m',
+  'revenue_15m',
 ] as const
 export type DeletionClickhouseTarget = (typeof DELETION_CLICKHOUSE_TARGETS)[number]
 
@@ -407,7 +438,22 @@ export interface DeletionTargetName {
  *   purges the `oauth_grant` half by `user_id`, and the two never overlap
  *   because exactly one of those columns is set per row. ClickHouse stayed 35 —
  *   a credential event is a Postgres row and nothing else — Redis stayed 5, and
- *   the object store stayed 1.
+ *   the object store stayed 1;
+ * - ADR-0068 dropped `events_preview` (ClickHouse migration 0022) — 35 became
+ *   34, the first time the ClickHouse set has ever shrunk;
+ * - ADR-0079 added the eight `*_15m` rollups (ClickHouse migration 0025) — 34
+ *   became **42**. One 15m twin per additive 1h family and nothing else: the
+ *   session and revenue rollups are finalizer swap targets rather than views
+ *   and get their fifteen-minute grain in a later step, and the read path does
+ *   not change here, so no Postgres row, Redis key or object moved with it;
+ * - ADR-0079's second step added that later grain — `session_rollups_15m` and
+ *   `revenue_15m` (ClickHouse migration 0026) — so 42 became **44**, and the
+ *   site total 70 became **72** (71 became **73** on hosted). Two tables, no
+ *   view: the worker writes them, which is why they needed an `oa_ingest`
+ *   grant and a container recreate that the eight views did not, and why their
+ *   history is backfilled rather than materialized. As purge targets they are
+ *   indistinguishable from their hour twins, which is the only thing this list
+ *   cares about.
  *
  * `currency_rates` (migration 0034) is deliberately **not** here and never will
  * be. It is global reference data — one row per `(rate_date, currency)`, with no

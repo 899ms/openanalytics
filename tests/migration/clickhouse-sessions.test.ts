@@ -274,11 +274,24 @@ describeIfClickHouse('session facts and rollups behaviour', () => {
     expect(Number(row?.pageviews)).toBe(2)
   })
 
-  it('swaps a session rollup bucket by generation, idempotently', async () => {
+  // Every grain, on the same terms. ADR-0079 step 2 added `session_rollups_15m`
+  // (migration 0026), and it is a swap target exactly like its two older twins
+  // -- same engine, same generation column, same content token -- so the
+  // semantics are asserted against all three rather than against the hour
+  // alone. A 15m table that merged differently would break the one property the
+  // fifteen-minute grain exists to provide.
+  //
+  // The hour is still here although step 4 stopped the finalizer writing it
+  // (migration 0027). Its rows are frozen, not deleted: the 15m backfill's
+  // equality gate reads them and so does the deletion workflow, so they have to
+  // keep READING correctly, which is exactly what this case asserts.
+  it.each([
+    ['session_rollups_15m', '2026-07-23 10:15:00'],
+    ['session_rollups_1h', '2026-07-23 10:00:00'],
+    ['session_rollups_1d', '2026-07-23 00:00:00'],
+  ])('swaps a %s bucket by generation, idempotently', async (table, bucket) => {
     const site = randomUUID()
-    const bucket = '2026-07-23 10:00:00'
     const insertRollup = async (
-      table: string,
       generation: number,
       values: { sessions: number; engaged: number; bounced: number },
     ) => {
@@ -303,14 +316,14 @@ describeIfClickHouse('session facts and rollups behaviour', () => {
     }
 
     // Generation 1: the provisional recompute counted 3 sessions, 1 engaged.
-    await insertRollup('session_rollups_1h', 1, { sessions: 3, engaged: 1, bounced: 2 })
+    await insertRollup(1, { sessions: 3, engaged: 1, bounced: 2 })
 
     const current = () =>
       queryRows<{ sessions: string; engaged: string; bounced: string }>(
         `SELECT argMax(srh.sessions, srh.generation)         AS sessions,
                 argMax(srh.engaged_sessions, srh.generation) AS engaged,
                 argMax(srh.bounced_sessions, srh.generation) AS bounced
-           FROM session_rollups_1h AS srh
+           FROM ${table} AS srh
           WHERE site_id = '${site}' GROUP BY site_id, bucket_start`,
       )
 
@@ -320,18 +333,18 @@ describeIfClickHouse('session facts and rollups behaviour', () => {
     // Generation 2: a later finalizer run re-sessionized the bucket — a late
     // pageview flipped a bounce, so now 3 sessions, 2 engaged. The swap is a
     // higher-generation insert; the read follows it.
-    await insertRollup('session_rollups_1h', 2, { sessions: 3, engaged: 2, bounced: 1 })
+    await insertRollup(2, { sessions: 3, engaged: 2, bounced: 1 })
     ;[row] = await current()
     expect([Number(row?.sessions), Number(row?.engaged), Number(row?.bounced)]).toEqual([3, 2, 1])
 
     // Re-running generation 2 with identical aggregates is a no-op: the read is
     // unchanged and no duplicate current row appears (acceptance criterion 2).
-    await insertRollup('session_rollups_1h', 2, { sessions: 3, engaged: 2, bounced: 1 })
+    await insertRollup(2, { sessions: 3, engaged: 2, bounced: 1 })
     ;[row] = await current()
     expect([Number(row?.sessions), Number(row?.engaged), Number(row?.bounced)]).toEqual([3, 2, 1])
     expect(
       await scalar(
-        `SELECT count() FROM (SELECT 1 FROM session_rollups_1h WHERE site_id = '${site}' GROUP BY site_id, bucket_start)`,
+        `SELECT count() FROM (SELECT 1 FROM ${table} WHERE site_id = '${site}' GROUP BY site_id, bucket_start)`,
       ),
     ).toBe(1)
 
@@ -340,7 +353,7 @@ describeIfClickHouse('session facts and rollups behaviour', () => {
       `SELECT sum(total)/sum(sess) AS avg_ms FROM (
          SELECT argMax(srh.total_session_duration_ms, srh.generation) AS total,
                 argMax(srh.sessions, srh.generation)                  AS sess
-           FROM session_rollups_1h AS srh
+           FROM ${table} AS srh
           WHERE site_id = '${site}' GROUP BY site_id, bucket_start)`,
     )
     expect(Number(avg?.avg_ms)).toBe(30_000)

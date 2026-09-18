@@ -417,7 +417,15 @@ export const WORKER_METRICS = {
   sessionFactVersions: 'worker_session_fact_versions',
   /** Retraction tombstones written, a counter. */
   sessionFactRetractions: 'worker_session_fact_retractions',
-  /** Rollup buckets swapped to a higher generation, a counter. */
+  /**
+   * Rollup buckets swapped to a higher generation, a counter, **labelled by
+   * `unit`** exactly as `revenueRollupSwaps` is (ADR-0079 step 2).
+   *
+   * The label is what makes the fifteen-minute grain observable at all: an
+   * unlabelled total stays healthy on hour and day traffic alone, so a
+   * `session_rollups_15m` that never receives a row would look identical to one
+   * that does.
+   */
   sessionRollupSwaps: 'worker_session_rollup_swaps',
   /** Time spent in one site's recompute, a `_ms` counter beside `_runs`. */
   sessionFinalizeMs: 'worker_session_finalize_ms',

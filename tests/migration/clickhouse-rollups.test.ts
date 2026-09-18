@@ -1,12 +1,27 @@
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createClient } from '@clickhouse/client'
-import { migrateClickHouse } from '@openanalytics/clickhouse'
+import {
+  BACKFILL_LEDGER_TABLE,
+  BackfillRefusedError,
+  FIFTEEN_MINUTE_ROLLUPS,
+  backfillFifteenMinuteRollups,
+  migrateClickHouse,
+  readBackfillLedger,
+  type FifteenMinuteRollupSpec,
+} from '@openanalytics/clickhouse'
 import { createCapturedLogger } from '@openanalytics/testkit'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 /**
  * The Milestone 7 additive rollup family, proven with data (plan items 1-2).
+ *
+ * **Reads both grains, and recreates the hour views to do it.** Migration 0027
+ * (ADR-0079 step 4) dropped the eight `*_1h_mv`, so a freshly migrated database
+ * has empty hour tables and nothing that fills them. `beforeAll` rebuilds those
+ * views from the same specs the backfill uses, which is what makes this suite a
+ * model of an UPGRADED install rather than a fresh one — the only kind of
+ * install where hour rows exist, and the reason the hour tables are kept.
  *
  * The bootstrap test (`clickhouse-analytics.test.ts`) proves the schema builds
  * and every dedup-bearing table carries the window. This one proves the three
@@ -136,6 +151,33 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       database,
       clickhouse_settings: { async_insert: 0, wait_for_async_insert: 1 },
     })
+
+    // The eight hour materialized views, rebuilt after migration 0027 dropped
+    // them (ADR-0079 step 4).
+    //
+    // This suite is where the hour and the quarter are compared, and after step
+    // 4 a freshly migrated database has the hour TABLES and no writer for them,
+    // so every such comparison would be an empty table against a full one. The
+    // install this file is about is not that one: it is an install that carries
+    // the hour rows its views wrote before the upgrade, which is precisely what
+    // the tables are kept for — the 15m backfill proves itself against them and
+    // the deletion workflow still erases them.
+    //
+    // Composed from `FIFTEEN_MINUTE_ROLLUPS` rather than hand-written, at the
+    // hour grain its `{bucket}` placeholder exists for: the spec's SELECT is
+    // the 0025 view's SELECT verbatim, and every 0025 view is its hour twin's
+    // DDL with the bucket expression swapped. So the rows these produce are the
+    // rows the dropped views produced, by construction rather than by copy.
+    const HOUR_BUCKET = "toStartOfHour(toDateTime(occurred_at, 'UTC'))"
+    for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
+      const where = spec.where.length > 0 ? ` WHERE ${spec.where}` : ''
+      await client.command({
+        query:
+          `CREATE MATERIALIZED VIEW ${spec.hourTwin}_mv TO ${spec.hourTwin} AS ` +
+          `SELECT ${spec.select.replace('{bucket}', HOUR_BUCKET)} ` +
+          `FROM events_raw${where} GROUP BY ${spec.groupBy}`,
+      })
+    }
   }, 120_000)
 
   afterAll(async () => {
@@ -665,5 +707,640 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     // double-counted across the local-day boundaries.
     const springTotal = eventsOn('2026-03-07') + eventsOn('2026-03-08')
     expect(springTotal).toBe(47) // 24 + 23, the first two full local days seeded
+  })
+
+  // ---------------------------------------------------------------------------
+  // ADR-0079 — the fifteen-minute atom (migration 0025). Four proofs:
+  //
+  //   1. the family rule (invariant 1 above) applied to the 15m targets: a
+  //      deduplicated raw retry leaves them unchanged;
+  //   2. EQUALITY: a local day composed from the 15m rows equals the same day
+  //      composed from the 1h rows, family by family, row for row, across a
+  //      DST transition — the property step 4 relies on to retire the hour
+  //      views;
+  //   3. SUB-HOUR TRUTH: for +05:30 and +05:45 a local day composed from the
+  //      15m rows equals the day computed directly from events_raw, while the
+  //      hour composition (the read that exists today) does not — the reason
+  //      the finer atom exists. This is the assertion that fails if the bucket
+  //      expression is changed back to toStartOfHour, and it was watched
+  //      failing before it was trusted;
+  //   4. the backfill inserts exactly what the views insert, and refuses to
+  //      run twice.
+  // ---------------------------------------------------------------------------
+
+  it('buckets the 15m family to the quarter hour and does not double it on a deduplicated retry', async () => {
+    const site = newSite()
+    const rows: RawRow[] = [
+      {
+        site_id: site,
+        event_id: newEvent(),
+        batch_id: 'q',
+        type: 'page_view',
+        occurred_at: '2026-07-23 10:07:00.000',
+        anonymous_id: 'v1',
+        page_path: '/a',
+      },
+      {
+        site_id: site,
+        event_id: newEvent(),
+        batch_id: 'q',
+        type: 'page_view',
+        occurred_at: '2026-07-23 10:14:59.999',
+        anonymous_id: 'v2',
+        page_path: '/a',
+      },
+      {
+        site_id: site,
+        event_id: newEvent(),
+        batch_id: 'q',
+        type: 'page_view',
+        occurred_at: '2026-07-23 10:22:00.000',
+        anonymous_id: 'v1',
+        page_path: '/b',
+      },
+    ]
+    await insertRaw('token-q', rows)
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await insertRaw('token-q', rows)
+    }
+
+    const buckets = await queryRows<{ bucket: string; events: string; visitors: string }>(
+      `SELECT toString(bucket_start) AS bucket, sum(events) AS events, uniqMerge(visitors) AS visitors
+         FROM metrics_15m WHERE site_id = '${site}' AND event_type = 'page_view'
+        GROUP BY bucket_start ORDER BY bucket_start`,
+    )
+    expect(buckets.map((row) => [row.bucket, Number(row.events), Number(row.visitors)])).toEqual([
+      ['2026-07-23 10:00:00', 2, 2],
+      ['2026-07-23 10:15:00', 1, 1],
+    ])
+    expect(
+      await scalar(
+        `SELECT sum(views) FROM pages_15m WHERE site_id = '${site}' AND page_path = '/a'`,
+      ),
+    ).toBe(2)
+    // The hour twin saw the same three rows once — the two grains agree.
+    expect(
+      await scalar(
+        `SELECT sum(events) FROM metrics_1h WHERE site_id = '${site}' AND event_type = 'page_view'`,
+      ),
+    ).toBe(3)
+  })
+
+  /** Every family's composed-day read, at one grain, for one site and zone. */
+  const composedDay = async (grain: '15m' | '1h', site: string, tz: string) => {
+    const day = `toString(toStartOfDay(bucket_start, '${tz}'))`
+    const rows = async (query: string) =>
+      (await queryRows<Record<string, string>>(query)).map((row) => Object.values(row))
+    return {
+      metrics: await rows(
+        `SELECT ${day} AS d, sumIf(events, event_type = 'page_view') AS pv,
+                sum(events) AS ev, sum(billable_events) AS bev,
+                uniqMergeIf(visitors, event_type = 'page_view') AS vis
+           FROM metrics_${grain} WHERE site_id = '${site}' GROUP BY d ORDER BY d`,
+      ),
+      pages: await rows(
+        `SELECT ${day} AS d, page_path, sum(views) AS v, uniqMerge(visitors) AS vis
+           FROM pages_${grain} WHERE site_id = '${site}' GROUP BY d, page_path ORDER BY d, page_path`,
+      ),
+      sources: await rows(
+        `SELECT ${day} AS d, referrer_domain, utm_source, sum(views) AS v, uniqMerge(visitors) AS vis
+           FROM sources_${grain} WHERE site_id = '${site}'
+          GROUP BY d, referrer_domain, utm_source ORDER BY d, referrer_domain, utm_source`,
+      ),
+      geography: await rows(
+        `SELECT ${day} AS d, country, city, sum(views) AS v, uniqMerge(visitors) AS vis
+           FROM geography_${grain} WHERE site_id = '${site}' GROUP BY d, country, city ORDER BY d, country, city`,
+      ),
+      devices: await rows(
+        `SELECT ${day} AS d, device_type, browser, sum(views) AS v, uniqMerge(visitors) AS vis
+           FROM devices_${grain} WHERE site_id = '${site}'
+          GROUP BY d, device_type, browser ORDER BY d, device_type, browser`,
+      ),
+      custom_events: await rows(
+        `SELECT ${day} AS d, event_name, event_type, sum(events) AS ev, sum(billable_events) AS bev,
+                uniqMerge(visitors) AS vis
+           FROM custom_events_${grain} WHERE site_id = '${site}'
+          GROUP BY d, event_name, event_type ORDER BY d, event_name, event_type`,
+      ),
+      performance: await rows(
+        `SELECT ${day} AS d, metric, device_type, sum(samples) AS s, round(sum(value_sum), 6) AS vs,
+                sum(good_samples) AS g, sum(needs_improvement_samples) AS ni, sum(poor_samples) AS p
+           FROM performance_${grain} WHERE site_id = '${site}'
+          GROUP BY d, metric, device_type ORDER BY d, metric, device_type`,
+      ),
+      custom_event_samples: await rows(
+        `SELECT ${day} AS d, t.event_name AS event_name, sum(t.events) AS ev,
+                toString(max(t.last_seen_at)) AS seen, argMaxMerge(t.sample_page_path) AS path
+           FROM custom_event_samples_${grain} AS t WHERE t.site_id = '${site}'
+          GROUP BY d, event_name ORDER BY d, event_name`,
+      ),
+    }
+  }
+
+  /** One page view, one custom event and one web vital every fifteen minutes over a UTC window. */
+  const seedQuarterHours = async (
+    site: string,
+    startUtc: string,
+    quarters: number,
+    token: string,
+  ): Promise<void> => {
+    const start = Date.parse(`${startUtc}Z`)
+    const rows: RawRow[] = []
+    for (let q = 0; q < quarters; q += 1) {
+      // Seven-minute offset so nothing sits on a bucket boundary; visitors
+      // rotate on a period that is not a multiple of four, so quarter-hour
+      // uniq states have to be merged, not summed, to agree with the hour.
+      const at = new Date(start + q * 900_000 + 7 * 60_000)
+        .toISOString()
+        .replace('T', ' ')
+        .replace('Z', '')
+      const visitor = `v${String(q % 7)}`
+      rows.push(
+        {
+          site_id: site,
+          event_id: newEvent(),
+          batch_id: token,
+          type: 'page_view',
+          occurred_at: at,
+          anonymous_id: visitor,
+          page_path: q % 3 === 0 ? '/' : '/blog',
+          referrer_domain: q % 2 === 0 ? 'google.com' : '',
+          utm_source: q % 5 === 0 ? 'newsletter' : '',
+          country: q % 2 === 0 ? 'DE' : 'IN',
+          city: q % 2 === 0 ? 'Berlin' : 'Pune',
+          device_type: q % 4 === 0 ? 'mobile' : 'desktop',
+          browser: 'Chrome',
+          os: 'Linux',
+        },
+        {
+          site_id: site,
+          event_id: newEvent(),
+          batch_id: token,
+          type: 'custom_event',
+          name: q % 2 === 0 ? 'signup' : 'download',
+          occurred_at: at,
+          anonymous_id: visitor,
+          page_path: `/step/${String(q % 5)}`,
+          properties: `{"q":${String(q)}}`,
+        },
+        {
+          site_id: site,
+          event_id: newEvent(),
+          batch_id: token,
+          type: 'web_vital',
+          billable: 0,
+          occurred_at: at,
+          anonymous_id: visitor,
+          device_type: q % 4 === 0 ? 'mobile' : 'desktop',
+          properties: JSON.stringify({
+            oa_metric: 'LCP',
+            oa_value: 100 + (q % 9) * 50,
+            oa_rating: q % 3 === 0 ? 'good' : q % 3 === 1 ? 'needs-improvement' : 'poor',
+          }),
+        },
+      )
+    }
+    await insertRaw(token, rows)
+  }
+
+  it('composes the same Europe/Berlin day from the 15m rows as from the 1h rows, across a DST transition', async () => {
+    const site = newSite()
+    // 2026-03-29 is Berlin's spring-forward day: local midnight 23:00Z on the
+    // 28th, next local midnight 22:00Z on the 29th — a 23-hour day. Seed three
+    // UTC days around it, one row set per quarter hour.
+    await seedQuarterHours(site, '2026-03-28 00:00:00.000', 24 * 4 * 3, 'berlin')
+
+    const fifteen = await composedDay('15m', site, 'Europe/Berlin')
+    const hour = await composedDay('1h', site, 'Europe/Berlin')
+    // Row for row, family by family: the union of four quarter-hour states is
+    // the hour's state, and every other measure is a plain sum.
+    expect(fifteen).toEqual(hour)
+
+    // And the DST day is really 23 hours long in both — 92 page views against
+    // 96 on an ordinary day. (Column 1 of the metrics rows is `pv`.)
+    const pageViewsOn = (day: string) =>
+      Number(fifteen.metrics.find((row) => row[0]?.startsWith(day))?.[1] ?? -1)
+    expect(pageViewsOn('2026-03-29')).toBe(23 * 4)
+    expect(pageViewsOn('2026-03-30')).toBe(24 * 4)
+  })
+
+  it('composes a correct +05:30 and +05:45 local day from the 15m rows, where the hour rows cannot', async () => {
+    // Local midnight is 18:30Z in Kolkata and 18:15Z in Kathmandu. Events a
+    // minute either side of it must land on different local days, and a
+    // one-hour bucket cannot tell them apart.
+    const cases: Array<{ tz: string; before: string; after: string }> = [
+      { tz: 'Asia/Kolkata', before: '18:29:00.000', after: '18:31:00.000' },
+      { tz: 'Asia/Kathmandu', before: '18:14:00.000', after: '18:16:00.000' },
+    ]
+    for (const { tz, before, after } of cases) {
+      const site = newSite()
+      const rows: RawRow[] = []
+      for (const day of ['2026-08-10', '2026-08-11', '2026-08-12']) {
+        for (const [i, clock] of [before, after].entries()) {
+          rows.push({
+            site_id: site,
+            event_id: newEvent(),
+            batch_id: tz,
+            type: 'page_view',
+            occurred_at: `${day} ${clock}`,
+            // Distinct visitors on each side of midnight, shared across days,
+            // so the visitor count per local day is 1 and the naive union is 2.
+            anonymous_id: `side${String(i)}`,
+            page_path: '/',
+          })
+        }
+        // Noon-local traffic, so every day also has an unambiguous row.
+        rows.push({
+          site_id: site,
+          event_id: newEvent(),
+          batch_id: tz,
+          type: 'page_view',
+          occurred_at: `${day} 06:30:00.000`,
+          anonymous_id: 'noon',
+          page_path: '/',
+        })
+      }
+      await insertRaw(`token-${tz}`, rows)
+
+      // The truth, straight from the rows: group by the local day of each event.
+      const truth = await queryRows<{ d: string; pv: string; vis: string }>(
+        `SELECT toString(toStartOfDay(toDateTime(occurred_at, 'UTC'), '${tz}')) AS d,
+                count() AS pv, uniqExact(anonymous_id) AS vis
+           FROM events_raw WHERE site_id = '${site}' AND type = 'page_view'
+          GROUP BY d ORDER BY d`,
+      )
+      // Sanity on the seed itself: four local days — the 18:31Z row of the
+      // 12th is the 13th locally — with 2, 3, 3 and 1 page views (a middle
+      // day holds the previous UTC day's post-midnight row, its noon row and
+      // its own pre-midnight row), each by a distinct visitor.
+      expect(truth.map((row) => [Number(row.pv), Number(row.vis)])).toEqual([
+        [2, 2],
+        [3, 3],
+        [3, 3],
+        [1, 1],
+      ])
+
+      const composed = async (grain: '15m' | '1h') =>
+        await queryRows<{ d: string; pv: string; vis: string }>(
+          `SELECT toString(toStartOfDay(bucket_start, '${tz}')) AS d,
+                  sumIf(events, event_type = 'page_view') AS pv,
+                  uniqMergeIf(visitors, event_type = 'page_view') AS vis
+             FROM metrics_${grain} WHERE site_id = '${site}' GROUP BY d ORDER BY d`,
+        )
+
+      // The fifteen-minute composition IS the truth.
+      expect(await composed('15m')).toEqual(truth)
+      // The hour composition is not: both sides of midnight fall in the 18:00Z
+      // bucket, so it puts them on the same local day. This is the read that
+      // exists today, and the reason ADR-0011 refused these zones.
+      expect(await composed('1h')).not.toEqual(truth)
+    }
+  })
+
+  it('backfills the 15m family from events_raw to exactly what the views produced, once', async () => {
+    // Everything every test above seeded is in events_raw, and the views put
+    // it in the 15m tables as it arrived. Fingerprint the merged content per
+    // table, empty the tables, run the production backfill, and compare.
+    const fingerprint = async () => {
+      const out: Record<string, unknown[]> = {}
+      for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
+        const key = spec.groupBy
+          .split(',')
+          .map((column) => `t.${column.trim()}`)
+          .join(', ')
+        const measures = [
+          ...spec.additiveColumns.map((column) => `sum(t.${column}) AS sum_${column}`),
+          ...spec.floatAdditiveColumns.map(
+            (column) => `round(sum(t.${column}), 6) AS sum_${column}`,
+          ),
+          ...(spec.hasVisitors ? ['uniqMerge(t.visitors) AS vis'] : []),
+          ...(spec.table === 'custom_event_samples_15m'
+            ? [
+                'toString(max(t.last_seen_at)) AS seen',
+                'argMaxMerge(t.sample_page_path) AS path',
+                'argMaxMerge(t.sample_properties) AS props',
+              ]
+            : []),
+        ].join(', ')
+        out[spec.table] = await queryRows<Record<string, string>>(
+          `SELECT ${key}, ${measures} FROM ${spec.table} AS t GROUP BY ${key} ORDER BY ${key}`,
+        )
+        expect(out[spec.table]?.length, `${spec.table} should hold seeded rows`).toBeGreaterThan(0)
+      }
+      return out
+    }
+
+    const fromViews = await fingerprint()
+
+    const { logger } = createCapturedLogger()
+    const options = {
+      url,
+      username: USERNAME,
+      password: PASSWORD,
+      database,
+      logger,
+      settleSeconds: 0,
+    }
+
+    // Guard 1: the targets are populated, so the backfill refuses before
+    // writing a byte.
+    await expect(backfillFifteenMinuteRollups(options)).rejects.toMatchObject({
+      name: 'BackfillRefusedError',
+      reason: 'target_not_empty',
+    })
+
+    for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
+      await client.command({ query: `TRUNCATE TABLE ${spec.table}` })
+    }
+
+    const result = await backfillFifteenMinuteRollups(options)
+    expect(result.inserts).toBe(FIFTEEN_MINUTE_ROLLUPS.length * result.partitions.length)
+    expect(result.partitions.length).toBeGreaterThan(1)
+    // Every family agrees with its hour twin per site, and says so.
+    for (const table of result.tables) {
+      expect(table.comparedFrom, table.table).not.toBeNull()
+      expect(table.mismatchedSites, table.table).toEqual([])
+    }
+
+    // The backfilled content is the view-produced content.
+    expect(await fingerprint()).toEqual(fromViews)
+
+    // And it cannot run again by accident.
+    await expect(backfillFifteenMinuteRollups(options)).rejects.toBeInstanceOf(BackfillRefusedError)
+  })
+
+  // ---------------------------------------------------------------------------
+  // `--if-needed` is a GAP FILL (v0.7.0 prework). The tests below run after the
+  // backfill test above, so every seeded event is in events_raw and the 15m
+  // tables are full. Each one builds a starting state an upgrade can meet, runs
+  // the automated mode, and compares every table with the TRUTH: the view's
+  // own SELECT run over the whole of events_raw right now.
+  // ---------------------------------------------------------------------------
+
+  /** Far enough ahead that no seeded event is in the live quarter hour. */
+  const LATER = Date.parse('2100-01-01T00:00:00.000Z')
+
+  const fingerprintOf = async (
+    from: (spec: FifteenMinuteRollupSpec) => string,
+  ): Promise<Record<string, unknown[]>> => {
+    const out: Record<string, unknown[]> = {}
+    for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
+      const key = spec.groupBy
+        .split(',')
+        .map((column) => `t.${column.trim()}`)
+        .join(', ')
+      const measures = [
+        ...spec.additiveColumns.map((column) => `sum(t.${column}) AS sum_${column}`),
+        ...spec.floatAdditiveColumns.map((column) => `round(sum(t.${column}), 6) AS sum_${column}`),
+        ...(spec.hasVisitors ? ['uniqMerge(t.visitors) AS vis'] : []),
+        ...(spec.table === 'custom_event_samples_15m'
+          ? [
+              'toString(max(t.last_seen_at)) AS seen',
+              'argMaxMerge(t.sample_page_path) AS path',
+              'argMaxMerge(t.sample_properties) AS props',
+            ]
+          : []),
+      ].join(', ')
+      out[spec.table] = await queryRows<Record<string, string>>(
+        `SELECT ${key}, ${measures} FROM ${from(spec)} AS t GROUP BY ${key} ORDER BY ${key}`,
+      )
+    }
+    return out
+  }
+  const stored = () => fingerprintOf((spec) => spec.table)
+  const truth = () =>
+    fingerprintOf((spec) => {
+      const where = spec.where.length > 0 ? ` WHERE ${spec.where}` : ''
+      return `(SELECT ${spec.select.replace('{bucket}', "toStartOfFifteenMinutes(toDateTime(occurred_at, 'UTC'))")} FROM events_raw${where} GROUP BY ${spec.groupBy})`
+    })
+
+  const truncateAll = async () => {
+    for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
+      await client.command({ query: `TRUNCATE TABLE ${spec.table}` })
+    }
+  }
+
+  const rowCounts = async () => {
+    const counts: Record<string, number> = {}
+    for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
+      counts[spec.table] = await scalar(`SELECT count() FROM ${spec.table}`)
+    }
+    return counts
+  }
+
+  const ifNeeded = (logger = createCapturedLogger().logger) => ({
+    url,
+    username: USERNAME,
+    password: PASSWORD,
+    database,
+    logger,
+    settleSeconds: 0,
+    ifNeeded: true,
+    nowMs: LATER,
+  })
+
+  it('(a, d) --if-needed over empty targets fills all of history, records it, and a second run writes nothing', async () => {
+    await truncateAll()
+    await client.command({ query: `TRUNCATE TABLE ${BACKFILL_LEDGER_TABLE}` })
+
+    const filled = await backfillFifteenMinuteRollups(ifNeeded())
+    expect(filled.noop).toBe(false)
+    expect(filled.gapRows).toBeGreaterThan(0)
+    for (const table of filled.tables) {
+      expect(table.mismatchedSites, table.table).toEqual([])
+      expect(table.comparedFrom, table.table).not.toBeNull()
+    }
+    // Pair by pair against events_raw: no gap left, no seam (nothing was
+    // writing), and not one event counted twice.
+    expect(filled.witness).toEqual({
+      gapPairs: 0,
+      gapEvents: 0,
+      seamPairs: 0,
+      seamEvents: 0,
+      overPairs: 0,
+      overEvents: 0,
+    })
+    expect(await stored()).toEqual(await truth())
+
+    // Evidence, one row, written by the run that filled.
+    expect(filled.ledgerRecorded).toBe(true)
+    const ledger = await readBackfillLedger(client)
+    expect(ledger.map((entry) => entry.name)).toEqual(['rollups_15m'])
+    expect(ledger[0]!.detail).toMatchObject({
+      command: 'backfill-15m',
+      mode: 'if-needed',
+      noop: false,
+    })
+
+    // (d) Again: every statement runs and finds no gap. Not one row moves —
+    // which is the whole claim, because a second additive pass is exactly how a
+    // count doubles.
+    const before = await rowCounts()
+    const again = await backfillFifteenMinuteRollups(ifNeeded())
+    expect(again.noop).toBe(true)
+    expect(again.gapRows).toBe(0)
+    expect(again.tables).toEqual([])
+    expect(again.ledgerRecorded).toBe(false)
+    expect(await rowCounts()).toEqual(before)
+    expect(await stored()).toEqual(await truth())
+  })
+
+  it('(b) fills a family the install has no rows for yet, and leaves the full ones alone', async () => {
+    // The state that stopped the whole stack before the rework: custom events
+    // are rare, so `custom_events_15m` and its samples table are EMPTY on most
+    // installs while the other six fill up. The old `--if-needed` called that
+    // "partially populated", exited 2, and `depends_on:
+    // service_completed_successfully` then kept every service down.
+    await client.command({ query: 'TRUNCATE TABLE custom_events_15m' })
+    await client.command({ query: 'TRUNCATE TABLE custom_event_samples_15m' })
+
+    const result = await backfillFifteenMinuteRollups(ifNeeded())
+    const rows = Object.fromEntries(result.tables.map((table) => [table.table, table.gapRows]))
+    expect(rows['custom_events_15m']).toBeGreaterThan(0)
+    expect(rows['custom_event_samples_15m']).toBeGreaterThan(0)
+    for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
+      if (!spec.table.startsWith('custom_event')) expect(rows[spec.table], spec.table).toBe(0)
+    }
+    expect(await stored()).toEqual(await truth())
+  })
+
+  it('(c) fills history when the views kept writing through the upgrade, instead of skipping it', async () => {
+    // Coolify/Dokploy redeploy, or `pull && up -d` by hand: the worker never
+    // stopped, so 0025's views started filling every table with the NEW
+    // traffic while all history stayed missing. The old `--if-needed` saw
+    // eight non-empty tables, said `alreadyPopulated`, and exited 0 — every
+    // pre-upgrade event silently absent from every 15m read.
+    await truncateAll()
+
+    const site = newSite()
+    const at = '2026-09-18 12:03:00.000'
+    await insertRaw('upgrade-traffic', [
+      {
+        site_id: site,
+        event_id: newEvent(),
+        batch_id: 'u',
+        type: 'page_view',
+        occurred_at: at,
+        anonymous_id: 'n1',
+        page_path: '/new',
+      },
+      {
+        site_id: site,
+        event_id: newEvent(),
+        batch_id: 'u',
+        type: 'custom',
+        name: 'signup',
+        occurred_at: at,
+        anonymous_id: 'n1',
+      },
+      {
+        site_id: site,
+        event_id: newEvent(),
+        batch_id: 'u',
+        type: 'web_vital',
+        occurred_at: at,
+        anonymous_id: 'n1',
+        properties: JSON.stringify({ oa_metric: 'LCP', oa_value: 1200, oa_rating: 'good' }),
+      },
+    ])
+    // The precondition the old code misread: nothing is empty.
+    for (const [table, count] of Object.entries(await rowCounts())) {
+      expect(count, table).toBeGreaterThan(0)
+    }
+
+    const result = await backfillFifteenMinuteRollups(ifNeeded())
+    expect(result.noop).toBe(false)
+    for (const table of result.tables) {
+      expect(table.gapRows, table.table).toBeGreaterThan(0)
+      expect(table.mismatchedSites, table.table).toEqual([])
+    }
+    expect(result.witness?.gapEvents).toBe(0)
+    expect(result.witness?.overEvents).toBe(0)
+    expect(await stored()).toEqual(await truth())
+  })
+
+  it('(e) a late event seams only its own quarter hour, fills the rest, and says so', async () => {
+    // A table-level "fill below the oldest row" would let one late event — its
+    // occurred_at before the views existed, delivered after — drag that
+    // boundary back and silently leave everything between it and the upgrade
+    // unfilled. Here the unit is the (site, quarter hour), so a late event
+    // costs exactly its own pair.
+    const site = newSite()
+    const history = (occurredAt: string, anonymousId: string): RawRow => ({
+      site_id: site,
+      event_id: newEvent(),
+      batch_id: 'h',
+      type: 'page_view',
+      occurred_at: occurredAt,
+      anonymous_id: anonymousId,
+      page_path: '/h',
+    })
+    // Before the upgrade: two events at 10:00, one at 11:00, one the next day.
+    await insertRaw('late-history', [
+      history('2026-06-01 10:01:00.000', 'h1'),
+      history('2026-06-01 10:02:00.000', 'h2'),
+      history('2026-06-01 11:01:00.000', 'h3'),
+      history('2026-06-02 09:01:00.000', 'h4'),
+    ])
+    // ...which the 15m views never saw.
+    await truncateAll()
+    // After it: one late event in the 10:00 quarter.
+    await insertRaw('late-event', [history('2026-06-01 10:05:00.000', 'late')])
+
+    const captured = createCapturedLogger()
+    const result = await backfillFifteenMinuteRollups(ifNeeded(captured.logger))
+
+    // No refusal, no mismatch: the site's hours at and above its first row
+    // are outside the gate window.
+    for (const table of result.tables) expect(table.mismatchedSites, table.table).toEqual([])
+
+    const events = (bucket: string) =>
+      scalar(
+        `SELECT sum(events) FROM metrics_15m WHERE site_id = '${site}' AND bucket_start = toDateTime('${bucket}', 'UTC')`,
+      )
+    // The seamed pair holds what the view saw: the late event alone.
+    expect(await events('2026-06-01 10:00:00')).toBe(1)
+    // Everything after it is filled — the part a moved boundary would lose.
+    expect(await events('2026-06-01 11:00:00')).toBe(1)
+    expect(await events('2026-06-02 09:00:00')).toBe(1)
+
+    // And the loss is measured, not silent.
+    expect(result.witness).toMatchObject({
+      gapEvents: 0,
+      seamPairs: 1,
+      seamEvents: 2,
+      overEvents: 0,
+    })
+    expect(captured.find('backfill_15m_witness')).toHaveLength(1)
+  })
+
+  it('reaches the live quarter hour only when events_raw is still', async () => {
+    // A gap inside the quarter hour the run starts in: with nothing writing
+    // (settle 0, no concurrent insert) the readings agree and it is filled.
+    await truncateAll()
+    const site = newSite()
+    const nowMs = Date.parse('2026-06-03T08:07:00.000Z')
+    await insertRaw('live-quarter', [
+      {
+        site_id: site,
+        event_id: newEvent(),
+        batch_id: 'l',
+        type: 'page_view',
+        occurred_at: '2026-06-03 08:01:00.000',
+        anonymous_id: 'l1',
+        page_path: '/l',
+      },
+    ])
+    await truncateAll()
+
+    const result = await backfillFifteenMinuteRollups({ ...ifNeeded(), nowMs })
+    expect(result.rawReadings).toHaveLength(2)
+    expect(result.liveIncluded).toBe(true)
+    expect(
+      await scalar(
+        `SELECT sum(events) FROM metrics_15m WHERE site_id = '${site}' AND bucket_start = toDateTime('2026-06-03 08:00:00', 'UTC')`,
+      ),
+    ).toBe(1)
+    expect(await stored()).toEqual(await truth())
   })
 })

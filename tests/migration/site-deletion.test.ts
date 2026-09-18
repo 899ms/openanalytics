@@ -254,9 +254,9 @@ describeIfPostgres('site deletion', () => {
       // Still no `stripe` row: a site deletion cancels no subscription, because
       // the site is one of several a payer may fund.
       // 62, not 63: `billing_transfer_offers` is a target the hosted surface registers (`CLOUD_DELETION_EXTENSION`), so this is the set a build without it erases.
-      expect(targets).toHaveLength(62)
+      expect(targets).toHaveLength(72)
       const byStore = (store: string) => targets.filter((t) => t.store === store).length
-      expect(byStore('clickhouse')).toBe(34)
+      expect(byStore('clickhouse')).toBe(44)
       expect(byStore('redis')).toBe(5)
       expect(byStore('postgres')).toBe(22)
       expect(byStore('stripe')).toBe(0)

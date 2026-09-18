@@ -42,7 +42,7 @@ import type {
  * the next window, where it recomputes byte-identical and writes nothing.
  */
 
-const MS_PER_HOUR = 3_600_000
+const MS_PER_QUARTER_HOUR = 900_000
 const MS_PER_DAY = 86_400_000
 
 /** A ClickHouse `DateTime64(3, 'UTC')` literal from epoch ms: `YYYY-MM-DD HH:MM:SS.mmm`. */
@@ -55,9 +55,17 @@ export function chDateTime(ms: number): string {
   return new Date(ms).toISOString().replace('T', ' ').replace('Z', '').slice(0, 19)
 }
 
-/** UTC start-of-hour, in epoch ms. Matches ClickHouse `toStartOfHour` on a UTC column. */
-export function hourBucketMs(ms: number): number {
-  return Math.floor(ms / MS_PER_HOUR) * MS_PER_HOUR
+/**
+ * UTC start-of-quarter-hour, in epoch ms. Matches ClickHouse
+ * `toStartOfFifteenMinutes` on a UTC column (ADR-0079, D1).
+ *
+ * The epoch is on a quarter-hour boundary and every quarter is the same width,
+ * so flooring the millisecond count is exactly what ClickHouse does — the same
+ * argument `dayBucketMs` relies on, and the reason neither needs a timezone
+ * database.
+ */
+export function quarterBucketMs(ms: number): number {
+  return Math.floor(ms / MS_PER_QUARTER_HOUR) * MS_PER_QUARTER_HOUR
 }
 
 /** UTC start-of-day, in epoch ms. Matches ClickHouse `toStartOfDay` on a UTC column. */
@@ -369,8 +377,8 @@ export interface SessionFactsPlan {
   readonly version: number
   readonly changed: number
   readonly retracted: number
-  /** UTC hour-bucket starts (epoch ms) touched by a written row. Sorted, unique. */
-  readonly affectedHourBucketsMs: readonly number[]
+  /** UTC quarter-hour-bucket starts (epoch ms) touched by a written row. Sorted, unique. */
+  readonly affectedQuarterBucketsMs: readonly number[]
   /** UTC day-bucket starts (epoch ms) touched by a written row. Sorted, unique. */
   readonly affectedDayBucketsMs: readonly number[]
   /**
@@ -429,7 +437,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
 
   const recomputedIds = new Set<string>()
   const factRows: SessionFactRow[] = []
-  const hourBuckets = new Set<number>()
+  const quarterBuckets = new Set<number>()
   const dayBuckets = new Set<number>()
   let changed = 0
   let retracted = 0
@@ -454,7 +462,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
     if (!isNew) continue
 
     factRows.push(sessionToFactRow(input.siteId, session, { version, finalized, computedAtMs }))
-    hourBuckets.add(hourBucketMs(session.startMs))
+    quarterBuckets.add(quarterBucketMs(session.startMs))
     dayBuckets.add(dayBucketMs(session.startMs))
     changed += 1
   }
@@ -463,7 +471,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
     if (stored.retracted === 1) continue
     if (recomputedIds.has(stored.sessionId)) continue
     factRows.push(storedToTombstoneRow(input.siteId, stored, { version, computedAtMs }))
-    hourBuckets.add(hourBucketMs(stored.startMs))
+    quarterBuckets.add(quarterBucketMs(stored.startMs))
     dayBuckets.add(dayBucketMs(stored.startMs))
     retracted += 1
   }
@@ -504,7 +512,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
     version,
     changed,
     retracted,
-    affectedHourBucketsMs: [...hourBuckets].sort((a, b) => a - b),
+    affectedQuarterBucketsMs: [...quarterBuckets].sort((a, b) => a - b),
     affectedDayBucketsMs: [...dayBuckets].sort((a, b) => a - b),
     finalizedThroughMs,
   }

@@ -31,6 +31,12 @@ import type { SessionizerEvent } from '@openanalytics/domain'
  */
 
 export const SESSION_FACTS_TABLE = 'session_facts_versions'
+export const SESSION_ROLLUP_15M_TABLE = 'session_rollups_15m'
+/**
+ * Frozen since ADR-0079 step 4: nothing writes this table (`'1h'` is not a
+ * `SessionRollupUnit` any more). It is still read — by the 15m backfill's
+ * equality gate and by the deletion workflow — so the name stays.
+ */
 export const SESSION_ROLLUP_1H_TABLE = 'session_rollups_1h'
 export const SESSION_ROLLUP_1D_TABLE = 'session_rollups_1d'
 
@@ -139,7 +145,16 @@ export interface StoredRollupBucket extends RollupBucketAggregate {
   readonly generation: number
 }
 
-export type SessionRollupUnit = '1h' | '1d'
+/**
+ * The grains the finalizer writes.
+ *
+ * `'1h'` left this union in ADR-0079 step 4: the hour views were dropped
+ * (migration 0027) and the finalizer stopped writing `session_rollups_1h`, so
+ * the hour grain is frozen history rather than a unit anything produces. The
+ * table constant below survives the union on purpose — the 15m backfill's
+ * equality gate still reads it, and so does the deletion workflow.
+ */
+export type SessionRollupUnit = '15m' | '1d'
 
 export interface SessionFactsStoreOptions {
   readonly url: string
@@ -149,7 +164,7 @@ export interface SessionFactsStoreOptions {
   readonly requestTimeoutMs?: number
   /** Overridable for tests that migrate into a throwaway database. */
   readonly factsTable?: string
-  readonly rollup1hTable?: string
+  readonly rollup15mTable?: string
   readonly rollup1dTable?: string
 }
 
@@ -294,15 +309,37 @@ function tokenFor(namespace: string, rows: readonly object[]): string {
   return hash.digest('hex').slice(0, 32)
 }
 
-const bucketFn = (unit: SessionRollupUnit): string =>
-  unit === '1h' ? 'toStartOfHour' : 'toStartOfDay'
+/**
+ * The ClickHouse bucket function per unit.
+ *
+ * A total `Record` rather than a ternary chain, and that is not style. The
+ * `unit === '1h' ? toStartOfHour : toStartOfDay` this replaced had no case for
+ * a third unit: adding `'15m'` to `SessionRollupUnit` would have made every
+ * fifteen-minute aggregate silently bucket by DAY and write day totals into
+ * `session_rollups_15m`, with no type error and no failing query. A `Record`
+ * keyed by the union makes the omission a compile error instead
+ * (`tests/unit/session-rollup-units.test.ts` pins the mapping).
+ *
+ * The union is two units again since step 4 retired the hour grain, and the
+ * `Record` earns its keep in the other direction now: a stale `'1h'` entry left
+ * behind by that removal would also be a compile error.
+ */
+export const SESSION_ROLLUP_BUCKET_FN: Readonly<Record<SessionRollupUnit, string>> = {
+  '15m': 'toStartOfFifteenMinutes',
+  '1d': 'toStartOfDay',
+}
+
+const bucketFn = (unit: SessionRollupUnit): string => SESSION_ROLLUP_BUCKET_FN[unit]
 
 export function createSessionFactsStore(options: SessionFactsStoreOptions): SessionFactsStore {
   const factsTable = options.factsTable ?? SESSION_FACTS_TABLE
-  const rollupTable = (unit: SessionRollupUnit): string =>
-    unit === '1h'
-      ? (options.rollup1hTable ?? SESSION_ROLLUP_1H_TABLE)
-      : (options.rollup1dTable ?? SESSION_ROLLUP_1D_TABLE)
+  // Total over the unit union for the same reason `BUCKET_FN` is: a missing
+  // case here would have routed 15m rows into the day table.
+  const rollupTables: Readonly<Record<SessionRollupUnit, string>> = {
+    '15m': options.rollup15mTable ?? SESSION_ROLLUP_15M_TABLE,
+    '1d': options.rollup1dTable ?? SESSION_ROLLUP_1D_TABLE,
+  }
+  const rollupTable = (unit: SessionRollupUnit): string => rollupTables[unit]
 
   const client: ClickHouseClient = createClient({
     url: options.url,

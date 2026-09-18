@@ -872,6 +872,13 @@ describeIfPostgres('revenue projection state', () => {
           async readCurrentRows() {
             return []
           },
+          async listOldestOccurrencePerSite() {
+            // The projection loop never calls this — it belongs to the 15m
+            // re-roll seeding (ADR-0079 step 2) — but the double implements the
+            // whole port rather than a cast-away subset, so a real method
+            // arriving here is a compile error rather than a runtime undefined.
+            return []
+          },
           async ping() {
             return true
           },
@@ -1046,14 +1053,14 @@ describeIfPostgres('revenue projection state', () => {
   })
 
   describe('deletion (D8, CP3 amendment)', () => {
-    it('snapshots 62 targets including revenue_events and revenue_match_hints', async () => {
+    it('snapshots 72 targets including revenue_events and revenue_match_hints', async () => {
       const siteId = await makeSite()
       const started = await startSiteDeletion(db, { siteId, requestedByUserId: ownerId })
       const targets = await listDeletionTargets(db, {
         deletionRequestId: started.deletionRequestId,
       })
       // 63, not 64: `billing_transfer_offers` is a target the hosted surface registers (`CLOUD_DELETION_EXTENSION`), so this is the set a build without it erases.
-      expect(targets).toHaveLength(62)
+      expect(targets).toHaveLength(72)
       expect(targets).toHaveLength(SITE_DELETION_TARGETS.length)
       expect(targets.filter((t) => t.store === 'clickhouse').map((t) => t.target)).toContain(
         'revenue_events',

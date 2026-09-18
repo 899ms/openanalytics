@@ -94,34 +94,36 @@ describeIfClickHouse('analytics schema bootstrap', () => {
     expect(byName.get('performance_events_mv')).toBe('MaterializedView')
     expect(byName.get('metrics_1m_mv')).toBe('MaterializedView')
 
-    // The Milestone 7 additive rollup family (plan items 1-2): every 1h/1d
-    // rollup is an AggregatingMergeTree fed by its own materialized view reading
-    // straight from events_raw. Asserted by presence rather than by a frozen
-    // count so a later checkpoint that adds a rollup does not fail this — the
-    // ledger test below is the one that pins the full file set, derived from the
-    // directory. Session/bounce and revenue rollups are intentionally absent
-    // (D-211, D-212) and there is nothing here to assert their non-existence
-    // against beyond their names never appearing.
+    // The Milestone 7 additive rollup family (plan items 1-2): every rollup the
+    // schema still WRITES is an AggregatingMergeTree fed by its own
+    // materialized view reading straight from events_raw. Asserted by presence
+    // rather than by a frozen count so a later checkpoint that adds a rollup
+    // does not fail this — the ledger test below is the one that pins the full
+    // file set, derived from the directory. Session/bounce and revenue rollups
+    // are intentionally absent (D-211, D-212) and there is nothing here to
+    // assert their non-existence against beyond their names never appearing.
     const rollupFamily = [
-      'metrics_1h',
       'metrics_1d',
-      'pages_1h',
       'pages_1d',
-      'sources_1h',
       'sources_1d',
-      'geography_1h',
       'geography_1d',
-      'devices_1h',
       'devices_1d',
-      'custom_events_1h',
       'custom_events_1d',
       // The custom-events decoration (ADR-0038, D5; migration 0021). Same
       // engine, same view pairing, additive — the property that let it ship
       // without dropping either `custom_events_*_mv`.
-      'custom_event_samples_1h',
       'custom_event_samples_1d',
-      'performance_1h',
       'performance_1d',
+      // The fifteen-minute family (ADR-0079, D1; migration 0025): one 15m twin
+      // per additive family above, same engine, same view pairing, additive.
+      'metrics_15m',
+      'pages_15m',
+      'sources_15m',
+      'geography_15m',
+      'devices_15m',
+      'custom_events_15m',
+      'performance_15m',
+      'custom_event_samples_15m',
     ]
     for (const table of rollupFamily) {
       expect(byName.get(table), `${table} should be an AggregatingMergeTree`).toBe(
@@ -132,16 +134,50 @@ describeIfClickHouse('analytics schema bootstrap', () => {
       )
     }
 
+    // The hour family, after ADR-0079 step 4 (migration 0027): the eight TABLES
+    // are still here, with their engine and their rows, and not one of them has
+    // a view any more. Both halves matter and they pull in opposite directions,
+    // which is why they are asserted together. A migration that dropped the
+    // tables would take the 15m backfill's only equality gate and the deletion
+    // workflow's targets with it; a view left behind would go on writing a
+    // grain nothing reads, which is the cost step 4 exists to remove.
+    const frozenHourFamily = [
+      'metrics_1h',
+      'pages_1h',
+      'sources_1h',
+      'geography_1h',
+      'devices_1h',
+      'custom_events_1h',
+      'custom_event_samples_1h',
+      'performance_1h',
+    ]
+    for (const table of frozenHourFamily) {
+      expect(byName.get(table), `${table} must survive 0027 as frozen history`).toBe(
+        'AggregatingMergeTree',
+      )
+      expect(byName.has(`${table}_mv`), `${table}_mv must be dropped by 0027`).toBe(false)
+    }
+
     // Milestone 8 Checkpoint A: the versioned session facts and the two
     // recompute/swap rollup targets. Asserted by presence and engine, not a
     // frozen count; the ledger test pins the full file set from the directory.
     // None of these is a materialized view — that is the whole point of D-211,
     // so their *_mv counterparts must NOT exist.
     expect(byName.get('session_facts_versions')).toBe('ReplacingMergeTree')
+    // Frozen rather than gone since step 4, exactly like the eight additive
+    // hour tables above — nothing writes it, everything that read it still can.
     expect(byName.get('session_rollups_1h')).toBe('ReplacingMergeTree')
     expect(byName.get('session_rollups_1d')).toBe('ReplacingMergeTree')
+    // ADR-0079 step 2 (migration 0026). The same engine and the same absence of
+    // a view, and the second half matters more here than anywhere: 0025 gave
+    // the eight ADDITIVE families a 15m twin WITH a materialized view, so a
+    // copy-paste that brought one along would look consistent with its
+    // neighbours and be structurally wrong -- a view cannot retract, and a
+    // retracted session must leave the rollup.
+    expect(byName.get('session_rollups_15m')).toBe('ReplacingMergeTree')
     for (const noView of [
       'session_facts_versions_mv',
+      'session_rollups_15m_mv',
       'session_rollups_1h_mv',
       'session_rollups_1d_mv',
     ]) {
@@ -163,7 +199,11 @@ describeIfClickHouse('analytics schema bootstrap', () => {
     // tests/unit/revenue-migration-order.test.ts pins the version ordering.
     expect(byName.get('revenue_1h')).toBe('ReplacingMergeTree')
     expect(byName.get('revenue_1d')).toBe('ReplacingMergeTree')
-    for (const noView of ['revenue_1h_mv', 'revenue_1d_mv']) {
+    // ADR-0079 step 2 (migration 0026), on the same terms: a swap target, never
+    // a view, because a refund has to be able to leave a bucket it once
+    // entered.
+    expect(byName.get('revenue_15m')).toBe('ReplacingMergeTree')
+    for (const noView of ['revenue_15m_mv', 'revenue_1h_mv', 'revenue_1d_mv']) {
       expect(
         byName.has(noView),
         `${noView} must not exist — revenue rollups are not MVs (D-212)`,
@@ -196,6 +236,12 @@ describeIfClickHouse('analytics schema bootstrap', () => {
       'devices_1d',
       'custom_events_1h',
       'custom_events_1d',
+      'metrics_15m',
+      'pages_15m',
+      'sources_15m',
+      'geography_15m',
+      'devices_15m',
+      'custom_events_15m',
     ]
     for (const table of visitorTables) {
       expect(byTable.get(table), `${table}.visitors must be an AggregateFunction(uniq)`).toMatch(

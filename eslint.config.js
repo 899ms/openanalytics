@@ -91,6 +91,13 @@ export default tseslint.config(
       // and no service env to read through, which is what this exemption is for.
       'apps/cli/src/**/*.ts',
       'apps/*/src/main.ts',
+      // One-shot operator entry points that ship inside a service image but are
+      // run by hand, never by the service: they resolve their own `*_FILE`
+      // environment (ADR-0065) and print a report to stdout, exactly as a
+      // `packages/*/src/cli.ts` does. Named individually rather than by a
+      // wildcard, so a long-running module cannot acquire the exemption by
+      // being moved next to one.
+      'apps/worker/src/revenue/seed-15m-reroll.ts',
       'packages/*/src/cli.ts',
       'packages/domain/src/policy.ts',
       'packages/domain/src/analytics-query.ts',

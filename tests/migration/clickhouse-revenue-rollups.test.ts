@@ -5,7 +5,9 @@ import {
   createRevenueEventsStore,
   createRevenueRollupsStore,
   migrateClickHouse,
+  sitesMissingFifteenMinuteHistory,
   type RevenueEventRow,
+  type RevenueRollupRow,
 } from '@openanalytics/clickhouse'
 import { createCapturedLogger } from '@openanalytics/testkit'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -294,16 +296,19 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
       const siteId = randomUUID()
       await insertFacts([factRow({ site_id: siteId, object_id: 'ch_1' })])
       const first = await runRollup(siteId)
+      // Two: one charge in one instant moves one quarter bucket and one day
+      // bucket. `changed` counts buckets across every unit, so it tracks the
+      // size of `UNITS` -- step 2 added the 15m grain, step 4 retired the hour.
       expect(first.changed).toBe(2)
 
-      const afterFirst = await currentBuckets('revenue_1h', siteId)
+      const afterFirst = await currentBuckets('revenue_15m', siteId)
       expect(afterFirst).toHaveLength(1)
       const firstGeneration = afterFirst[0]?.generation as number
       expect(firstGeneration).toBeGreaterThan(0)
       expect(afterFirst[0]?.charge).toBe(10_800)
       expect(afterFirst[0]?.net).toBe(10_260)
 
-      // A refund lands in the same hour under a new fact. The bucket must change
+      // A refund lands in the same quarter under a new fact. It must change
       // immediately — a merge is a space reclamation, not a correctness step.
       await insertFacts([
         factRow({
@@ -320,7 +325,7 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
       const second = await runRollup(siteId)
       expect(second.changed).toBe(2)
 
-      const afterSecond = await currentBuckets('revenue_1h', siteId)
+      const afterSecond = await currentBuckets('revenue_15m', siteId)
       expect(afterSecond).toHaveLength(1)
       expect(afterSecond[0]?.generation).toBeGreaterThan(firstGeneration)
       expect(afterSecond[0]?.net).toBe(10_260 - 4_000)
@@ -329,7 +334,7 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
 
       // Both generations are still physically present; the read is what selects.
       const raw = await queryRows<{ n: string }>(
-        `SELECT count()::text AS n FROM revenue_1h WHERE site_id = '${siteId}'`,
+        `SELECT count()::text AS n FROM revenue_15m WHERE site_id = '${siteId}'`,
       )
       expect(Number(raw[0]?.n)).toBe(2)
     })
@@ -342,7 +347,7 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
 
       expect(again.changed).toBe(0)
       const raw = await queryRows<{ n: string }>(
-        `SELECT count()::text AS n FROM revenue_1h WHERE site_id = '${siteId}'`,
+        `SELECT count()::text AS n FROM revenue_15m WHERE site_id = '${siteId}'`,
       )
       // One row per unit, not two: the planner compared before it wrote. Without
       // this the 15-minute staleness sweep would grow a generation per bucket
@@ -362,27 +367,60 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
       const after = await runRollup(siteId)
       expect(after.changed).toBe(2)
 
-      const buckets = await currentBuckets('revenue_1h', siteId)
+      const buckets = await currentBuckets('revenue_15m', siteId)
       expect(buckets[0]?.charge).toBe(0)
       expect(buckets[0]?.net).toBe(0)
       expect(buckets[0]?.generation).toBeGreaterThan(1)
     })
 
-    it('keeps the day rollup equal to the sum of its hours', async () => {
+    it('keeps the day rollup equal to the sum of its quarters', async () => {
+      // ADR-0079 steps 2 and 4. This was two tests until step 4 -- day equals
+      // the sum of hours, hour equals the sum of quarters -- and the hour half
+      // went with the grain it was about. What survives is the composition the
+      // read actually performs: a local day is built from quarter buckets, so a
+      // quarter that did not close over its day would be wrong for every zone
+      // at once.
+      //
+      // Three facts: two in the SAME hour but different quarters, one five
+      // hours later. The first pair is what makes +05:30, +05:45, +08:45 and
+      // +12:45 servable -- a fifteen-minute bucket is the first one that falls
+      // wholly inside a local day for every IANA offset -- and it also makes
+      // the day a genuine sum rather than a relabelled single bucket.
+      //
+      // All inside 2026-07-20: `runRollup` recomputes exactly that one UTC day
+      // (`revenueRollupRange` over `DAY_START`), and a fact outside it is
+      // simply not in the window the pass reads -- which is what the first
+      // draft of this test got wrong, writing no buckets at all and reporting
+      // an empty 15m table as if the grain were broken.
       const siteId = randomUUID()
       await insertFacts([
-        factRow({ site_id: siteId, object_id: 'ch_1', occurred_at: '2026-07-20 10:00:00.000' }),
-        factRow({ site_id: siteId, object_id: 'ch_2', occurred_at: '2026-07-20 15:30:00.000' }),
+        factRow({ site_id: siteId, object_id: 'ch_1', occurred_at: '2026-07-20 08:02:00.000' }),
+        factRow({ site_id: siteId, object_id: 'ch_2', occurred_at: '2026-07-20 08:47:00.000' }),
+        factRow({ site_id: siteId, object_id: 'ch_3', occurred_at: '2026-07-20 15:30:00.000' }),
       ])
       await runRollup(siteId)
 
-      const hours = await currentBuckets('revenue_1h', siteId)
+      const quarters = await currentBuckets('revenue_15m', siteId)
       const days = await currentBuckets('revenue_1d', siteId)
-      expect(hours).toHaveLength(2)
+      expect(quarters).toHaveLength(3)
+      expect(quarters.map((quarter) => quarter.bucket)).toEqual([
+        '2026-07-20 08:00:00',
+        '2026-07-20 08:45:00',
+        '2026-07-20 15:30:00',
+      ])
       expect(days).toHaveLength(1)
       expect(days[0]?.bucket).toBe('2026-07-20 00:00:00')
-      expect(days[0]?.charge).toBe(hours.reduce((total, hour) => total + hour.charge, 0))
-      expect(days[0]?.net).toBe(hours.reduce((total, hour) => total + hour.net, 0))
+
+      // Exact, on every money column: these are Int64 minor units, so there is
+      // nothing to round and a single unit of drift is a defect.
+      expect(days[0]?.charge).toBe(quarters.reduce((total, one) => total + one.charge, 0))
+      expect(days[0]?.net).toBe(quarters.reduce((total, one) => total + one.net, 0))
+      // Non-trivially: a site whose quarters were all zero would pass the two
+      // lines above and prove nothing.
+      expect(days[0]?.charge).toBeGreaterThan(0)
+
+      // And nothing reached the frozen hour table (migration 0027).
+      expect(await currentBuckets('revenue_1h', siteId)).toHaveLength(0)
     })
 
     it('excludes an unconverted fact from the money and counts it separately', async () => {
@@ -407,7 +445,7 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
            argMax(rr.charge_gross_minor, rr.generation) AS charge,
            argMax(rr.charge_count, rr.generation) AS charge_count,
            argMax(rr.unconverted_count, rr.generation) AS unconverted
-         FROM revenue_1h AS rr
+         FROM revenue_15m AS rr
          WHERE rr.site_id = '${siteId}'
          GROUP BY rr.site_id, rr.bucket_start`,
       )
@@ -441,12 +479,12 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
       const rollupFacts = current.map(toRollupFact)
       const plan = planRevenueRollupSwap({
         siteId,
-        recomputed: aggregateRevenueBuckets(rollupFacts, '1h'),
+        recomputed: aggregateRevenueBuckets(rollupFacts, '15m'),
         stored: [],
         affectedBucketSeconds: affectedBucketSecondsOf({
           facts: rollupFacts,
           stored: [],
-          unit: '1h',
+          unit: '15m',
         }),
         generation: 1,
         computedAtMs: Date.parse('2026-07-21T01:00:00.000Z'),
@@ -489,7 +527,7 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
         computedAtMs: Date.parse('2026-07-21T01:00:00.000Z'),
       })
 
-      const buckets = await currentBuckets('revenue_1h', siteId)
+      const buckets = await currentBuckets('revenue_15m', siteId)
       expect(buckets).toHaveLength(1)
       expect(buckets[0]?.generation).toBe(9)
       expect(buckets[0]?.net).toBe(10_260)
@@ -509,10 +547,95 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
       ])
       await runRollup(siteA)
 
-      expect(await currentBuckets('revenue_1h', siteA)).toHaveLength(1)
+      expect(await currentBuckets('revenue_15m', siteA)).toHaveLength(1)
       // B was never rolled up: the whole pipeline is per site, from the claim to
       // the insert.
-      expect(await currentBuckets('revenue_1h', siteB)).toHaveLength(0)
+      expect(await currentBuckets('revenue_15m', siteB)).toHaveLength(0)
+    })
+  })
+
+  describe('the 15m re-roll seed gap test (v0.7.0 prework)', () => {
+    const bucketRow = (
+      siteId: string,
+      bucketStart: string,
+      generation: number,
+      charges: number,
+    ): RevenueRollupRow => ({
+      site_id: siteId,
+      bucket_start: bucketStart,
+      generation,
+      charge_gross_minor: charges * 100,
+      refund_minor: 0,
+      dispute_withdrawn_minor: 0,
+      dispute_reinstated_minor: 0,
+      fee_minor: 0,
+      net_minor: charges * 100,
+      charge_count: charges,
+      refund_count: 0,
+      dispute_count: 0,
+      unconverted_count: 0,
+      computed_at: '2026-09-18 00:00:00.000',
+    })
+
+    const missing = async (sites: readonly string[]) =>
+      sitesMissingFifteenMinuteHistory(await rollups.listFifteenMinuteCoverage())
+        .map((site) => site.siteId)
+        .filter((siteId) => sites.includes(siteId))
+        .sort()
+
+    it('names a site until its 15m grain reaches the first live day, and never one that is caught up', async () => {
+      // Upgraded: the day grain has all of history, the quarter grain only the
+      // rolling month the attribution job rewrote after the upgrade.
+      const upgraded = randomUUID()
+      await rollups.insertRollups({
+        unit: '1d',
+        rows: [
+          bucketRow(upgraded, '2026-06-10 00:00:00', 1, 1),
+          bucketRow(upgraded, '2026-07-20 00:00:00', 1, 1),
+        ],
+      })
+      await rollups.insertRollups({
+        unit: '15m',
+        rows: [bucketRow(upgraded, '2026-07-20 10:00:00', 1, 1)],
+      })
+
+      // Never re-rolled at all.
+      const empty = randomUUID()
+      await rollups.insertRollups({
+        unit: '1d',
+        rows: [bucketRow(empty, '2026-06-10 00:00:00', 1, 1)],
+      })
+
+      // Caught up — except for a day bucket a later recompute ZEROED. It is not
+      // live history, so it must not keep the site "missing" forever, which
+      // would restart a finished re-roll on every start.
+      const caughtUp = randomUUID()
+      await rollups.insertRollups({
+        unit: '1d',
+        rows: [
+          bucketRow(caughtUp, '2026-05-01 00:00:00', 1, 1),
+          bucketRow(caughtUp, '2026-06-01 00:00:00', 1, 1),
+        ],
+      })
+      await rollups.insertRollups({
+        unit: '1d',
+        rows: [bucketRow(caughtUp, '2026-05-01 00:00:00', 2, 0)],
+      })
+      await rollups.insertRollups({
+        unit: '15m',
+        rows: [bucketRow(caughtUp, '2026-06-01 13:45:00', 1, 1)],
+      })
+
+      const sites = [upgraded, empty, caughtUp]
+      expect(await missing(sites)).toEqual([empty, upgraded].sort())
+
+      // The re-roll walks the first chunk: the quarter grain now reaches the
+      // first day, and the site drops out by itself — no marker written.
+      await rollups.insertRollups({
+        unit: '15m',
+        rows: [bucketRow(upgraded, '2026-06-10 16:30:00', 1, 1)],
+      })
+      expect(await missing(sites)).toEqual([empty])
     })
   })
 })

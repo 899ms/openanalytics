@@ -444,9 +444,12 @@ describe('the horizon rule', () => {
     expect(read.toMs).toBeGreaterThanOrEqual(NOW + 1)
   })
 
-  it('rolls up on the same claim, over both units, from the same read', async () => {
+  it('rolls up on the same claim, over every unit, from the same read', async () => {
     // The reason the rollup is a step of this job rather than a loop of its own:
-    // one ClickHouse round trip serves both the journeys and the buckets.
+    // one ClickHouse round trip serves the journeys and every grain of buckets.
+    // Two grains: step 2 added `revenue_15m` beside the hour and the day, step
+    // 4 retired the hour. Still one fact read -- if a unit had cost a round
+    // trip, that would be the argument for a separate loop, and it does not.
     const built = fakes()
     const context = deps({ _fakes: built })
     await attributeRevenueOnce(
@@ -454,18 +457,18 @@ describe('the horizon rule', () => {
     )
 
     expect(built.recorded.factReads).toHaveLength(1)
-    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d'])
+    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['15m', '1d'])
     const read = built.recorded.factReads[0]!
     for (const rollupRead of built.recorded.rollupReads) {
       expect(rollupRead.loMs).toBe(read.fromMs)
       expect(rollupRead.hiMs).toBe(read.toMs)
     }
-    // One charge, so one hour bucket and one day bucket move.
+    // One charge, so one quarter and one day bucket move.
     expect(built.recorded.rollupWrites).toEqual([
-      { unit: '1h', rows: 1 },
+      { unit: '15m', rows: 1 },
       { unit: '1d', rows: 1 },
     ])
-    // Both units carry the generation the CLAIM minted, not one derived from
+    // Every unit carries the generation the CLAIM minted, not one derived from
     // what is stored — the property that makes a stolen lease harmless.
     expect(built.recorded.rollupGenerations).toEqual([7, 7])
   })
@@ -482,10 +485,11 @@ describe('the horizon rule', () => {
 
     expect(result.attributed).toBe(1)
     expect(result.rows).toBe(0)
-    // Both units were read and both were written: the refund moved its bucket.
-    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d'])
+    // Every unit was read and every unit was written: the refund moved its
+    // bucket at both grains, the fifteen-minute one included.
+    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['15m', '1d'])
     expect(built.recorded.rollupWrites).toEqual([
-      { unit: '1h', rows: 1 },
+      { unit: '15m', rows: 1 },
       { unit: '1d', rows: 1 },
     ])
     expect(advanceMock).toHaveBeenCalledTimes(1)
@@ -502,7 +506,7 @@ describe('the horizon rule', () => {
       context.deps as unknown as Parameters<typeof attributeRevenueOnce>[0],
     )
 
-    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d'])
+    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['15m', '1d'])
     expect(advanceMock).toHaveBeenCalledTimes(1)
   })
 

@@ -178,7 +178,7 @@ export interface RevenueAttributionDeps {
   /** Reads the current `revenue_events` facts — the charges to attribute. */
   readonly facts: RevenueEventsStore
   /**
-   * The `revenue_1h`/`revenue_1d` swap targets (CP5, ClickHouse 0018).
+   * The `revenue_15m`/`revenue_1d` swap targets (ClickHouse 0018 and 0026).
    *
    * The rollup runs as a **step of this job** rather than as a loop of its own,
    * and `apps/worker/src/revenue/rollup.ts` gives the four reasons — the lease,

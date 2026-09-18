@@ -34,18 +34,32 @@ import { createClient, type ClickHouseClient } from '@clickhouse/client'
  * Same boundary as every other analytics table (D-208): the api holds no
  * ClickHouse credential and reads these through the signed query gateway. The
  * worker writes on `oa_ingest`, which needs `INSERT` and `SELECT` on
- * `revenue_1h` and `revenue_1d` through the entrypoint XML and a container
+ * `revenue_15m` and `revenue_1d` through the entrypoint XML and a container
  * **recreate** — CP7's deploy step, exactly as `revenue_events` and
  * `revenue_attributions` needed before it.
  */
 
+export const REVENUE_ROLLUP_15M_TABLE = 'revenue_15m'
+/**
+ * Frozen since ADR-0079 step 4: the attribution job stopped writing it when
+ * `'1h'` left `RevenueRollupUnit`. Kept because the deletion workflow's targets
+ * do not change and the rows it already holds are real history.
+ */
 export const REVENUE_ROLLUP_1H_TABLE = 'revenue_1h'
 export const REVENUE_ROLLUP_1D_TABLE = 'revenue_1d'
 
-export type RevenueRollupUnit = '1h' | '1d'
+/**
+ * The grains the attribution job writes.
+ *
+ * Two, not three, since ADR-0079 step 4 retired the hour grain: every read had
+ * already moved to the fifteen-minute family in step 3, so the hour swap was
+ * pure cost. The narrowing is the enforcement — a write to `revenue_1h` does
+ * not type-check any more.
+ */
+export type RevenueRollupUnit = '15m' | '1d'
 
 /**
- * One row of `revenue_1h`/`revenue_1d` (migration 0018).
+ * One row of `revenue_15m`/`revenue_1d` (migrations 0018 and 0026).
  *
  * snake_case because these are the migration's column names, sent as
  * `JSONEachRow`. Numbers rather than bigints: every amount is an `Int64` of
@@ -108,7 +122,7 @@ export interface RevenueRollupsStoreOptions {
   readonly database: string
   readonly requestTimeoutMs?: number
   /** Overridable for tests that migrate into a throwaway database. */
-  readonly rollup1hTable?: string
+  readonly rollup15mTable?: string
   readonly rollup1dTable?: string
 }
 
@@ -127,8 +141,48 @@ export interface RevenueRollupsStore {
     unit: RevenueRollupUnit
     rows: readonly RevenueRollupRow[]
   }): Promise<void>
+  /**
+   * Per site with revenue history, where its day rollup and its fifteen-minute
+   * rollup each begin. The re-roll seed's gap test (`sitesMissingFifteenMinuteHistory`).
+   */
+  listFifteenMinuteCoverage(): Promise<readonly RevenueFifteenMinuteCoverage[]>
   ping(): Promise<boolean>
   close(): Promise<void>
+}
+
+/**
+ * Where a site's two revenue grains begin, over LIVE buckets only: the current
+ * generation of a bucket, and only when it counts at least one fact. A bucket
+ * a later recompute zeroed is not history either grain has to match.
+ */
+export interface RevenueFifteenMinuteCoverage {
+  readonly siteId: string
+  /** Start of the first live `revenue_1d` bucket, epoch ms. */
+  readonly firstDayMs: number
+  /** Start of the first live `revenue_15m` bucket, epoch ms, or null when there is none. */
+  readonly firstQuarterMs: number | null
+}
+
+const MS_PER_DAY = 86_400_000
+
+/**
+ * The sites whose fifteen-minute revenue history is missing: the day grain
+ * holds a live bucket on a day the fifteen-minute grain does not reach.
+ *
+ * The two grains are recomputed from the same facts by the same planner, so a
+ * site whose re-roll has run has the same first DAY in both, and the test
+ * settles to "nothing to do" by itself. That is what lets it run on every
+ * start: unlike "seed every revenue site", it cannot restart a finished re-roll,
+ * and unlike a done-marker it needs nothing written anywhere to know.
+ */
+export function sitesMissingFifteenMinuteHistory(
+  coverage: readonly RevenueFifteenMinuteCoverage[],
+): readonly RevenueFifteenMinuteCoverage[] {
+  return coverage.filter(
+    (site) =>
+      site.firstQuarterMs === null ||
+      Math.floor(site.firstQuarterMs / MS_PER_DAY) * MS_PER_DAY > site.firstDayMs,
+  )
 }
 
 /**
@@ -153,10 +207,16 @@ export function revenueRollupToken(
 export function createRevenueRollupsStore(
   options: RevenueRollupsStoreOptions,
 ): RevenueRollupsStore {
-  const rollupTable = (unit: RevenueRollupUnit): string =>
-    unit === '1h'
-      ? (options.rollup1hTable ?? REVENUE_ROLLUP_1H_TABLE)
-      : (options.rollup1dTable ?? REVENUE_ROLLUP_1D_TABLE)
+  // A total `Record` over the unit union, not a ternary. The ternary it
+  // replaces had no third case, so adding `'15m'` to `RevenueRollupUnit` would
+  // have sent every fifteen-minute read and every fifteen-minute swap to
+  // `revenue_1d` -- silently, with no type error, corrupting the day grain
+  // instead of merely failing.
+  const rollupTables: Readonly<Record<RevenueRollupUnit, string>> = {
+    '15m': options.rollup15mTable ?? REVENUE_ROLLUP_15M_TABLE,
+    '1d': options.rollup1dTable ?? REVENUE_ROLLUP_1D_TABLE,
+  }
+  const rollupTable = (unit: RevenueRollupUnit): string => rollupTables[unit]
 
   const client: ClickHouseClient = createClient({
     url: options.url,
@@ -223,6 +283,40 @@ export function createRevenueRollupsStore(
         format: 'JSONEachRow',
         clickhouse_settings: { insert_deduplication_token: revenueRollupToken(unit, rows) },
       })
+    },
+
+    async listFifteenMinuteCoverage() {
+      const live = (table: string) => `
+        SELECT l.site_id AS site_id, min(l.bucket_start) AS first_bucket
+          FROM (
+            SELECT rr.site_id AS site_id,
+                   rr.bucket_start AS bucket_start,
+                   argMax(rr.charge_count + rr.refund_count + rr.dispute_count + rr.unconverted_count, rr.generation) AS facts
+              FROM ${table} AS rr
+             GROUP BY rr.site_id, rr.bucket_start
+          ) AS l
+         WHERE l.facts > 0
+         GROUP BY l.site_id`
+      const resultSet = await client.query({
+        query: `SELECT toString(d.site_id)                      AS site_id,
+                       toUnixTimestamp(d.first_bucket) * 1000   AS first_day_ms,
+                       if(q.first_bucket IS NULL, NULL, toUnixTimestamp(q.first_bucket) * 1000) AS first_quarter_ms
+                  FROM (${live(rollupTable('1d'))}) AS d
+                  LEFT JOIN (${live(rollupTable('15m'))}) AS q ON q.site_id = d.site_id
+                 ORDER BY site_id
+                SETTINGS join_use_nulls = 1`,
+        format: 'JSONEachRow',
+      })
+      const rows = await resultSet.json<{
+        site_id: string
+        first_day_ms: string
+        first_quarter_ms: string | null
+      }>()
+      return rows.map((row) => ({
+        siteId: row.site_id,
+        firstDayMs: Number(row.first_day_ms),
+        firstQuarterMs: row.first_quarter_ms === null ? null : Number(row.first_quarter_ms),
+      }))
     },
 
     async ping() {

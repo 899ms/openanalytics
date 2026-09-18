@@ -8,7 +8,6 @@ export {
 export {
   chDateTime,
   dayBucketMs,
-  hourBucketMs,
   planRollupSwap,
   planSessionFacts,
   type RollupSwapPlan,

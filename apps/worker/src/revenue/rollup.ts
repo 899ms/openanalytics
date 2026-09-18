@@ -82,7 +82,10 @@ import {
 
 const MS_PER_DAY = 86_400_000
 
-const UNITS: readonly RevenueRollupUnit[] = ['1h', '1d']
+// Two grains since ADR-0079 step 4: nothing has read `revenue_1h` since step 3
+// moved every composition to the quarter, so the hour swap was a third of this
+// job's writes for no reader. The table is frozen, not dropped.
+const UNITS: readonly RevenueRollupUnit[] = ['15m', '1d']
 
 export interface RevenueRollupDeps {
   readonly logger: Logger

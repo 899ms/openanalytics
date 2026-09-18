@@ -2,9 +2,10 @@ import { sessionize, type CanonicalSession, type SessionizerEvent } from '@opena
 import type { StoredRollupBucket, StoredSessionFact } from '@openanalytics/clickhouse'
 import { describe, expect, it } from 'vitest'
 import {
-  hourBucketMs,
+  dayBucketMs,
   planRollupSwap,
   planSessionFacts,
+  quarterBucketMs,
 } from '../../apps/worker/src/sessions/plan.ts'
 
 /**
@@ -139,7 +140,10 @@ describe('planSessionFacts', () => {
     expect(plan.factRows).toHaveLength(0)
     expect(plan.changed).toBe(0)
     expect(plan.retracted).toBe(0)
-    expect(plan.affectedHourBucketsMs).toHaveLength(0)
+    // Nothing changed, so neither grain has anything to swap -- including the
+    // fifteen-minute one ADR-0079 step 2 added.
+    expect(plan.affectedQuarterBucketsMs).toHaveLength(0)
+    expect(plan.affectedDayBucketsMs).toHaveLength(0)
   })
 
   it('emits a new finalized version when only the finalized flag flips', () => {
@@ -324,8 +328,44 @@ describe('planSessionFacts', () => {
     expect(tombstone).toBeDefined()
     expect(tombstone!.retracted).toBe(1)
     expect(tombstone!.version).toBe(4)
-    // The vanished session's bucket is affected — the rollup must lose it.
-    expect(plan.affectedHourBucketsMs).toContain(hourBucketMs(gone!.startMs))
+    // The vanished session's bucket is affected at every grain — the rollups
+    // must lose it. A retraction the 15m rollup never heard about would leave
+    // the vanished session's counts standing in `session_rollups_15m` forever,
+    // because nothing revisits a bucket the planner did not name.
+    expect(plan.affectedQuarterBucketsMs).toContain(quarterBucketMs(gone!.startMs))
+    expect(plan.affectedDayBucketsMs).toContain(dayBucketMs(gone!.startMs))
+  })
+
+  it('names a quarter and a day for every touched session', () => {
+    // The two affected-bucket lists are the finalizer's only instruction about
+    // what to re-swap, so each has to be sorted, unique, and consistent with
+    // the other: every day named must be the day of some quarter named, and
+    // every quarter's day must be named. A quarter list that drifted from the
+    // day list would leave one grain silently stale. (There were three lists
+    // until ADR-0079 step 4 retired the hour grain.)
+    const events = [
+      pageView('e1', '2026-07-23T10:05:00.000Z'),
+      pageView('e2', '2026-07-23T10:40:00.000Z'),
+      pageView('e3', '2026-07-23T13:20:00.000Z'),
+    ]
+    const recomputed = sessionize(SITE, events)
+    const plan = planSessionFacts({
+      siteId: SITE,
+      recomputed,
+      stored: [],
+      nowMs: Date.parse('2026-07-24T00:00:00.000Z'),
+      inactivityMs: INACTIVITY_MS,
+      latenessMs: LATENESS_MS,
+    })
+
+    expect(plan.affectedQuarterBucketsMs.length).toBeGreaterThan(0)
+    for (const list of [plan.affectedQuarterBucketsMs, plan.affectedDayBucketsMs]) {
+      expect([...list].sort((a, b) => a - b)).toEqual([...list])
+      expect(new Set(list).size).toBe(list.length)
+    }
+
+    const daysOfQuarters = new Set(plan.affectedQuarterBucketsMs.map(dayBucketMs))
+    expect([...daysOfQuarters].sort((a, b) => a - b)).toEqual([...plan.affectedDayBucketsMs])
   })
 
   it('resurrects a previously-retracted session that reappears in the recompute', () => {

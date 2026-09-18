@@ -213,6 +213,21 @@ export interface RevenueEventsStore {
     fromMs: number
     toMs: number
   }): Promise<CurrentRevenueEvent[]>
+  /**
+   * The oldest `occurred_at` this table holds, per site.
+   *
+   * Read from the fact rather than from the attribution watermark on purpose:
+   * the watermark says how far the job has PROCESSED, and the question a
+   * re-roll seeding asks is how far back there is anything to process at all.
+   *
+   * No version resolution and no `retracted` filter, because neither applies:
+   * a money object's occurrence does not move between versions (the comment on
+   * `readCurrentRows` says so and the partition pruning depends on it), so the
+   * minimum over every version equals the minimum over the current ones.
+   */
+  listOldestOccurrencePerSite(): Promise<
+    readonly { readonly siteId: string; readonly oldestOccurredAtMs: number }[]
+  >
   ping(): Promise<boolean>
   close(): Promise<void>
 }
@@ -263,6 +278,22 @@ export function createRevenueEventsStore(options: RevenueEventsStoreOptions): Re
         clickhouse_settings: { insert_deduplication_token: token },
       })
       return { token }
+    },
+
+    async listOldestOccurrencePerSite() {
+      const resultSet = await client.query({
+        query: `SELECT toString(re.site_id)                        AS site_id,
+                       toUnixTimestamp64Milli(min(re.occurred_at)) AS oldest_ms
+                  FROM ${table} AS re
+                 GROUP BY re.site_id
+                 ORDER BY site_id`,
+        format: 'JSONEachRow',
+      })
+      const rows = await resultSet.json<{ site_id: string; oldest_ms: string }>()
+      return rows.map((row) => ({
+        siteId: row.site_id,
+        oldestOccurredAtMs: Number(row.oldest_ms),
+      }))
     },
 
     async readCurrentRows({ siteId, fromMs, toMs }) {

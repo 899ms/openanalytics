@@ -67,8 +67,16 @@ const CREATE_TABLE =
  * from the ADR verbatim would have silently ignored the exact two tables it
  * exists to catch. The optional middle segment fixes it, and the test below
  * pins the behaviour so nobody "corrects" it back.
+ *
+ * `15m` was added to the grain alternation by ADR-0079 step 2, and its absence
+ * was the same failure a second time. The pattern read `1[hd]` — one character,
+ * then `h` or `d` — so `revenue_15m` matched NOTHING, and both guards below
+ * (create-after-the-fact, and never-a-materialized-view) passed over migration
+ * 0026's new rollup in silence while appearing to cover it. A guard that
+ * skips the table it was extended for is worse than no guard, because the
+ * green result is read as coverage.
  */
-const REVENUE_ROLLUP = /^revenue_(?:.*_)?1[hd]$/
+const REVENUE_ROLLUP = /^revenue_(?:.*_)?(?:15m|1[hd])$/
 
 const FACT_TABLE = 'revenue_events'
 
@@ -132,7 +140,17 @@ describe('revenue migration order (plan 04 M12, acceptance criterion 4)', () => 
     for (const table of ['revenue_1h', 'revenue_1d', 'revenue_net_1d']) {
       expect(REVENUE_ROLLUP.test(table), table).toBe(true)
     }
+    // ADR-0079 step 2. Pinned by name because the previous `1[hd]` spelling
+    // returned false for exactly this string, which made both guards below
+    // silently skip migration 0026's rollup while still reporting green.
+    for (const table of ['revenue_15m', 'revenue_net_15m']) {
+      expect(REVENUE_ROLLUP.test(table), table).toBe(true)
+    }
     for (const table of ['revenue_events', 'revenue_attributions', 'metrics_1h']) {
+      expect(REVENUE_ROLLUP.test(table), table).toBe(false)
+    }
+    // Near misses, so the widened alternation did not become a wildcard.
+    for (const table of ['revenue_15', 'revenue_5m', 'revenue_15m_mv']) {
       expect(REVENUE_ROLLUP.test(table), table).toBe(false)
     }
   })

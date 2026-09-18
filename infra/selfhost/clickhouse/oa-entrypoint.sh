@@ -116,6 +116,18 @@ cat >"$TARGET" <<XML
         <query>GRANT INSERT ON analytics.revenue_1d</query>
         <query>GRANT SELECT ON analytics.revenue_1d</query>
 
+        <!-- The fifteen-minute grain of the two swap rollups (migration 0026).
+             The eight 15m materialized-view families of 0025 need no grant at
+             all, because ClickHouse pushes into a view's target under its own
+             authority. These two the worker writes, so they need INSERT and,
+             for the same compare-before-write reason as the hour twins,
+             SELECT. Adding a line here takes effect on a container RECREATE,
+             never a restart. -->
+        <query>GRANT INSERT ON analytics.session_rollups_15m</query>
+        <query>GRANT SELECT ON analytics.session_rollups_15m</query>
+        <query>GRANT INSERT ON analytics.revenue_15m</query>
+        <query>GRANT SELECT ON analytics.revenue_15m</query>
+
       </grants>
     </oa_ingest>
 

@@ -651,8 +651,8 @@ describeIfPostgres('event definitions', () => {
       const targets = await listDeletionTargets(db, {
         deletionRequestId: started.deletionRequestId,
       })
-      // 63, not 64: `billing_transfer_offers` is a target the hosted surface registers (`CLOUD_DELETION_EXTENSION`), so this is the set a build without it erases.
-      expect(targets).toHaveLength(62)
+      // 73, not 74: `billing_transfer_offers` is a target the hosted surface registers (`CLOUD_DELETION_EXTENSION`), so this is the set a build without it erases.
+      expect(targets).toHaveLength(72)
       expect(targets).toHaveLength(SITE_DELETION_TARGETS.length)
       const names = new Set(targets.map((t) => `${t.store}:${t.target}`))
       expect(names.has('postgres:event_definitions')).toBe(true)

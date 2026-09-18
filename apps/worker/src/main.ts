@@ -487,7 +487,7 @@ if (env.DATABASE_URL) {
    *
    * Gated with the attribution job rather than on its own, because the rollup is
    * a STEP of that job (`apps/worker/src/revenue/rollup.ts` gives the four
-   * reasons). Deploy note: `oa_ingest` needs INSERT and SELECT on `revenue_1h`
+   * reasons). Deploy note: `oa_ingest` needs INSERT and SELECT on `revenue_15m`
    * and `revenue_1d` through the ClickHouse entrypoint XML and a container
    * **recreate**, exactly as `revenue_events` and `revenue_attributions` did.
    */
