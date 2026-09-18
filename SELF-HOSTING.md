@@ -171,7 +171,8 @@ minutes on that box, most of it compiling.
 Either way, the order is enforced by the compose file and is not cosmetic:
 
 1. stores start and become healthy;
-2. `migrate` runs Postgres migrations, then ClickHouse migrations, and exits;
+2. `migrate` runs Postgres migrations, then ClickHouse migrations, then fills
+   any rollup history that is missing (a no-op on an empty install), and exits;
 3. every application service waits for that exit — a failed migration stops the
    deploy instead of producing a fleet of services against a half-built schema;
 4. `tracker-build` compiles `oa.js` into a volume Caddy serves read-only;
@@ -663,9 +664,45 @@ standing on, takes a snapshot, points `.env` at the new images, pulls them and
 brings everything up. On an architecture with no published images,
 `./upgrade.sh --from-source` builds instead.
 
-**0.5.0 → 0.6.0 asks nothing else of you.** Its two ClickHouse migrations
-only add columns, and the migrate container applies them while the upgrade
-runs.
+**0.6.0 → 0.7.0 asks nothing else of you either, but it does more while it
+runs**, so it is worth knowing what you are watching:
+
+- **Every chart now reads fifteen-minute rollups instead of hourly ones.** That
+  is what lets a site report on any IANA timezone, including +05:30 and +05:45,
+  which 0.6.0 refused. ClickHouse migrations 0025–0028 add the new tables, stop
+  the hourly ones from being written (they stay as frozen history, and a later
+  release drops them) and add `backfill_ledger`.
+- **The migrate container fills the new tables from your history, by itself.**
+  After the migrations it runs three fills — the eight view-backed families,
+  the session rollups and the revenue rollups (the worker then re-rolls revenue
+  history a month per pass). Each fill writes only what is missing, a site's
+  quarter hour that has events and no rollup row, so it is safe on any state
+  and the next start writes nothing. It reads every raw event once, so on a
+  large install the migrate step takes noticeably longer than usual, once. A
+  fill that fails is logged as `oa-migrate: history fill … failed` and does
+  **not** stop the stack: the next `docker compose up -d` retries it. Each
+  fill that wrote something leaves a row you can read with
+  `docker compose run --rm migrate node packages/clickhouse/dist/cli.js ledger`.
+- **If the worker keeps running through the upgrade** — a platform redeploy, or
+  `docker compose pull && docker compose up -d` without `./upgrade.sh` — one
+  quarter hour can come out short: the one in which the new views were created
+  counts only the events that arrived after that moment. `./upgrade.sh` stops
+  everything first, so it has no such gap.
+- **ClickHouse gets new grants**, for the two rollups the worker writes itself.
+  They are rendered when its container is created, and the new image tag is
+  what recreates it, so `./upgrade.sh` and a platform redeploy deliver them
+  without a step of yours. If you run your own ClickHouse image, see the
+  recreate note below.
+- **Every site now has a reporting timezone.** Postgres migration 0046 gives
+  each site without one its owner's account timezone, or UTC, and makes the
+  column required. The dashboard, widgets, the share page and the MCP server
+  all read on it; a reader can switch their own view from the header.
+- **Disk:** the fifteen-minute tables hold up to four rows for every hourly
+  one. Measured on a real install they came to about a tenth of the size of
+  the raw events.
+
+Going back is `./rollback.sh` to the snapshot the upgrade took, as for any
+release.
 
 **There are no down migrations, and that is a decision rather than an omission.**
 A reverse migration is code that runs once, in an emergency, having never been
@@ -724,6 +761,12 @@ services by hand:
   `infra/selfhost/clickhouse/oa-entrypoint.sh` and one of these recreates.
   Without it, inserts into the new table fail while ordinary traffic keeps
   flowing — the quiet half of the failure.
+- **Schema migrations are fatal, history fills are not.** The `migrate`
+  container stops the stack if a migration fails, because nothing may run
+  against a schema it was not built for. The history fills that follow them
+  only log a failure, because stopping the stack there would stop the
+  collector too, and every event sent meanwhile would be lost for the sake of
+  a report that the next start completes.
 
 ### The tracker
 

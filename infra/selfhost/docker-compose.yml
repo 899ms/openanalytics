@@ -62,6 +62,15 @@
 #    uses, what any architecture we do not publish for uses, and what makes a
 #    local change testable without a registry round trip.
 #
+# 5. EVERY SERVICE'S LOG HAS A CEILING: 3 files of 100 MB, rotated by Docker.
+#    Docker's default json-file driver never rotates, so a chatty service grows
+#    one file until the disk is full — and a full disk stops Postgres and
+#    ClickHouse, not only the service that wrote it. The anchor below is
+#    applied to every service, one-shots included, because an unbounded log is
+#    a class of failure rather than a habit of one service. Raise the numbers
+#    if you ship logs somewhere that needs more history on the host; do not
+#    remove the block.
+#
 # ---------------------------------------------------------------------------
 # Optional pieces, off by default, enabled with `--profile`:
 #   --profile object-storage   MinIO, for data import/export and CSV exports
@@ -70,6 +79,12 @@
 # and served by Caddy. See the `tracker-build` service and the Caddyfile.
 
 name: openanalytics
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 100m
+    max-file: '3'
 
 x-node-build: &node-build
   # The build context is the repository ROOT: these are pnpm workspace packages
@@ -86,6 +101,7 @@ x-node-build: &node-build
 x-node-service: &node-service
   restart: unless-stopped
   networks: [oa]
+  logging: *logging
 
 # Each service answers `GET /health` on its own port (packages/observability),
 # returning 503 while a dependency is unavailable. `node -e` rather than curl:
@@ -107,6 +123,7 @@ services:
   # --- stores ---------------------------------------------------------------
 
   postgres:
+    logging: *logging
     image: postgres:17-alpine
     container_name: oa-postgres
     restart: unless-stopped
@@ -129,6 +146,7 @@ services:
   # the compose file, which is what the one-click platforms cannot provide. To
   # edit one without a release, bind-mount over it: a mount still wins.
   clickhouse:
+    logging: *logging
     image: ${OA_IMAGE_REPO:-openanalytics}/clickhouse:${OA_IMAGE_TAG:-local}
     build:
       context: ../..
@@ -156,6 +174,7 @@ services:
   # The durable event queue. Between the collector's 202 and the worker's
   # insert, this instance holds the only copy of an event.
   valkey-queue:
+    logging: *logging
     image: ${OA_IMAGE_REPO:-openanalytics}/valkey:${OA_IMAGE_TAG:-local}
     build:
       context: ../..
@@ -187,6 +206,7 @@ services:
 
   # Presence, rate-limit counters, short-lived caches. Losable by design.
   valkey-realtime:
+    logging: *logging
     image: ${OA_IMAGE_REPO:-openanalytics}/valkey:${OA_IMAGE_TAG:-local}
     build:
       context: ../..
@@ -223,6 +243,7 @@ services:
   # Re-runs are safe and are the normal upgrade path: both runners keep a ledger
   # and apply only what is pending.
   migrate:
+    logging: *logging
     build:
       <<: *node-build
       args:
@@ -235,8 +256,27 @@ services:
     container_name: oa-migrate
     restart: 'no'
     env_file: env/migrate.env
+    # Two kinds of step, with opposite failure rules.
+    #
+    # The schema migrations come first and a failure stops the stack: nothing
+    # may run against a schema it was not built for.
+    #
+    # The history fills after them (the fifteen-minute rollups) are gap fills:
+    # each one fills only what is missing, is safe over any state — worker
+    # stopped or still running through the upgrade — and a second run writes
+    # nothing. So a failed fill is logged and the stack starts anyway, and the
+    # next start retries it. Stopping the stack there would stop the collector
+    # too, and every event sent meanwhile would be lost for the sake of a report
+    # that can be completed later. No shell variables on purpose: a platform
+    # that interpolates this file would eat them.
     entrypoint:
-      ['sh', '-c', 'node packages/postgres/dist/cli.js && node packages/clickhouse/dist/cli.js']
+      - sh
+      - -c
+      - |
+        node packages/postgres/dist/cli.js && node packages/clickhouse/dist/cli.js || exit 1
+        node packages/clickhouse/dist/cli.js backfill-15m --if-needed || echo 'oa-migrate: history fill backfill-15m failed; the stack starts anyway and the next start retries it' >&2
+        node packages/clickhouse/dist/cli.js backfill-15m --sessions --if-needed || echo 'oa-migrate: history fill backfill-15m --sessions failed; the stack starts anyway and the next start retries it' >&2
+        node apps/worker/dist/revenue/seed-15m-reroll.js --if-needed || echo 'oa-migrate: history fill seed-15m-reroll failed; the stack starts anyway and the next start retries it' >&2
     depends_on:
       postgres: { condition: service_healthy }
       clickhouse: { condition: service_healthy }
@@ -258,6 +298,7 @@ services:
   # `target: build` because the bundler (esbuild) is a dev dependency and is
   # deliberately absent from the runtime stage.
   tracker-build:
+    logging: *logging
     build:
       <<: *node-build
       target: build
@@ -436,6 +477,7 @@ services:
   # rate limiting and geo depend on, and that stripping is a security control,
   # not tidiness.
   caddy:
+    logging: *logging
     image: caddy:2-alpine
     container_name: oa-caddy
     restart: unless-stopped
@@ -486,6 +528,7 @@ services:
   # says why it is not a bootstrap flag to switch back off afterwards. Recreate
   # the api if you have just changed it.
   create-admin:
+    logging: *logging
     image: ${OA_IMAGE_REPO:-openanalytics}/migrate:${OA_IMAGE_TAG:-local}
     profiles: ['tools']
     restart: 'no'
@@ -505,6 +548,7 @@ services:
   # Pulled from Quay: MinIO's Docker Hub repository stopped resolving on
   # 2026-09-16 ("pull access denied"); the same tag and digest live on Quay.
   minio:
+    logging: *logging
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: oa-minio
     restart: unless-stopped
