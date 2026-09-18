@@ -8,7 +8,7 @@ taking.
 Releases before 0.6.0 have their notes on the
 [GitHub releases page](https://github.com/OpenLabs-so/openanalytics/releases).
 
-## [Unreleased]
+## [0.7.0] - 2026-09-18
 
 **Upgrade notes: nothing by hand, but the first start takes longer.**
 `./upgrade.sh` as always. The migrate container then fills the new
@@ -18,9 +18,12 @@ usual. A fill that fails is logged as `oa-migrate: history fill … failed`,
 does not stop the stack, and is retried on the next `docker compose up -d`.
 If the worker keeps running through the switch (a platform redeploy, or
 `pull` and `up -d` without `./upgrade.sh`), the quarter hour in which the new
-views are created counts only the events that arrived after that moment. The
-new rollups take up to four rows for every hourly one. The new ClickHouse
-grants arrive with the new image. Details in `SELF-HOSTING.md`, "Upgrades and
+views are created counts only the events that arrived after that moment, and
+the first start can log one `history fill backfill-15m failed` with
+`additive_mismatch` (late events reach the new tables but not the frozen
+hourly ones the fill checks against; the history is complete and the line
+does not repeat). The new rollups take up to four rows for every hourly one.
+The new ClickHouse grants arrive with the new image. Details in `SELF-HOSTING.md`, "Upgrades and
 going back".
 
 ### Added
@@ -129,6 +132,11 @@ going back".
   reaches the collector as the Docker bridge gateway and so gets no country;
   the troubleshooting section and both platform guides now do.
   ([#6](https://github.com/OpenLabs-so/openanalytics/issues/6))
+
+### Coming later
+
+The hourly rollup tables this release stops writing are dropped in a later
+release; its notes will say what it asks of an install that skipped 0.7.0.
 
 ## [0.6.0] - 2026-09-05
 

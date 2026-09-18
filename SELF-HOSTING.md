@@ -77,7 +77,7 @@ part doing the work: a candidate publishes images under its own tag and sorts
 _above_ the release it is a candidate for, so `git tag --sort=-v:refname` lists
 `v0.1.0-rc.1` before `v0.1.0` and `git describe` would hand you the candidate.
 Dropping every tag with a `-` in it leaves only releases. To take a specific
-one, name it instead: `git checkout v0.6.0`.
+one, name it instead: `git checkout v0.7.0`.
 
 Add `--with-geoip` to that last command to download the country and city
 database in the same pass — see [GeoIP](#geoip). It is the one thing in the
@@ -116,7 +116,7 @@ because you checked out the tag before running it:
 > your version over the baked one, which still wins.
 
 ```sh
-grep OA_IMAGE .env                 # ghcr.io/openlabs-so/openanalytics, v0.6.0
+grep OA_IMAGE .env                 # ghcr.io/openlabs-so/openanalytics, v0.7.0
 docker compose pull
 docker compose up -d
 docker compose logs -f migrate     # schemas, both stores, from empty
@@ -643,7 +643,7 @@ Two things worth knowing before you rely on any of it:
 
 ```sh
 git fetch --tags
-git checkout v0.6.0            # the release you are moving to
+git checkout v0.7.0            # the release you are moving to
 cd infra/selfhost
 ./upgrade.sh                   # tells you what it costs, then does it
 ```
@@ -686,8 +686,12 @@ runs**, so it is worth knowing what you are watching:
 - **If the worker keeps running through the upgrade** — a platform redeploy, or
   `docker compose pull && docker compose up -d` without `./upgrade.sh` — one
   quarter hour can come out short: the one in which the new views were created
-  counts only the events that arrived after that moment. `./upgrade.sh` stops
-  everything first, so it has no such gap.
+  counts only the events that arrived after that moment. The first start can
+  also log one `history fill backfill-15m failed` with `additive_mismatch`:
+  the fill checks its sums against the hourly tables, and late events that
+  arrive after the switch reach the new tables but not the frozen hourly ones.
+  The history itself is complete, and the next start does not repeat the line.
+  `./upgrade.sh` stops everything first, so it has neither.
 - **ClickHouse gets new grants**, for the two rollups the worker writes itself.
   They are rendered when its container is created, and the new image tag is
   what recreates it, so `./upgrade.sh` and a platform redeploy deliver them
