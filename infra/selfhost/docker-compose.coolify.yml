@@ -404,8 +404,11 @@ services:
     # nothing. So a failed fill is logged and the stack starts anyway, and the
     # next start retries it. Stopping the stack there would stop the collector
     # too, and every event sent meanwhile would be lost for the sake of a report
-    # that can be completed later. No shell variables on purpose: a platform
-    # that interpolates this file would eat them.
+    # that can be completed later. Since 0.8.0 each fill proves itself against
+    # events_raw (the session one against the session facts), so a "failed"
+    # line means the filled history really disagrees with its source, never
+    # that the worker kept writing through the upgrade. No shell variables on
+    # purpose: a platform that interpolates this file would eat them.
     entrypoint:
       - sh
       - -c

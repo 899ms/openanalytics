@@ -4,7 +4,8 @@ import {
   createSessionFactsStore,
   SESSION_FACTS_TABLE,
   SESSION_ROLLUP_15M_TABLE,
-  SESSION_ROLLUP_1H_TABLE,
+  type RollupBucketAggregate,
+  type SessionFactsStore,
   type SessionRollupRow,
 } from './session-facts.ts'
 import { BackfillRefusedError } from './backfill-15m.ts'
@@ -49,9 +50,11 @@ import { hasBackfillRecord, recordBackfill } from './backfill-ledger.ts'
  *
  * ## Proof
  *
- * Per site, every hour wholly below the first quarter hour the site held before
- * this run — the hours this run filled — is compared with the stored hour
- * rollup, measure by measure. A disagreement fails the run (exit 3).
+ * Per site, every quarter hour this run was responsible for — those below the
+ * first quarter hour the site held before the run, and the gap buckets it
+ * wrote above it — is compared, measure by measure, with a fresh recompute from
+ * `session_facts_versions`: the facts every writer of this table computes
+ * from. A disagreement that survives one re-read fails the run (exit 3).
  *
  * ## Exit contract
  *
@@ -80,14 +83,17 @@ export interface BackfillSessionRollupsOptions {
   readonly settleSeconds?: number
   /**
    * Sites excluded from the equality gate, still reported. The same escape the
-   * 0025 backfill has, for the same situation: a site whose stored hour rollups
-   * outlived the facts they were computed from (a hand purge) can never satisfy
-   * "hour equals the sum of its quarters", because the quarters are recomputed
-   * from facts that are gone and the hour row is not.
+   * 0025 backfill has, for the same situation: a site whose stored rollups
+   * outlived the facts they were computed from (a hand purge).
    */
   readonly acceptSites?: readonly string[]
   /** Per-statement memory ceiling. Default 1.5 GB. */
   readonly maxMemoryBytes?: number
+  /**
+   * Test seam: awaited after every site's fill and before the equality gate
+   * reads anything. Production passes nothing.
+   */
+  readonly afterFill?: () => Promise<void>
 }
 
 export interface BackfillSessionSiteReport {
@@ -97,12 +103,12 @@ export interface BackfillSessionSiteReport {
   readonly minBucket: string | null
   readonly maxBucket: string | null
   /**
-   * Hour buckets whose stored 1h row does not equal the sum of the four
-   * quarters written for it. Empty is the passing state.
+   * Quarter hours whose stored row (at its current generation) does not equal
+   * a recompute from the session facts. Empty is the passing state.
    */
-  readonly mismatchedHours: readonly string[]
-  /** Hour buckets compared. Zero means the site had no stored hour rollups in the filled range. */
-  readonly comparedHours: number
+  readonly mismatchedBuckets: readonly string[]
+  /** Quarter hours compared; 0 on a dry run. */
+  readonly comparedBuckets: number
   readonly accepted: boolean
 }
 
@@ -269,6 +275,13 @@ export async function backfillSessionRollups15m(
     const reports: BackfillSessionSiteReport[] = []
     let rowsWritten = 0
 
+    // Fill every site first, then prove every site: the proof reads the table
+    // as the whole run left it.
+    const filled: Array<{
+      readonly site: SiteGap
+      readonly rows: readonly SessionRollupRow[]
+      readonly written: ReadonlySet<number>
+    }> = []
     for (const site of siteGaps) {
       const { siteId, loMs, hiMs } = site
 
@@ -281,46 +294,61 @@ export async function backfillSessionRollups15m(
           (stored) => stored.bucketSeconds,
         ),
       )
-      const rows: SessionRollupRow[] = buckets
-        .filter((bucket) => !present.has(bucket.bucketSeconds))
-        .map((bucket) => ({
-          site_id: siteId,
-          bucket_start: bucket.bucketStart,
-          generation: SESSION_BACKFILL_GENERATION,
-          sessions: bucket.sessions,
-          engaged_sessions: bucket.engagedSessions,
-          bounced_sessions: bucket.bouncedSessions,
-          pageviews: bucket.pageviews,
-          total_session_duration_ms: bucket.totalSessionDurationMs,
-          total_active_duration_ms: bucket.totalActiveDurationMs,
-          computed_at: computedAt,
-        }))
+      const gaps = buckets.filter((bucket) => !present.has(bucket.bucketSeconds))
+      const rows: SessionRollupRow[] = gaps.map((bucket) => ({
+        site_id: siteId,
+        bucket_start: bucket.bucketStart,
+        generation: SESSION_BACKFILL_GENERATION,
+        sessions: bucket.sessions,
+        engaged_sessions: bucket.engagedSessions,
+        bounced_sessions: bucket.bouncedSessions,
+        pageviews: bucket.pageviews,
+        total_session_duration_ms: bucket.totalSessionDurationMs,
+        total_active_duration_ms: bucket.totalActiveDurationMs,
+        computed_at: computedAt,
+      }))
 
       if (!dryRun && rows.length > 0) {
         await store.insertRollups({ unit: '15m', rows })
         rowsWritten += rows.length
       }
+      filled.push({ site, rows, written: new Set(gaps.map((bucket) => bucket.bucketSeconds)) })
+    }
 
+    if (!dryRun && options.afterFill !== undefined) await options.afterFill()
+
+    for (const { site, rows, written } of filled) {
+      const { siteId } = site
       const sorted = [...rows].sort((a, b) => a.bucket_start.localeCompare(b.bucket_start))
-      const comparison = dryRun
-        ? { mismatchedHours: [], comparedHours: 0 }
-        : await compareHours(client, siteId, site.cutMs)
+      let comparison: { mismatchedBuckets: readonly string[]; comparedBuckets: number } = {
+        mismatchedBuckets: [],
+        comparedBuckets: 0,
+      }
+      if (!dryRun) {
+        comparison = await compareBuckets(store, site, written)
+        // A session finalized between the two reads moves one side first. It
+        // agrees a moment later; a real disagreement does not.
+        if (comparison.mismatchedBuckets.length > 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 1000))
+          comparison = await compareBuckets(store, site, written)
+        }
+      }
 
       reports.push({
         siteId,
         buckets: rows.length,
         minBucket: sorted[0]?.bucket_start ?? null,
         maxBucket: sorted[sorted.length - 1]?.bucket_start ?? null,
-        mismatchedHours: comparison.mismatchedHours,
-        comparedHours: comparison.comparedHours,
+        mismatchedBuckets: comparison.mismatchedBuckets,
+        comparedBuckets: comparison.comparedBuckets,
         accepted: accepted.has(siteId),
       })
       logger.info('backfill_sessions_15m_site_done', {
         store: 'clickhouse',
         site_id: siteId,
         buckets: rows.length,
-        compared_hours: comparison.comparedHours,
-        mismatched_hours: comparison.mismatchedHours.length,
+        compared_buckets: comparison.comparedBuckets,
+        mismatched_buckets: comparison.mismatchedBuckets.length,
       })
     }
 
@@ -329,7 +357,7 @@ export async function backfillSessionRollups15m(
       : rowsWritten
     const noop = plannedOrWritten === 0
     const failing = reports.filter(
-      (report) => !report.accepted && report.mismatchedHours.length > 0,
+      (report) => !report.accepted && report.mismatchedBuckets.length > 0,
     )
 
     let ledgerRecorded = false
@@ -347,7 +375,7 @@ export async function backfillSessionRollups15m(
             .sort()[0] ?? null,
         mismatched: failing.map((report) => ({
           site: report.siteId,
-          hours: report.mismatchedHours.length,
+          buckets: report.mismatchedBuckets.length,
         })),
       })
     }
@@ -366,8 +394,8 @@ export async function backfillSessionRollups15m(
     if (!dryRun && failing.length > 0) {
       throw new BackfillRefusedError(
         'additive_mismatch',
-        `backfill finished but an hour rollup does not equal the sum of its four quarters: ${failing
-          .map((report) => `${report.siteId} (${report.mismatchedHours.join(', ')})`)
+        `backfill finished but a filled quarter hour disagrees with the session facts: ${failing
+          .map((report) => `${report.siteId} (${report.mismatchedBuckets.join(', ')})`)
           .join('; ')}. Report: ${JSON.stringify(result)}`,
       )
     }
@@ -399,75 +427,64 @@ async function recordRun(
   }
 }
 
+type Measures = Readonly<Record<(typeof MEASURES)[number], number>>
+
+const measuresOf = (bucket: RollupBucketAggregate): Measures => ({
+  sessions: bucket.sessions,
+  engaged_sessions: bucket.engagedSessions,
+  bounced_sessions: bucket.bouncedSessions,
+  pageviews: bucket.pageviews,
+  total_session_duration_ms: bucket.totalSessionDurationMs,
+  total_active_duration_ms: bucket.totalActiveDurationMs,
+})
+
 /**
- * Per site, the hour buckets where the stored 1h rollup and the sum of the four
- * 15m rows disagree on any measure — over the hours wholly below the first
- * quarter hour the site held before this run (`cutMs`), which are the hours
- * this run filled. Null means the site held nothing, so every hour is in range.
+ * Per site, the quarter hours where the stored 15m rollup (at its current
+ * generation) and a fresh recompute from `session_facts_versions` disagree on
+ * any measure — over every quarter hour of `[loMs, hiMs)` that this run was
+ * responsible for: those below the first quarter hour the site held before the
+ * run (`cutMs`; null means it held nothing, so all of them), plus the gap
+ * buckets it wrote above that.
  *
- * Both sides are read at their current generation, `argMax` over generation
- * exactly as the reader does, so a superseded row cannot enter the comparison.
- * Only hours the 1h table actually holds are compared: an hour with no stored
- * row is not a mismatch, it is a bucket the finalizer never had reason to
- * write.
+ * The facts are the reference because they are what every writer computes
+ * from. A finalizer pass that supersedes a backfilled row meanwhile computes
+ * from the same facts, so it agrees; a session finalized while the run is going
+ * changes both sides. A missing bucket reads as zeros on its side, so a gap
+ * left behind (facts, no row) fails, and so does a row with no facts behind it.
+ *
+ * (Until v0.8.0 this compared hours against `session_rollups_1h`, which
+ * migration 0027 froze and 0029 dropped.)
  */
-async function compareHours(
-  client: ClickHouseClient,
-  siteId: string,
-  cutMs: number | null,
-): Promise<{ mismatchedHours: readonly string[]; comparedHours: number }> {
-  const conditions = MEASURES.map((measure) => `h.${measure} != q.${measure}`).join(' OR ')
-  const current = (alias: string): string =>
-    MEASURES.map(
-      (measure) => `argMax(${alias}.${measure}, ${alias}.generation) AS ${measure}`,
-    ).join(', ')
-  // Far enough ahead to mean "no bound" and still a valid DateTime.
-  const beforeSeconds = cutMs === null ? 4_000_000_000 : Math.floor(cutMs / 3_600_000) * 3600
-
-  // The quarters of one site at their current generation, folded up to hours.
-  const quartersByHour = `
-         SELECT toStartOfHour(v.bucket_start) AS bucket_start,
-                ${MEASURES.map((measure) => `sum(v.${measure}) AS ${measure}`).join(', ')}
-           FROM (
-             SELECT sq.bucket_start AS bucket_start,
-                    ${current('sq')}
-               FROM ${SESSION_ROLLUP_15M_TABLE} AS sq
-              WHERE sq.site_id = {siteId:String}
-                AND sq.bucket_start < toDateTime({before:UInt32}, 'UTC')
-              GROUP BY sq.site_id, sq.bucket_start
-           ) AS v
-          GROUP BY bucket_start`
-
-  // The stored hours of one site at their current generation.
-  const hours = `
-         SELECT sr.bucket_start AS bucket_start,
-                ${current('sr')}
-           FROM ${SESSION_ROLLUP_1H_TABLE} AS sr
-          WHERE sr.site_id = {siteId:String}
-            AND sr.bucket_start < toDateTime({before:UInt32}, 'UTC')
-          GROUP BY sr.site_id, sr.bucket_start`
-
-  const params = { siteId, before: beforeSeconds }
-  const rows = await queryRows<{ bucket: string }>(
-    client,
-    `SELECT formatDateTime(h.bucket_start, '%F %T') AS bucket
-       FROM (${hours}) AS h
-       INNER JOIN (${quartersByHour}) AS q ON h.bucket_start = q.bucket_start
-      WHERE ${conditions}
-      ORDER BY bucket`,
-    params,
+async function compareBuckets(
+  store: SessionFactsStore,
+  site: {
+    readonly siteId: string
+    readonly cutMs: number | null
+    readonly loMs: number
+    readonly hiMs: number
+  },
+  written: ReadonlySet<number>,
+): Promise<{ mismatchedBuckets: readonly string[]; comparedBuckets: number }> {
+  const range = { siteId: site.siteId, unit: '15m' as const, loMs: site.loMs, hiMs: site.hiMs }
+  const expected = new Map(
+    (await store.aggregateRollupBuckets(range)).map((bucket) => [bucket.bucketSeconds, bucket]),
   )
-
-  const [countRow] = await queryRows<{ c: string }>(
-    client,
-    `SELECT count() AS c
-       FROM (${hours}) AS h
-       INNER JOIN (${quartersByHour}) AS q ON h.bucket_start = q.bucket_start`,
-    params,
+  const stored = new Map(
+    (await store.readStoredRollups(range)).map((bucket) => [bucket.bucketSeconds, bucket]),
   )
+  const cutSeconds = site.cutMs === null ? Number.POSITIVE_INFINITY : site.cutMs / 1000
 
-  return {
-    mismatchedHours: rows.map((row) => row.bucket),
-    comparedHours: Number(countRow?.c ?? 0),
+  const mismatched: string[] = []
+  let compared = 0
+  for (const seconds of new Set([...expected.keys(), ...stored.keys()])) {
+    if (seconds >= cutSeconds && !written.has(seconds)) continue
+    compared += 1
+    const a = expected.get(seconds)
+    const b = stored.get(seconds)
+    const x = a === undefined ? null : measuresOf(a)
+    const y = b === undefined ? null : measuresOf(b)
+    const differs = MEASURES.some((measure) => (x?.[measure] ?? 0) !== (y?.[measure] ?? 0))
+    if (differs) mismatched.push((a ?? b)?.bucketStart ?? String(seconds))
   }
+  return { mismatchedBuckets: mismatched.sort(), comparedBuckets: compared }
 }

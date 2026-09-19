@@ -27,8 +27,9 @@ import { migrateClickHouse } from './migrate.ts'
  * fills GAPS — a (site, quarter hour) with raw events and no rollup row — and
  * never touches a pair that holds a row, so it cannot double a count and a
  * second run writes nothing. Exit codes: 0 done (including "nothing to fill"),
- * 2 refused by a guard (nothing was written), 3 the fill ran but the additive
- * sums disagree with the hour twins, 1 any other failure.
+ * 2 refused by a guard (nothing was written), 3 the fill ran but what it left
+ * disagrees with `events_raw` (or, with `--sessions`, with the session facts),
+ * 1 any other failure.
  *
  * `--if-needed` is the automated mode the self-hosted migrate container runs
  * on every start: no refusal at all, whatever the state — empty targets, targets

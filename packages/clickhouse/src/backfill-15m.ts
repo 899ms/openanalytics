@@ -9,7 +9,7 @@ import { hasBackfillRecord, recordBackfill } from './backfill-ledger.ts'
  * A materialized view aggregates only what is inserted after it exists, so the
  * eight `*_15m` targets 0025 creates are empty for every event already stored.
  * This fills that history with the same SELECT each view runs, one month
- * partition at a time, and then proves the result against the hour twins.
+ * partition at a time, and then proves the result against `events_raw` itself.
  *
  * ## What it fills: the gap, per site and quarter hour
  *
@@ -66,14 +66,32 @@ import { hasBackfillRecord, recordBackfill } from './backfill-ledger.ts'
  *
  * ## Proof
  *
- * For each family the additive measures are compared per site between the 15m
- * table and the hour twin, over the hours that lie wholly below the first
- * quarter hour the site already held before this run — the hours this run
- * filled — and above the twin's first complete bucket. A mismatch fails the
- * run (exit 3). Unique-visitor states are reported merged over the same window
- * but not gated on: `uniq` is an estimator, and equality of two merges over
- * differently partitioned states is expected but is not the invariant this
- * step exists to prove.
+ * For each family, every `(site_id, quarter hour)` below the live quarter hour
+ * is compared with `events_raw` — the view's own SELECT, run over the raw rows
+ * and summed per pair — additive measure by additive measure, one month
+ * partition at a time. The raw table is the reference because it is the one
+ * thing that is never behind: it is the table every view reads, so an event
+ * that arrives while the run is going (a late event drained from the queue
+ * during an upgrade, say) lands in the raw table and in the 15m table in the
+ * same insert, and the two stay equal.
+ *
+ * (Until v0.8.0 the reference was the hour twin. Migration 0027 froze those
+ * tables, so every event delivered after it — a queue backlog drained during
+ * the upgrade — was in the 15m rows and not in the reference, and the run
+ * reported "history fill failed" over data that was right. Migration 0029 then
+ * dropped the hour tables altogether.)
+ *
+ * A pair fails the gate when the two sides disagree in any way except one: a
+ * pair the site already held before the run (at or above its first quarter
+ * hour) may hold FEWER events than raw. That is the seam, and the only state a
+ * gap fill leaves by design. Every other difference — a pair short below the
+ * site's first quarter hour, a pair the rollup holds and raw does not, a pair
+ * holding more than raw (a double count), a raw pair with no rollup row at all
+ * — is a failure (exit 3). A family that fails is read once more after a short
+ * pause before the run says so, so an insert caught between its raw part and
+ * its view's part cannot fail it. Unique-visitor states are not compared:
+ * `uniq` is an estimator, and it is the additive measures that a double or a
+ * missing fill moves.
  *
  * A run that wrote something records itself in `backfill_ledger` (0028) as
  * `rollups_15m`; so does the first run that found nothing to write. The ledger
@@ -88,8 +106,6 @@ import { hasBackfillRecord, recordBackfill } from './backfill-ledger.ts'
 export interface FifteenMinuteRollupSpec {
   /** The 15m target the view writes to. */
   readonly table: string
-  /** The hour twin the equality report compares against. */
-  readonly hourTwin: string
   /**
    * The SELECT list of the materialized view, verbatim, bucket expression
    * included. `{bucket}` is substituted with the bucket expression so a test can
@@ -100,7 +116,11 @@ export interface FifteenMinuteRollupSpec {
   readonly where: string
   /** The view's GROUP BY list without the keywords. */
   readonly groupBy: string
-  /** Integer additive measures the equality report sums and compares exactly. */
+  /**
+   * Integer additive measures the equality gate sums and compares exactly. The
+   * first is the family's event count, which decides whether a pair is short
+   * (a seam) or over (a double count).
+   */
   readonly additiveColumns: readonly string[]
   /** Float additive measures, compared within a relative tolerance. */
   readonly floatAdditiveColumns: readonly string[]
@@ -120,7 +140,6 @@ const IDENTITY = "if(user_id != '', user_id, anonymous_id)"
 export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   {
     table: 'metrics_15m',
-    hourTwin: 'metrics_1h',
     select: `site_id, {bucket} AS bucket_start, type AS event_type, count() AS events, countIf(billable = 1) AS billable_events, uniqState(${IDENTITY}) AS visitors`,
     where: '',
     groupBy: 'site_id, bucket_start, event_type',
@@ -130,7 +149,6 @@ export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   },
   {
     table: 'pages_15m',
-    hourTwin: 'pages_1h',
     select: `site_id, {bucket} AS bucket_start, page_path, count() AS views, uniqState(${IDENTITY}) AS visitors`,
     where: "type = 'page_view'",
     groupBy: 'site_id, bucket_start, page_path',
@@ -140,7 +158,6 @@ export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   },
   {
     table: 'sources_15m',
-    hourTwin: 'sources_1h',
     select: `site_id, {bucket} AS bucket_start, referrer_domain, utm_source, utm_medium, utm_campaign, count() AS views, uniqState(${IDENTITY}) AS visitors`,
     where: "type = 'page_view'",
     groupBy: 'site_id, bucket_start, referrer_domain, utm_source, utm_medium, utm_campaign',
@@ -150,7 +167,6 @@ export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   },
   {
     table: 'geography_15m',
-    hourTwin: 'geography_1h',
     select: `site_id, {bucket} AS bucket_start, country, city, count() AS views, uniqState(${IDENTITY}) AS visitors`,
     where: "type = 'page_view'",
     groupBy: 'site_id, bucket_start, country, city',
@@ -160,7 +176,6 @@ export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   },
   {
     table: 'devices_15m',
-    hourTwin: 'devices_1h',
     select: `site_id, {bucket} AS bucket_start, device_type, browser, os, count() AS views, uniqState(${IDENTITY}) AS visitors`,
     where: "type = 'page_view'",
     groupBy: 'site_id, bucket_start, device_type, browser, os',
@@ -170,7 +185,6 @@ export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   },
   {
     table: 'custom_events_15m',
-    hourTwin: 'custom_events_1h',
     select: `site_id, {bucket} AS bucket_start, name AS event_name, type AS event_type, count() AS events, countIf(billable = 1) AS billable_events, uniqState(${IDENTITY}) AS visitors`,
     where: "name != ''",
     groupBy: 'site_id, bucket_start, event_name, event_type',
@@ -180,7 +194,6 @@ export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   },
   {
     table: 'performance_15m',
-    hourTwin: 'performance_1h',
     select: `site_id, {bucket} AS bucket_start, JSONExtractString(properties, 'oa_metric') AS metric, device_type, count() AS samples, sum(JSONExtractFloat(properties, 'oa_value')) AS value_sum, quantilesTDigestState(0.5, 0.75, 0.9, 0.95, 0.99)(JSONExtractFloat(properties, 'oa_value')) AS value_quantiles, countIf(JSONExtractString(properties, 'oa_rating') = 'good') AS good_samples, countIf(JSONExtractString(properties, 'oa_rating') = 'needs-improvement') AS needs_improvement_samples, countIf(JSONExtractString(properties, 'oa_rating') = 'poor') AS poor_samples`,
     where: "type = 'web_vital' AND metric != ''",
     groupBy: 'site_id, bucket_start, metric, device_type',
@@ -190,7 +203,6 @@ export const FIFTEEN_MINUTE_ROLLUPS: readonly FifteenMinuteRollupSpec[] = [
   },
   {
     table: 'custom_event_samples_15m',
-    hourTwin: 'custom_event_samples_1h',
     select: `site_id, {bucket} AS bucket_start, name AS event_name, type AS event_type, count() AS events, max(occurred_at) AS last_seen_at, argMaxState(page_path, occurred_at) AS sample_page_path, argMaxState(properties, occurred_at) AS sample_properties`,
     where: "name != ''",
     groupBy: 'site_id, bucket_start, event_name, event_type',
@@ -295,10 +307,10 @@ export interface BackfillFifteenMinuteOptions {
   /** Seconds between the two `events_raw` readings. Default 10. */
   readonly settleSeconds?: number
   /**
-   * Sites whose raw rows were purged by hand after their hour rollups were
-   * written (the 2026-08-25 cleanup, ADR-0074): their hour twin holds counts
-   * the raw table no longer can, so they are listed in the report but excluded
-   * from the equality gate.
+   * Sites excluded from the equality gate, still listed in the report. For a
+   * site whose raw rows were purged by hand after its rollups were written
+   * (the 2026-08-25 cleanup, ADR-0074): its view-written rows hold counts the
+   * raw table no longer can.
    */
   readonly acceptSites?: readonly string[]
   /** Per-statement memory ceiling. Default 1.5 GB. */
@@ -307,6 +319,12 @@ export interface BackfillFifteenMinuteOptions {
   readonly maxThreads?: number
   /** The run's clock, for tests. Default `Date.now()`. */
   readonly nowMs?: number
+  /**
+   * Test seam: awaited after the fill and before the equality gate reads
+   * anything, so a test can put an insert exactly where a running worker puts
+   * one during an upgrade. Production passes nothing.
+   */
+  readonly afterFill?: () => Promise<void>
 }
 
 export interface BackfillTableReport {
@@ -319,12 +337,14 @@ export interface BackfillTableReport {
   readonly buckets: number
   readonly minBucket: string | null
   readonly maxBucket: string | null
-  /** The additive equality window's start against the hour twin, or null when the twin is empty. */
-  readonly comparedFrom: string | null
+  /** `(site, quarter hour)` pairs compared with `events_raw`; 0 on a dry run. */
+  readonly comparedPairs: number
+  /** Pairs the site held before the run that hold fewer events than raw: the seam. */
+  readonly seamPairs: number
+  readonly seamEvents: number
+  /** Sites with at least one pair that fails the gate. Empty is the passing state. */
   readonly mismatchedSites: readonly string[]
   readonly acceptedMismatchSites: readonly string[]
-  readonly visitors15m: number | null
-  readonly visitors1h: number | null
 }
 
 /**
@@ -588,15 +608,17 @@ async function run(
   const tables: BackfillTableReport[] = []
   let witness: BackfillWitness | null = null
   if (!noop) {
-    const liveHour = Math.floor(liveFromSeconds / 3600) * 3600
+    if (!dryRun && options.afterFill !== undefined) await options.afterFill()
     for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
       tables.push(
         await reportTable(client, spec, {
           accepted,
           cuts: cuts.get(spec.table) ?? new Map(),
-          liveHourSeconds: liveHour,
+          partitions,
+          liveFromSeconds,
           gapRows: gapRows.get(spec.table) ?? 0,
           compare: !dryRun,
+          recheckMs: Math.max(settleSeconds, 1) * 1000,
         }),
       )
     }
@@ -647,7 +669,7 @@ async function run(
   if (!dryRun && failing.length > 0) {
     throw new BackfillRefusedError(
       'additive_mismatch',
-      `backfill finished but the additive sums disagree with the hour twin: ${failing
+      `backfill finished but the filled rollups disagree with events_raw: ${failing
         .map((table) => `${table.table} (${table.mismatchedSites.join(', ')})`)
         .join('; ')}. Report: ${JSON.stringify(result)}`,
     )
@@ -723,9 +745,11 @@ async function reportTable(
   input: {
     readonly accepted: ReadonlySet<string>
     readonly cuts: ReadonlyMap<string, number>
-    readonly liveHourSeconds: number
+    readonly partitions: readonly number[]
+    readonly liveFromSeconds: number
     readonly gapRows: number
     readonly compare: boolean
+    readonly recheckMs: number
   },
 ): Promise<BackfillTableReport> {
   const [shape] = await queryRows<{
@@ -749,104 +773,150 @@ async function reportTable(
     minBucket: shape?.min_bucket ?? null,
     maxBucket: shape?.max_bucket ?? null,
   }
-
-  // The comparison window starts at the hour twin's first COMPLETE bucket: a
-  // view created mid-hour saw only part of its first hour, and the samples
-  // family (0021) was created onto a populated table, so its first bucket is a
-  // fragment by construction.
-  const twinMin = input.compare
-    ? await scalar(
-        client,
-        `SELECT if(count() = 0, NULL, toString(min(bucket_start) + INTERVAL 1 HOUR)) FROM ${spec.hourTwin}`,
-      )
-    : null
-  if (twinMin === null) {
+  if (!input.compare) {
     return {
       ...base,
-      comparedFrom: null,
+      comparedPairs: 0,
+      seamPairs: 0,
+      seamEvents: 0,
       mismatchedSites: [],
       acceptedMismatchSites: [],
-      visitors15m: null,
-      visitors1h: null,
     }
   }
 
-  // And it ends, per site, at the hour of the first quarter hour the site held
-  // before this run: every hour wholly below it was filled by this run from
-  // raw, while an hour the view had reached holds whatever the view saw and
-  // the hour twin — frozen since 0027 — cannot be its reference any more. The
-  // live hour caps every site, since the twin has not seen it either.
-  const sites = [...input.cuts.keys()]
-  const hours = sites.map((site) => {
-    const cut = input.cuts.get(site) ?? input.liveHourSeconds
-    return Math.min(Math.floor(cut / 3600) * 3600, input.liveHourSeconds)
-  })
-  const windowParams = { cut_sites: sites, cut_hours: hours, live_hour: input.liveHourSeconds }
-  const inWindow = (alias: string) =>
-    `${alias}.bucket_start >= toDateTime('${twinMin}', 'UTC')
-        AND ${alias}.bucket_start < toDateTime(transform(toString(${alias}.site_id), {cut_sites:Array(String)}, {cut_hours:Array(UInt32)}, {live_hour:UInt32}), 'UTC')`
-
-  const measures = [...spec.additiveColumns, ...spec.floatAdditiveColumns]
-  const sums = measures.map((column) => `sum(t.${column}) AS sum_${column}`).join(', ')
-  const perSite = async (table: string) =>
-    await queryRows<Record<string, string>>(
-      client,
-      // Qualified through `t` and aliased away from the column names for the
-      // reason every gateway operation is (ADR-0011): an alias that shadows
-      // its source column turns a later bare reference into ILLEGAL_AGGREGATION.
-      `SELECT toString(t.site_id) AS site, ${sums}
-         FROM ${table} AS t
-        WHERE ${inWindow('t')}
-        GROUP BY t.site_id`,
-      windowParams,
-    )
-  const fifteen = new Map((await perSite(spec.table)).map((row) => [row['site'] ?? '', row]))
-  const hour = new Map((await perSite(spec.hourTwin)).map((row) => [row['site'] ?? '', row]))
+  let gate = await gateAgainstRaw(client, spec, input)
+  if (gate.failing.length > 0) {
+    // One insert is two parts — the raw rows, then each view's rows — and a
+    // read can fall between them. Such a pair agrees a moment later; a real
+    // disagreement does not.
+    await sleep(input.recheckMs)
+    gate = await gateAgainstRaw(client, spec, input)
+  }
 
   const mismatched: string[] = []
   const acceptedMismatch: string[] = []
-  for (const site of new Set([...fifteen.keys(), ...hour.keys()])) {
-    const a = fifteen.get(site)
-    const b = hour.get(site)
-    let equal = a !== undefined && b !== undefined
-    if (equal && a && b) {
-      for (const column of spec.additiveColumns) {
-        if (a[`sum_${column}`] !== b[`sum_${column}`]) equal = false
-      }
-      for (const column of spec.floatAdditiveColumns) {
-        const x = Number(a[`sum_${column}`])
-        const y = Number(b[`sum_${column}`])
-        const tolerance = Math.max(Math.abs(x), Math.abs(y), 1) * 1e-9
-        if (Math.abs(x - y) > tolerance) equal = false
-      }
-    }
-    if (!equal) {
-      if (input.accepted.has(site)) acceptedMismatch.push(site)
-      else mismatched.push(site)
-    }
+  for (const site of gate.failing) {
+    if (input.accepted.has(site)) acceptedMismatch.push(site)
+    else mismatched.push(site)
   }
-
-  let visitors15m: number | null = null
-  let visitors1h: number | null = null
-  if (spec.hasVisitors) {
-    const merged = async (table: string) =>
-      Number(
-        await scalar(
-          client,
-          `SELECT uniqMerge(t.visitors) FROM ${table} AS t WHERE ${inWindow('t')}`,
-          windowParams,
-        ),
-      )
-    visitors15m = await merged(spec.table)
-    visitors1h = await merged(spec.hourTwin)
-  }
-
   return {
     ...base,
-    comparedFrom: twinMin,
+    comparedPairs: gate.pairs,
+    seamPairs: gate.seamPairs,
+    seamEvents: gate.seamEvents,
     mismatchedSites: mismatched.sort(),
     acceptedMismatchSites: acceptedMismatch.sort(),
-    visitors15m,
-    visitors1h,
   }
+}
+
+/**
+ * One family against `events_raw`, pair by pair, one month partition at a
+ * time (the fill's own partitioning, so no statement builds more than a month
+ * of pairs).
+ *
+ * The raw side is the view's SELECT run over the raw rows and summed per pair,
+ * so what it produces is by construction what the view would have written. A
+ * pair is `seam` when the site held it before the run (at or above its first
+ * quarter hour, `cut`) and it holds fewer events than raw with no measure
+ * above raw's; it is `bad` when it differs in any other way.
+ */
+async function gateAgainstRaw(
+  client: ClickHouseClient,
+  spec: FifteenMinuteRollupSpec,
+  input: {
+    readonly cuts: ReadonlyMap<string, number>
+    readonly partitions: readonly number[]
+    readonly liveFromSeconds: number
+  },
+): Promise<{
+  readonly pairs: number
+  readonly seamPairs: number
+  readonly seamEvents: number
+  readonly failing: readonly string[]
+}> {
+  const select = spec.select.replace('{bucket}', FIFTEEN_MINUTE_BUCKET)
+  const measures = [...spec.additiveColumns, ...spec.floatAdditiveColumns]
+  const count = spec.additiveColumns[0] ?? 'events'
+  const sums = (alias: string) =>
+    measures.map((column) => `sum(${alias}.${column}) AS s_${column}`).join(', ')
+  const equal = [
+    ...spec.additiveColumns.map((column) => `r.s_${column} = m.s_${column}`),
+    ...spec.floatAdditiveColumns.map(
+      (column) =>
+        `abs(r.s_${column} - m.s_${column}) <= greatest(abs(r.s_${column}), abs(m.s_${column}), 1) * 1e-9`,
+    ),
+  ].join(' AND ')
+  const notAbove = [
+    ...spec.additiveColumns.map((column) => `m.s_${column} <= r.s_${column}`),
+    ...spec.floatAdditiveColumns.map((column) => `m.s_${column} <= r.s_${column} + 1e-9`),
+  ].join(' AND ')
+  const where = spec.where.length > 0 ? `${spec.where} AND ` : ''
+  const sites = [...input.cuts.keys()]
+  const params = {
+    live: input.liveFromSeconds,
+    cut_sites: sites,
+    cut_secs: sites.map((site) => input.cuts.get(site) ?? 0),
+  }
+
+  let pairs = 0
+  let seamPairs = 0
+  let seamEvents = 0
+  const failing = new Set<string>()
+  for (const yyyymm of input.partitions) {
+    const rows = await queryRows<{
+      site: string
+      pairs: string
+      seam_pairs: string
+      seam_events: string
+      bad_pairs: string
+    }>(
+      client,
+      // `present` tells an absent side from a side of zeros, and the pair's
+      // own site and bucket are taken from whichever side has it.
+      // A site absent from the cut map held nothing before the run, so every
+      // pair of it is one the run filled: its cut is the live bound.
+      `SELECT toString(site) AS site,
+              count() AS pairs,
+              countIf(seam) AS seam_pairs,
+              sumIf(r_count - m_count, seam) AS seam_events,
+              countIf(NOT ok AND NOT seam) AS bad_pairs
+         FROM (
+           SELECT if(r.present = 1, r.site_id, m.site_id) AS site,
+                  if(r.present = 1, r.b, m.b) AS b,
+                  r.s_${count} AS r_count,
+                  m.s_${count} AS m_count,
+                  r.present = 1 AND m.present = 1 AND ${equal} AS ok,
+                  r.present = 1 AND m.present = 1 AND NOT (${equal}) AND ${notAbove}
+                    AND toUnixTimestamp(b) >= transform(toString(site), {cut_sites:Array(String)}, {cut_secs:Array(UInt32)}, {live:UInt32})
+                    AS seam
+             FROM (
+               SELECT v.site_id AS site_id, v.bucket_start AS b, 1 AS present, ${sums('v')}
+                 FROM (SELECT ${select}
+                         FROM events_raw
+                        WHERE ${where}toYYYYMM(occurred_at) = ${String(yyyymm)}
+                          AND occurred_at < toDateTime({live:UInt32}, 'UTC')
+                        GROUP BY ${spec.groupBy}) AS v
+                GROUP BY v.site_id, v.bucket_start
+             ) AS r
+             FULL OUTER JOIN (
+               SELECT t.site_id AS site_id, t.bucket_start AS b, 1 AS present, ${sums('t')}
+                 FROM ${spec.table} AS t
+                WHERE toYYYYMM(t.bucket_start) = ${String(yyyymm)}
+                  AND t.bucket_start < toDateTime({live:UInt32}, 'UTC')
+                GROUP BY t.site_id, t.bucket_start
+             ) AS m
+               ON r.site_id = m.site_id AND r.b = m.b
+         )
+        GROUP BY site
+       SETTINGS join_use_nulls = 0`,
+      params,
+    )
+    for (const row of rows) {
+      pairs += Number(row.pairs)
+      seamPairs += Number(row.seam_pairs)
+      seamEvents += Number(row.seam_events)
+      if (Number(row.bad_pairs) > 0) failing.add(row.site)
+    }
+  }
+  return { pairs, seamPairs, seamEvents, failing: [...failing].sort() }
 }
