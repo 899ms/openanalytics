@@ -1,7 +1,6 @@
 import {
   SESSION_ROLLUP_15M_TABLE,
   SESSION_ROLLUP_1D_TABLE,
-  SESSION_ROLLUP_1H_TABLE,
   SESSION_ROLLUP_BUCKET_FN,
   type SessionRollupUnit,
 } from '@openanalytics/clickhouse'
@@ -85,13 +84,12 @@ describe('session rollup unit dispatch (ADR-0079 steps 2 and 4)', () => {
     expect(Object.keys(SESSION_ROLLUP_BUCKET_FN)).not.toContain('1h')
   })
 
-  it('keeps the rollup table names distinct, hour included', () => {
-    // The hour TABLE outlives the hour UNIT. It is read by the 15m backfill's
-    // equality gate and by the deletion workflow, so its name has to stay
-    // correct and distinct even though nothing writes it.
-    const tables = [SESSION_ROLLUP_15M_TABLE, SESSION_ROLLUP_1H_TABLE, SESSION_ROLLUP_1D_TABLE]
-    expect(tables).toEqual(['session_rollups_15m', 'session_rollups_1h', 'session_rollups_1d'])
-    expect(new Set(tables).size).toBe(3)
+  it('keeps the rollup table names distinct', () => {
+    // The hour table outlived the hour unit by one release (0027 froze it) and
+    // left with ClickHouse migration 0029, together with its constant.
+    const tables = [SESSION_ROLLUP_15M_TABLE, SESSION_ROLLUP_1D_TABLE]
+    expect(tables).toEqual(['session_rollups_15m', 'session_rollups_1d'])
+    expect(new Set(tables).size).toBe(2)
   })
 
   it('widths the revenue units the same way, and in the same order of size', () => {

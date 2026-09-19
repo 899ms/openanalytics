@@ -4,7 +4,7 @@ import { sanitizeUrl } from './event-sanitize.ts'
  * What a client-sent referrer becomes on the way into the pipeline (ADR-0028).
  *
  * Two rules, and one definition of each, because `referrer_domain` is a
- * *grouping key*: it is the ORDER BY prefix of `sources_1h`/`sources_1d`, the
+ * *grouping key*: it is the ORDER BY prefix of `sources_15m`/`sources_1d`, the
  * first-touch dimension of a session fact, a column of the visitor trail and a
  * field on the realtime feed. Anything that writes it differently from anything
  * else silently splits one acquisition source into several rows that no reader
@@ -26,7 +26,7 @@ import { sanitizeUrl } from './event-sanitize.ts'
  * serving a cached `oa.js`, and the browser is the one participant whose code
  * we cannot re-deploy. Why not the read path: a rollup key that has to be
  * repaired at query time is a key that also has to be repaired in every future
- * reader, and `sources_1h` groups *before* any reader sees a row.
+ * reader, and `sources_15m` groups *before* any reader sees a row.
  *
  * What this module deliberately does **not** do: move referrer attribution to
  * the session grain. It makes the per-EVENT value correct and nothing more.

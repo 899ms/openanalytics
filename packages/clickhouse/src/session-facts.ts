@@ -32,12 +32,6 @@ import type { SessionizerEvent } from '@openanalytics/domain'
 
 export const SESSION_FACTS_TABLE = 'session_facts_versions'
 export const SESSION_ROLLUP_15M_TABLE = 'session_rollups_15m'
-/**
- * Frozen since ADR-0079 step 4: nothing writes this table (`'1h'` is not a
- * `SessionRollupUnit` any more). It is still read — by the 15m backfill's
- * equality gate and by the deletion workflow — so the name stays.
- */
-export const SESSION_ROLLUP_1H_TABLE = 'session_rollups_1h'
 export const SESSION_ROLLUP_1D_TABLE = 'session_rollups_1d'
 
 /** A `session_facts_versions` row (migration 0013). */
@@ -79,7 +73,7 @@ export interface SessionFactRow {
   readonly computed_at: string
 }
 
-/** A `session_rollups_1h`/`_1d` row (migration 0014). */
+/** A `session_rollups_15m`/`_1d` row (migrations 0014 and 0026). */
 export interface SessionRollupRow {
   readonly site_id: string
   readonly bucket_start: string
@@ -149,10 +143,9 @@ export interface StoredRollupBucket extends RollupBucketAggregate {
  * The grains the finalizer writes.
  *
  * `'1h'` left this union in ADR-0079 step 4: the hour views were dropped
- * (migration 0027) and the finalizer stopped writing `session_rollups_1h`, so
- * the hour grain is frozen history rather than a unit anything produces. The
- * table constant below survives the union on purpose — the 15m backfill's
- * equality gate still reads it, and so does the deletion workflow.
+ * (migration 0027) and the finalizer stopped writing `session_rollups_1h`.
+ * The table itself was dropped by migration 0029 (v0.8.0), once the 15m
+ * backfill's equality gate stopped reading it.
  */
 export type SessionRollupUnit = '15m' | '1d'
 

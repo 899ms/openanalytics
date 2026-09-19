@@ -16,12 +16,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 /**
  * The Milestone 7 additive rollup family, proven with data (plan items 1-2).
  *
- * **Reads both grains, and recreates the hour views to do it.** Migration 0027
- * (ADR-0079 step 4) dropped the eight `*_1h_mv`, so a freshly migrated database
- * has empty hour tables and nothing that fills them. `beforeAll` rebuilds those
- * views from the same specs the backfill uses, which is what makes this suite a
- * model of an UPGRADED install rather than a fresh one — the only kind of
- * install where hour rows exist, and the reason the hour tables are kept.
+ * **Reads the grains that exist: fifteen minutes and one day.** Migration 0027
+ * (ADR-0079 step 4) dropped the eight `*_1h_mv` and 0029 (v0.8.0) the hour
+ * tables themselves. Until then this suite rebuilt the hour views in
+ * `beforeAll` to model an upgraded install, because the 15m backfill proved
+ * itself against the hour twins; it proves itself against `events_raw` now,
+ * so the model is no longer needed and every assertion reads what production
+ * reads.
  *
  * The bootstrap test (`clickhouse-analytics.test.ts`) proves the schema builds
  * and every dedup-bearing table carries the window. This one proves the three
@@ -151,33 +152,6 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       database,
       clickhouse_settings: { async_insert: 0, wait_for_async_insert: 1 },
     })
-
-    // The eight hour materialized views, rebuilt after migration 0027 dropped
-    // them (ADR-0079 step 4).
-    //
-    // This suite is where the hour and the quarter are compared, and after step
-    // 4 a freshly migrated database has the hour TABLES and no writer for them,
-    // so every such comparison would be an empty table against a full one. The
-    // install this file is about is not that one: it is an install that carries
-    // the hour rows its views wrote before the upgrade, which is precisely what
-    // the tables are kept for — the 15m backfill proves itself against them and
-    // the deletion workflow still erases them.
-    //
-    // Composed from `FIFTEEN_MINUTE_ROLLUPS` rather than hand-written, at the
-    // hour grain its `{bucket}` placeholder exists for: the spec's SELECT is
-    // the 0025 view's SELECT verbatim, and every 0025 view is its hour twin's
-    // DDL with the bucket expression swapped. So the rows these produce are the
-    // rows the dropped views produced, by construction rather than by copy.
-    const HOUR_BUCKET = "toStartOfHour(toDateTime(occurred_at, 'UTC'))"
-    for (const spec of FIFTEEN_MINUTE_ROLLUPS) {
-      const where = spec.where.length > 0 ? ` WHERE ${spec.where}` : ''
-      await client.command({
-        query:
-          `CREATE MATERIALIZED VIEW ${spec.hourTwin}_mv TO ${spec.hourTwin} AS ` +
-          `SELECT ${spec.select.replace('{bucket}', HOUR_BUCKET)} ` +
-          `FROM events_raw${where} GROUP BY ${spec.groupBy}`,
-      })
-    }
   }, 120_000)
 
   afterAll(async () => {
@@ -225,14 +199,14 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
 
     const events = () =>
       scalar(
-        `SELECT sum(events) FROM metrics_1h WHERE site_id = '${site}' AND event_type = 'page_view'`,
+        `SELECT sum(events) FROM metrics_15m WHERE site_id = '${site}' AND event_type = 'page_view'`,
       )
     const visitors = () =>
       scalar(
-        `SELECT uniqMerge(visitors) FROM metrics_1h WHERE site_id = '${site}' AND event_type = 'page_view'`,
+        `SELECT uniqMerge(visitors) FROM metrics_15m WHERE site_id = '${site}' AND event_type = 'page_view'`,
       )
     const pageViews = (path: string) =>
-      scalar(`SELECT sum(views) FROM pages_1h WHERE site_id = '${site}' AND page_path = '${path}'`)
+      scalar(`SELECT sum(views) FROM pages_15m WHERE site_id = '${site}' AND page_path = '${path}'`)
 
     expect(await events()).toBe(3)
     expect(await visitors()).toBe(2)
@@ -261,8 +235,8 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
 
   it('merges unique visitors across buckets rather than summing them', async () => {
     const site = newSite()
-    // v1 appears in two different hours of the same day; v2 in one. Per-hour
-    // uniques sum to 3, but the true distinct count over the day is 2.
+    // v1 appears in two different quarters of the same day; v2 in a third.
+    // Per-quarter uniques sum to 3, but the true distinct count over the day is 2.
     await insertRaw('token-merge', [
       {
         site_id: site,
@@ -290,23 +264,23 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       },
     ])
 
-    // Two hour buckets exist.
-    const hourBuckets = await scalar(
-      `SELECT count() FROM (SELECT bucket_start FROM metrics_1h WHERE site_id = '${site}' AND event_type = 'page_view' GROUP BY bucket_start)`,
+    // Three quarter buckets exist.
+    const quarterBuckets = await scalar(
+      `SELECT count() FROM (SELECT bucket_start FROM metrics_15m WHERE site_id = '${site}' AND event_type = 'page_view' GROUP BY bucket_start)`,
     )
-    expect(hourBuckets).toBe(2)
+    expect(quarterBuckets).toBe(3)
 
-    // The naive sum of per-hour uniq counts would be 3.
+    // The naive sum of per-quarter uniq counts would be 3.
     const summed = await scalar(
       `SELECT sum(u) FROM (
-         SELECT uniqMerge(visitors) AS u FROM metrics_1h
+         SELECT uniqMerge(visitors) AS u FROM metrics_15m
           WHERE site_id = '${site}' AND event_type = 'page_view' GROUP BY bucket_start)`,
     )
     expect(summed).toBe(3)
 
-    // Merged across both hours it is 2 — the property that a bucket sum destroys.
+    // Merged across the quarters it is 2 — the property that a bucket sum destroys.
     const merged = await scalar(
-      `SELECT uniqMerge(visitors) FROM metrics_1h WHERE site_id = '${site}' AND event_type = 'page_view'`,
+      `SELECT uniqMerge(visitors) FROM metrics_15m WHERE site_id = '${site}' AND event_type = 'page_view'`,
     )
     expect(merged).toBe(2)
 
@@ -364,7 +338,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     // the gateway's timeseries and overview branches filter it. Two people.
     expect(
       await scalar(
-        `SELECT uniqMergeIf(visitors, event_type = 'page_view') FROM metrics_1h WHERE site_id = '${site}'`,
+        `SELECT uniqMergeIf(visitors, event_type = 'page_view') FROM metrics_15m WHERE site_id = '${site}'`,
       ),
     ).toBe(2)
 
@@ -372,7 +346,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     // user hash — one person as two visitors. Pinned so the double count the
     // filter closes stays visible in the data, not only in prose.
     expect(
-      await scalar(`SELECT uniqMerge(visitors) FROM metrics_1h WHERE site_id = '${site}'`),
+      await scalar(`SELECT uniqMerge(visitors) FROM metrics_15m WHERE site_id = '${site}'`),
     ).toBe(3)
   })
 
@@ -380,7 +354,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     const site = newSite()
     // The dominant real-world generator of the "2 visitors / 1 pageview"
     // symptom: a page opened at 09:58 whose engagement and web_vital fire at
-    // departure, 10:03, landing in the NEXT hour bucket (the events are
+    // departure, 10:03, landing in a LATER bucket (the events are
     // stamped when they happen, and that is correct — ADR-0036 changed the
     // definition, not the clock).
     await insertRaw('token-departure', [
@@ -414,11 +388,11 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       `SELECT bucket_start AS bucket,
               sumIf(events, event_type = 'page_view') AS pageviews,
               uniqMergeIf(visitors, event_type = 'page_view') AS visitors
-         FROM metrics_1h WHERE site_id = '${site}'
+         FROM metrics_15m WHERE site_id = '${site}'
         GROUP BY bucket_start ORDER BY bucket_start`,
     )
     // Two buckets exist (the departure events are real rows in 10:00), and the
-    // shipped rule holds in both: 09:00 is 1/1, 10:00 is 0 visitors beside 0
+    // shipped rule holds in both: 09:45 is 1/1, 10:00 is 0 visitors beside 0
     // pageviews — not the 1-visitor/0-pageview bucket the bare merge produced.
     expect(buckets.map((row) => [Number(row.visitors), Number(row.pageviews)])).toEqual([
       [1, 1],
@@ -476,7 +450,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       visitors: string
     }>(
       `SELECT event_name, event_type, sum(events) AS events, uniqMerge(visitors) AS visitors
-         FROM custom_events_1h WHERE site_id = '${site}'
+         FROM custom_events_15m WHERE site_id = '${site}'
         GROUP BY event_name, event_type ORDER BY event_name`,
     )
     expect(
@@ -488,7 +462,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     // The page_view carried no name, so it never entered the custom-event rollup.
     expect(
       await scalar(
-        `SELECT count() FROM custom_events_1h WHERE site_id = '${site}' AND event_name = ''`,
+        `SELECT count() FROM custom_events_15m WHERE site_id = '${site}' AND event_name = ''`,
       ),
     ).toBe(0)
   })
@@ -537,7 +511,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
          max(t.last_seen_at)                AS last_seen_at,
          argMaxMerge(t.sample_page_path)    AS sample_page_path,
          argMaxMerge(t.sample_properties)   AS sample_properties
-       FROM custom_event_samples_1h AS t WHERE t.site_id = '${site}'
+       FROM custom_event_samples_15m AS t WHERE t.site_id = '${site}'
        GROUP BY event_name ORDER BY event_name`,
     )
 
@@ -554,7 +528,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       ['signup', 2, '2026-07-23 12:30:00.000', '/new', '{"section":"hero"}'],
     ])
 
-    // Same filter as custom_events_1h: a row with no name never enters.
+    // Same filter as custom_events_15m: a row with no name never enters.
     await insertRaw('token-sample-pv', [
       {
         site_id: site,
@@ -568,7 +542,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     ])
     expect(
       await scalar(
-        `SELECT count() FROM custom_event_samples_1h WHERE site_id = '${site}' AND event_name = ''`,
+        `SELECT count() FROM custom_event_samples_15m WHERE site_id = '${site}' AND event_name = ''`,
       ),
     ).toBe(0)
 
@@ -585,7 +559,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     ])
     expect(
       await scalar(
-        `SELECT sum(events) FROM custom_event_samples_1h
+        `SELECT sum(events) FROM custom_event_samples_15m
           WHERE site_id = '${site}' AND event_name = 'signup'`,
       ),
     ).toBe(2)
@@ -603,7 +577,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       occurred_at: at,
       properties: JSON.stringify({ oa_metric: 'LCP', oa_value: value, oa_rating: rating }),
     })
-    // Two different hours so the read has to merge two sketches.
+    // Two different hours so the read has to merge several sketches.
     await insertRaw('token-perf', [
       vital(100, 'good', '2026-07-23 08:10:00.000'),
       vital(200, 'good', '2026-07-23 08:20:00.000'),
@@ -628,7 +602,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
          sum(poor_samples) AS poor,
          arrayElement(quantilesTDigestMerge(0.5, 0.75, 0.9, 0.95, 0.99)(value_quantiles), 1) AS p50,
          arrayElement(quantilesTDigestMerge(0.5, 0.75, 0.9, 0.95, 0.99)(value_quantiles), 4) AS p95
-       FROM performance_1h WHERE site_id = '${site}' AND metric = 'LCP'`,
+       FROM performance_15m WHERE site_id = '${site}' AND metric = 'LCP'`,
     )
 
     expect(Number(row?.samples)).toBe(4)
@@ -647,12 +621,12 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
   })
 
   // Milestone 7 acceptance criterion 4 (DST through the composed-day path). The
-  // read API composes a non-UTC day from metrics_1h with
+  // read API composes a non-UTC day from metrics_15m (metrics_1h until ADR-0079) with
   // toStartOfDay(bucket_start, tz) — exactly the analytics.timeseries_day
   // operation. On a DST transition that local "day" is 23 or 25 UTC hours long,
   // and this proves the composition lands every one of those hours in the right
   // local day, so the 23h/25h day is neither short-changed nor padded.
-  it('composes a 23h spring-forward and a 25h fall-back local day from the hour rollup', async () => {
+  it('composes a 23h spring-forward and a 25h fall-back local day from the 15m rollup', async () => {
     const site = newSite()
     const NY = 'America/New_York'
 
@@ -688,7 +662,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       `SELECT
          toString(toStartOfDay(bucket_start, '${NY}')) AS local_day,
          sum(events) AS events
-       FROM metrics_1h
+       FROM metrics_15m
        WHERE site_id = '${site}' AND event_type = 'page_view'
        GROUP BY local_day
        ORDER BY local_day`,
@@ -715,17 +689,16 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
   //   1. the family rule (invariant 1 above) applied to the 15m targets: a
   //      deduplicated raw retry leaves them unchanged;
   //   2. EQUALITY: a local day composed from the 15m rows equals the same day
-  //      composed from the 1h rows, family by family, row for row, across a
-  //      DST transition — the property step 4 relies on to retire the hour
-  //      views;
+  //      composed from events_raw by the view's own SELECT, family by family,
+  //      row for row, across a DST transition (until migration 0029 this
+  //      compared with the hour rows, which are gone);
   //   3. SUB-HOUR TRUTH: for +05:30 and +05:45 a local day composed from the
-  //      15m rows equals the day computed directly from events_raw, while the
-  //      hour composition (the read that exists today) does not — the reason
-  //      the finer atom exists. This is the assertion that fails if the bucket
-  //      expression is changed back to toStartOfHour, and it was watched
-  //      failing before it was trusted;
-  //   4. the backfill inserts exactly what the views insert, and refuses to
-  //      run twice.
+  //      15m rows equals the day computed directly from events_raw, while an
+  //      hour composition does not — the reason the finer atom exists. This is
+  //      the assertion that fails if the bucket expression is changed back to
+  //      toStartOfHour, and it was watched failing before it was trusted;
+  //   4. the backfill inserts exactly what the views insert, refuses to run
+  //      twice, and proves itself against events_raw.
   // ---------------------------------------------------------------------------
 
   it('buckets the 15m family to the quarter hour and does not double it on a deduplicated retry', async () => {
@@ -778,16 +751,28 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
         `SELECT sum(views) FROM pages_15m WHERE site_id = '${site}' AND page_path = '/a'`,
       ),
     ).toBe(2)
-    // The hour twin saw the same three rows once — the two grains agree.
+    // The day twin saw the same three rows once — the two grains agree.
     expect(
       await scalar(
-        `SELECT sum(events) FROM metrics_1h WHERE site_id = '${site}' AND event_type = 'page_view'`,
+        `SELECT sum(events) FROM metrics_1d WHERE site_id = '${site}' AND event_type = 'page_view'`,
       ),
     ).toBe(3)
   })
 
-  /** Every family's composed-day read, at one grain, for one site and zone. */
-  const composedDay = async (grain: '15m' | '1h', site: string, tz: string) => {
+  /**
+   * What a family's rows would be if its view had seen every raw row: the
+   * view's own SELECT over events_raw, as a subquery a read can stand on.
+   */
+  const fromRaw = (family: string): string => {
+    const spec = FIFTEEN_MINUTE_ROLLUPS.find((entry) => entry.table === `${family}_15m`)
+    if (spec === undefined) throw new Error(`no 15m spec for ${family}`)
+    const where = spec.where.length > 0 ? ` WHERE ${spec.where}` : ''
+    return `(SELECT ${spec.select.replace('{bucket}', "toStartOfFifteenMinutes(toDateTime(occurred_at, 'UTC'))")} FROM events_raw${where} GROUP BY ${spec.groupBy})`
+  }
+
+  /** Every family's composed-day read, from the 15m tables or from raw, for one site and zone. */
+  const composedDay = async (source: '15m' | 'raw', site: string, tz: string) => {
+    const from = (family: string) => (source === '15m' ? `${family}_15m` : fromRaw(family))
     const day = `toString(toStartOfDay(bucket_start, '${tz}'))`
     const rows = async (query: string) =>
       (await queryRows<Record<string, string>>(query)).map((row) => Object.values(row))
@@ -796,42 +781,42 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
         `SELECT ${day} AS d, sumIf(events, event_type = 'page_view') AS pv,
                 sum(events) AS ev, sum(billable_events) AS bev,
                 uniqMergeIf(visitors, event_type = 'page_view') AS vis
-           FROM metrics_${grain} WHERE site_id = '${site}' GROUP BY d ORDER BY d`,
+           FROM ${from('metrics')} AS t WHERE site_id = '${site}' GROUP BY d ORDER BY d`,
       ),
       pages: await rows(
         `SELECT ${day} AS d, page_path, sum(views) AS v, uniqMerge(visitors) AS vis
-           FROM pages_${grain} WHERE site_id = '${site}' GROUP BY d, page_path ORDER BY d, page_path`,
+           FROM ${from('pages')} AS t WHERE site_id = '${site}' GROUP BY d, page_path ORDER BY d, page_path`,
       ),
       sources: await rows(
         `SELECT ${day} AS d, referrer_domain, utm_source, sum(views) AS v, uniqMerge(visitors) AS vis
-           FROM sources_${grain} WHERE site_id = '${site}'
+           FROM ${from('sources')} AS t WHERE site_id = '${site}'
           GROUP BY d, referrer_domain, utm_source ORDER BY d, referrer_domain, utm_source`,
       ),
       geography: await rows(
         `SELECT ${day} AS d, country, city, sum(views) AS v, uniqMerge(visitors) AS vis
-           FROM geography_${grain} WHERE site_id = '${site}' GROUP BY d, country, city ORDER BY d, country, city`,
+           FROM ${from('geography')} AS t WHERE site_id = '${site}' GROUP BY d, country, city ORDER BY d, country, city`,
       ),
       devices: await rows(
         `SELECT ${day} AS d, device_type, browser, sum(views) AS v, uniqMerge(visitors) AS vis
-           FROM devices_${grain} WHERE site_id = '${site}'
+           FROM ${from('devices')} AS t WHERE site_id = '${site}'
           GROUP BY d, device_type, browser ORDER BY d, device_type, browser`,
       ),
       custom_events: await rows(
         `SELECT ${day} AS d, event_name, event_type, sum(events) AS ev, sum(billable_events) AS bev,
                 uniqMerge(visitors) AS vis
-           FROM custom_events_${grain} WHERE site_id = '${site}'
+           FROM ${from('custom_events')} AS t WHERE site_id = '${site}'
           GROUP BY d, event_name, event_type ORDER BY d, event_name, event_type`,
       ),
       performance: await rows(
         `SELECT ${day} AS d, metric, device_type, sum(samples) AS s, round(sum(value_sum), 6) AS vs,
                 sum(good_samples) AS g, sum(needs_improvement_samples) AS ni, sum(poor_samples) AS p
-           FROM performance_${grain} WHERE site_id = '${site}'
+           FROM ${from('performance')} AS t WHERE site_id = '${site}'
           GROUP BY d, metric, device_type ORDER BY d, metric, device_type`,
       ),
       custom_event_samples: await rows(
         `SELECT ${day} AS d, t.event_name AS event_name, sum(t.events) AS ev,
                 toString(max(t.last_seen_at)) AS seen, argMaxMerge(t.sample_page_path) AS path
-           FROM custom_event_samples_${grain} AS t WHERE t.site_id = '${site}'
+           FROM ${from('custom_event_samples')} AS t WHERE t.site_id = '${site}'
           GROUP BY d, event_name ORDER BY d, event_name`,
       ),
     }
@@ -903,7 +888,7 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     await insertRaw(token, rows)
   }
 
-  it('composes the same Europe/Berlin day from the 15m rows as from the 1h rows, across a DST transition', async () => {
+  it('composes the same Europe/Berlin day from the 15m rows as from events_raw, across a DST transition', async () => {
     const site = newSite()
     // 2026-03-29 is Berlin's spring-forward day: local midnight 23:00Z on the
     // 28th, next local midnight 22:00Z on the 29th — a 23-hour day. Seed three
@@ -911,12 +896,12 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     await seedQuarterHours(site, '2026-03-28 00:00:00.000', 24 * 4 * 3, 'berlin')
 
     const fifteen = await composedDay('15m', site, 'Europe/Berlin')
-    const hour = await composedDay('1h', site, 'Europe/Berlin')
-    // Row for row, family by family: the union of four quarter-hour states is
-    // the hour's state, and every other measure is a plain sum.
-    expect(fifteen).toEqual(hour)
+    const raw = await composedDay('raw', site, 'Europe/Berlin')
+    // Row for row, family by family: what the views wrote is what the raw rows
+    // say, uniq states included.
+    expect(fifteen).toEqual(raw)
 
-    // And the DST day is really 23 hours long in both — 92 page views against
+    // And the DST day is really 23 hours long — 92 page views against
     // 96 on an ordinary day. (Column 1 of the metrics rows is `pv`.)
     const pageViewsOn = (day: string) =>
       Number(fifteen.metrics.find((row) => row[0]?.startsWith(day))?.[1] ?? -1)
@@ -980,20 +965,27 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
         [1, 1],
       ])
 
-      const composed = async (grain: '15m' | '1h') =>
-        await queryRows<{ d: string; pv: string; vis: string }>(
-          `SELECT toString(toStartOfDay(bucket_start, '${tz}')) AS d,
-                  sumIf(events, event_type = 'page_view') AS pv,
-                  uniqMergeIf(visitors, event_type = 'page_view') AS vis
-             FROM metrics_${grain} WHERE site_id = '${site}' GROUP BY d ORDER BY d`,
-        )
+      const composed = await queryRows<{ d: string; pv: string; vis: string }>(
+        `SELECT toString(toStartOfDay(bucket_start, '${tz}')) AS d,
+                sumIf(events, event_type = 'page_view') AS pv,
+                uniqMergeIf(visitors, event_type = 'page_view') AS vis
+           FROM metrics_15m WHERE site_id = '${site}' GROUP BY d ORDER BY d`,
+      )
+      // An hour atom, composed the same way — from the raw rows, since the
+      // hour tables are gone (migration 0029).
+      const byHour = await queryRows<{ d: string; pv: string; vis: string }>(
+        `SELECT toString(toStartOfDay(toStartOfHour(toDateTime(occurred_at, 'UTC')), '${tz}')) AS d,
+                count() AS pv, uniqExact(anonymous_id) AS vis
+           FROM events_raw WHERE site_id = '${site}' AND type = 'page_view'
+          GROUP BY d ORDER BY d`,
+      )
 
       // The fifteen-minute composition IS the truth.
-      expect(await composed('15m')).toEqual(truth)
+      expect(composed).toEqual(truth)
       // The hour composition is not: both sides of midnight fall in the 18:00Z
-      // bucket, so it puts them on the same local day. This is the read that
-      // exists today, and the reason ADR-0011 refused these zones.
-      expect(await composed('1h')).not.toEqual(truth)
+      // bucket, so it puts them on the same local day — the reason ADR-0011
+      // refused these zones.
+      expect(byHour).not.toEqual(truth)
     }
   })
 
@@ -1056,9 +1048,9 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     const result = await backfillFifteenMinuteRollups(options)
     expect(result.inserts).toBe(FIFTEEN_MINUTE_ROLLUPS.length * result.partitions.length)
     expect(result.partitions.length).toBeGreaterThan(1)
-    // Every family agrees with its hour twin per site, and says so.
+    // Every family agrees with events_raw pair by pair, and says so.
     for (const table of result.tables) {
-      expect(table.comparedFrom, table.table).not.toBeNull()
+      expect(table.comparedPairs, table.table).toBeGreaterThan(0)
       expect(table.mismatchedSites, table.table).toEqual([])
     }
 
@@ -1148,7 +1140,8 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     expect(filled.gapRows).toBeGreaterThan(0)
     for (const table of filled.tables) {
       expect(table.mismatchedSites, table.table).toEqual([])
-      expect(table.comparedFrom, table.table).not.toBeNull()
+      expect(table.comparedPairs, table.table).toBeGreaterThan(0)
+      expect(table.seamPairs, table.table).toBe(0)
     }
     // Pair by pair against events_raw: no gap left, no seam (nothing was
     // writing), and not one event counted twice.
@@ -1290,9 +1283,11 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
     const captured = createCapturedLogger()
     const result = await backfillFifteenMinuteRollups(ifNeeded(captured.logger))
 
-    // No refusal, no mismatch: the site's hours at and above its first row
-    // are outside the gate window.
+    // No refusal, no mismatch: the one short pair is one the site already
+    // held before the run, which is the seam the gate allows and reports.
     for (const table of result.tables) expect(table.mismatchedSites, table.table).toEqual([])
+    const metrics = result.tables.find((table) => table.table === 'metrics_15m')
+    expect(metrics).toMatchObject({ seamPairs: 1, seamEvents: 2 })
 
     const events = (bucket: string) =>
       scalar(
@@ -1342,5 +1337,150 @@ describeIfClickHouse('analytics rollup family behaviour', () => {
       ),
     ).toBe(1)
     expect(await stored()).toEqual(await truth())
+  })
+
+  // ---------------------------------------------------------------------------
+  // v0.8.0 — the gate compares with events_raw. The first two cases are the
+  // states that made the hour-twin gate cry "history fill failed" over data
+  // that was right; the last two prove the new gate still fails when the data
+  // is wrong, so green above is not a gate that cannot say no.
+  // ---------------------------------------------------------------------------
+
+  /** Page views for one site, one per quarter hour, from a UTC start. */
+  const pageViews = (site: string, startUtc: string, quarters: number, tag: string): RawRow[] =>
+    Array.from({ length: quarters }, (_, q) => ({
+      site_id: site,
+      event_id: newEvent(),
+      batch_id: tag,
+      type: 'page_view',
+      occurred_at: new Date(Date.parse(`${startUtc}Z`) + q * 900_000 + 3 * 60_000)
+        .toISOString()
+        .replace('T', ' ')
+        .replace('Z', ''),
+      anonymous_id: `${tag}${String(q % 5)}`,
+      page_path: `/${tag}`,
+    }))
+
+  it('stays green when a late event lands in a pair the fill just wrote (v0.7.0 scenario d)', async () => {
+    // The upgrade with a queue backlog: history is filled, and the worker then
+    // drains a late event whose occurred_at is in that history. The view writes
+    // it to the 15m row the fill just wrote; the raw row is written in the same
+    // insert. The hour-twin gate compared against a table 0027 had frozen, so
+    // this was additive_mismatch on correct data — the red half is recorded in
+    // the v0.8.0 notes (the old code, this scenario, exit 3). Against raw the
+    // two sides move together.
+    const site = newSite()
+    await insertRaw('late-drain-history', pageViews(site, '2026-05-10 09:00:00.000', 12, 'd'))
+    await truncateAll()
+
+    const result = await backfillFifteenMinuteRollups({
+      ...ifNeeded(),
+      afterFill: async () => {
+        await insertRaw('late-drain-event', [
+          {
+            site_id: site,
+            event_id: newEvent(),
+            batch_id: 'late',
+            type: 'page_view',
+            occurred_at: '2026-05-10 10:20:00.000',
+            anonymous_id: 'late',
+            page_path: '/d',
+          },
+        ])
+      },
+    })
+    for (const table of result.tables) {
+      expect(table.mismatchedSites, table.table).toEqual([])
+      expect(table.acceptedMismatchSites, table.table).toEqual([])
+    }
+    // The late event is counted, once, in the pair it belongs to.
+    expect(
+      await scalar(
+        `SELECT sum(events) FROM metrics_15m WHERE site_id = '${site}' AND bucket_start = toDateTime('2026-05-10 10:15:00', 'UTC')`,
+      ),
+    ).toBe(2)
+    expect(await stored()).toEqual(await truth())
+  })
+
+  it('fills complete history while a worker keeps writing, and the gate stays green', async () => {
+    // Every start of the migrate container runs this beside a live worker.
+    // The writer below inserts current traffic and late events for the whole
+    // length of the run.
+    await truncateAll()
+    const site = newSite()
+    await insertRaw('busy-history', pageViews(site, '2026-04-01 00:00:00.000', 96 * 3, 'b'))
+
+    let writing = true
+    let batches = 0
+    const writer = (async () => {
+      while (writing) {
+        batches += 1
+        await insertRaw(`busy-${String(batches)}`, [
+          ...pageViews(site, '2026-04-02 06:00:00.000', 2, `late${String(batches)}`),
+          ...pageViews(site, '2026-06-20 12:00:00.000', 1, `now${String(batches)}`),
+        ])
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+    })()
+    let result
+    try {
+      result = await backfillFifteenMinuteRollups(ifNeeded())
+    } finally {
+      writing = false
+      await writer
+    }
+    expect(batches).toBeGreaterThan(1)
+    for (const table of result.tables) {
+      expect(table.mismatchedSites, table.table).toEqual([])
+    }
+    expect(result.witness).toMatchObject({ gapEvents: 0, overEvents: 0 })
+    // History is whole: every raw row of the site is in exactly one 15m pair.
+    expect(await scalar(`SELECT sum(events) FROM metrics_15m WHERE site_id = '${site}'`)).toBe(
+      await scalar(`SELECT count() FROM events_raw WHERE site_id = '${site}'`),
+    )
+    expect(await stored()).toEqual(await truth())
+  })
+
+  it('fails a double count that lands between the fill and the proof', async () => {
+    const metricsSpec = FIFTEEN_MINUTE_ROLLUPS[0]!
+    const FIFTEEN = "toStartOfFifteenMinutes(toDateTime(occurred_at, 'UTC'))"
+    const site = newSite()
+    await insertRaw('double-history', pageViews(site, '2026-05-20 09:00:00.000', 4, 'x'))
+    await truncateAll()
+
+    const run = backfillFifteenMinuteRollups({
+      ...ifNeeded(),
+      afterFill: async () => {
+        // The failure the gate exists for: a pair's events inserted a second
+        // time, straight into the rollup (what a fill without its gap predicate
+        // would do).
+        await client.command({
+          query: `INSERT INTO metrics_15m SELECT ${metricsSpec.select.replace('{bucket}', FIFTEEN)} FROM events_raw WHERE site_id = '${site}' GROUP BY ${metricsSpec.groupBy}`,
+        })
+      },
+    })
+    await expect(run).rejects.toMatchObject({
+      name: 'BackfillRefusedError',
+      reason: 'additive_mismatch',
+    })
+    // Named by family and site, so the operator knows what to look at.
+    await expect(run).rejects.toThrow(`metrics_15m (${site})`)
+  })
+
+  it('fails a filled pair that went missing before the proof', async () => {
+    const site = newSite()
+    await insertRaw('gap-history', pageViews(site, '2026-05-21 09:00:00.000', 4, 'g'))
+    await truncateAll()
+
+    await expect(
+      backfillFifteenMinuteRollups({
+        ...ifNeeded(),
+        afterFill: async () => {
+          await client.command({
+            query: `ALTER TABLE pages_15m DELETE WHERE site_id = '${site}' AND bucket_start = toDateTime('2026-05-21 09:15:00', 'UTC') SETTINGS mutations_sync = 2`,
+          })
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'BackfillRefusedError', reason: 'additive_mismatch' })
   })
 })

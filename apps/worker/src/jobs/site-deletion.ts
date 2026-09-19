@@ -1,4 +1,5 @@
 import {
+  DELETION_CLICKHOUSE_TARGETS,
   DELETION_REDIS_TARGETS,
   SITE_DELETION_PHASES,
   isSiteDeletionPhase,
@@ -708,6 +709,8 @@ async function objectPurge(context: PhaseContext): Promise<PhaseOutcome> {
  * since ClickHouse queues mutations per table regardless of when they arrive.
  * The job runner's own `limit: 1` is what keeps *deletions* from overlapping.
  */
+const RETAINED_CLICKHOUSE_TARGETS: ReadonlySet<string> = new Set(DELETION_CLICKHOUSE_TARGETS)
+
 async function clickhousePurge(context: PhaseContext): Promise<PhaseOutcome> {
   const maintenance = context.job.resources?.clickhouse
   if (!maintenance) {
@@ -734,6 +737,28 @@ async function clickhousePurge(context: PhaseContext): Promise<PhaseOutcome> {
 
   for (const target of targets) {
     if (target.phase === 'completed') continue
+
+    // A target the vocabulary no longer names is a table a later migration
+    // dropped — the ten hour tables, ClickHouse 0029 (v0.8.0) — while this
+    // deletion's snapshot, taken at its start, still lists it. The table holds
+    // no row of any site, so there is nothing to purge and nothing a mutation
+    // could be submitted against: ClickHouse would refuse it on every attempt
+    // and the deletion would never finish. Settled as verified-empty, with the
+    // reason, and never submitted.
+    if (!RETAINED_CLICKHOUSE_TARGETS.has(target.target)) {
+      await completeTarget(context, target, {
+        count: 0,
+        mutation_id: null,
+        retired: 'target left the deletion vocabulary: its table was dropped by a migration',
+        verified_at: new Date().toISOString(),
+      })
+      context.job.logger.info('site_deletion_target_retired', {
+        job_id: context.job.job.id,
+        site_id: context.siteId,
+        table: target.target,
+      })
+      continue
+    }
 
     let mutationId = target.mutationId
     // Whether ClickHouse has *reported* this mutation finished. It is not the

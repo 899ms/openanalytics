@@ -453,7 +453,7 @@ function buildPersistedEvent(input: BuildPersistedInput): PersistedEvent {
   const page = event.page ? sanitizeUrl(event.page.url, { redactQueryKeys }) : null
   // The site's own hosts are not an acquisition source, and one source has one
   // spelling (ADR-0028). Both rules are applied here, on the way in, because
-  // `referrer_domain` is a rollup grouping key: `sources_1h` has already grouped
+  // `referrer_domain` is a rollup grouping key: `sources_15m` has already grouped
   // by it before any reader exists to repair it.
   const referrer = resolveReferrer(event.referrer, {
     siteDomains: config.allowedDomains,
@@ -466,7 +466,7 @@ function buildPersistedEvent(input: BuildPersistedInput): PersistedEvent {
   // of the channel is the click id the platform put in the landing URL. It is
   // read here, on the way in, for the reason ADR-0028 gives for resolving the
   // referrer here: `referrer_domain` is the rollup grouping key and
-  // `sources_1h` has already grouped by it before any reader exists to repair
+  // `sources_15m` has already grouped by it before any reader exists to repair
   // it. Repairing it at read time would have to be repeated in every future
   // reader — the sources report, the session fact's entry attribution, revenue
   // first/last touch — instead of once.

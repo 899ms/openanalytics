@@ -77,7 +77,7 @@ part doing the work: a candidate publishes images under its own tag and sorts
 _above_ the release it is a candidate for, so `git tag --sort=-v:refname` lists
 `v0.1.0-rc.1` before `v0.1.0` and `git describe` would hand you the candidate.
 Dropping every tag with a `-` in it leaves only releases. To take a specific
-one, name it instead: `git checkout v0.7.0`.
+one, name it instead: `git checkout v0.8.0`.
 
 Add `--with-geoip` to that last command to download the country and city
 database in the same pass — see [GeoIP](#geoip). It is the one thing in the
@@ -116,7 +116,7 @@ because you checked out the tag before running it:
 > your version over the baked one, which still wins.
 
 ```sh
-grep OA_IMAGE .env                 # ghcr.io/openlabs-so/openanalytics, v0.7.0
+grep OA_IMAGE .env                 # ghcr.io/openlabs-so/openanalytics, v0.8.0
 docker compose pull
 docker compose up -d
 docker compose logs -f migrate     # schemas, both stores, from empty
@@ -643,7 +643,7 @@ Two things worth knowing before you rely on any of it:
 
 ```sh
 git fetch --tags
-git checkout v0.7.0            # the release you are moving to
+git checkout v0.8.0            # the release you are moving to
 cd infra/selfhost
 ./upgrade.sh                   # tells you what it costs, then does it
 ```
@@ -663,6 +663,31 @@ the version being upgraded to. It works out the target from the tag you are
 standing on, takes a snapshot, points `.env` at the new images, pulls them and
 brings everything up. On an architecture with no published images,
 `./upgrade.sh --from-source` builds instead.
+
+**0.7.0 → 0.8.0 asks nothing else of you either**, and it is short:
+
+- **The hourly rollup tables are dropped.** ClickHouse migration 0029 removes
+  the ten `*_1h` tables 0.7.0 stopped writing; nothing had read them since
+  0.7.0 moved every chart to the fifteen-minute rollups. Site deletion stops
+  naming them in the same release. The `*_1d` tables stay.
+- **The history fill checks itself against your raw events.** In 0.7.0 it
+  compared its sums with the frozen hourly tables, so an upgrade with the
+  worker still running could log one `history fill backfill-15m failed` with
+  `additive_mismatch` over history that was complete. It now compares with
+  `events_raw`, which every rollup is built from, so that line no longer
+  appears for that reason — when it does appear, the filled history really
+  disagrees with the raw events, and the report above it says where.
+- **Going back from 0.8.0 is a restore, not an image tag.** 0029 deletes the
+  hourly tables, so the 0.7.0 images would find tables missing. Use
+  `./rollback.sh` to the snapshot `./upgrade.sh` took, as below.
+
+**Skipping 0.7.0 (0.6.0 → 0.8.0) is supported and asks nothing extra.** The
+migrate container applies ClickHouse migrations 0025 through 0029 in one run
+and fills the fifteen-minute rollups from your raw events afterwards, so
+everything 0.7.0 describes below happens too — only the hourly tables are gone
+by the time the fill runs. That is safe because the fill reads `events_raw`
+and checks itself against `events_raw`; no step of it needs an hourly table.
+Read the 0.7.0 notes below for what the fill costs on a large install.
 
 **0.6.0 → 0.7.0 asks nothing else of you either, but it does more while it
 runs**, so it is worth knowing what you are watching:
@@ -686,12 +711,9 @@ runs**, so it is worth knowing what you are watching:
 - **If the worker keeps running through the upgrade** — a platform redeploy, or
   `docker compose pull && docker compose up -d` without `./upgrade.sh` — one
   quarter hour can come out short: the one in which the new views were created
-  counts only the events that arrived after that moment. The first start can
-  also log one `history fill backfill-15m failed` with `additive_mismatch`:
-  the fill checks its sums against the hourly tables, and late events that
-  arrive after the switch reach the new tables but not the frozen hourly ones.
-  The history itself is complete, and the next start does not repeat the line.
-  `./upgrade.sh` stops everything first, so it has neither.
+  counts only the events that arrived after that moment. `./upgrade.sh`
+  stops everything first, so it does not have that. (0.7.0 could also log one
+  false `additive_mismatch` here; 0.8.0 no longer does.)
 - **ClickHouse gets new grants**, for the two rollups the worker writes itself.
   They are rendered when its container is created, and the new image tag is
   what recreates it, so `./upgrade.sh` and a platform redeploy deliver them

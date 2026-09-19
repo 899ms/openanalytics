@@ -281,13 +281,9 @@ describeIfClickHouse('session facts and rollups behaviour', () => {
   // alone. A 15m table that merged differently would break the one property the
   // fifteen-minute grain exists to provide.
   //
-  // The hour is still here although step 4 stopped the finalizer writing it
-  // (migration 0027). Its rows are frozen, not deleted: the 15m backfill's
-  // equality gate reads them and so does the deletion workflow, so they have to
-  // keep READING correctly, which is exactly what this case asserts.
+  // (The hour table left with migration 0029, v0.8.0.)
   it.each([
     ['session_rollups_15m', '2026-07-23 10:15:00'],
-    ['session_rollups_1h', '2026-07-23 10:00:00'],
     ['session_rollups_1d', '2026-07-23 00:00:00'],
   ])('swaps a %s bucket by generation, idempotently', async (table, bucket) => {
     const site = randomUUID()

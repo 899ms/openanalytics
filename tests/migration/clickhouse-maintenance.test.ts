@@ -100,7 +100,7 @@ describeIfClickHouse('clickhouse site purge', () => {
   /** One session-rollup row, so a table no materialized view feeds is covered too. */
   const insertRollup = async (siteId: string): Promise<void> => {
     await client.insert({
-      table: 'session_rollups_1h',
+      table: 'session_rollups_15m',
       values: [
         {
           site_id: siteId,
@@ -212,13 +212,13 @@ describeIfClickHouse('clickhouse site purge', () => {
   it(
     'purges a rollup table the same way',
     async () => {
-      expect(await maintenance.countSiteRows('session_rollups_1h', siteA)).toBe(1)
+      expect(await maintenance.countSiteRows('session_rollups_15m', siteA)).toBe(1)
 
-      const submitted = await maintenance.submitSiteDelete('session_rollups_1h', siteA)
-      await pollToDone('session_rollups_1h', submitted.mutationId as string)
+      const submitted = await maintenance.submitSiteDelete('session_rollups_15m', siteA)
+      await pollToDone('session_rollups_15m', submitted.mutationId as string)
 
-      expect(await maintenance.countSiteRows('session_rollups_1h', siteA)).toBe(0)
-      expect(await maintenance.countSiteRows('session_rollups_1h', siteB)).toBe(1)
+      expect(await maintenance.countSiteRows('session_rollups_15m', siteA)).toBe(0)
+      expect(await maintenance.countSiteRows('session_rollups_15m', siteB)).toBe(1)
     },
     POLL_TIMEOUT_MS + 30_000,
   )

@@ -147,8 +147,9 @@ describe('ClickHouse migration files split into statements', () => {
   it('drops eight views and not one table in 0027', async () => {
     // ADR-0079 step 4. The shape of this file is the whole decision: the hour
     // grain stops being WRITTEN and stays READABLE, so eight views go and not a
-    // single table does. A `DROP TABLE` slipping in here would take the 15m
-    // backfill's equality gate and the deletion workflow's targets with it, and
+    // single table does. A `DROP TABLE` slipping in here would have taken the
+    // 15m backfill's equality gate and the deletion workflow's targets with it
+    // (0029 drops the tables a release later, once neither needs them), and
     // it would be irreversible in the one direction that matters -- the rows
     // are gone, whereas a dropped view can be recreated and replayed from
     // `events_raw`.
@@ -174,6 +175,33 @@ describe('ClickHouse migration files split into statements', () => {
       // leave a safe re-run.
       expect(statement).toContain('IF EXISTS')
       expect(statement).not.toMatch(/DROP\s+TABLE/iu)
+    }
+  })
+
+  it('0029 drops exactly the ten hour tables, and nothing of the day or quarter grain', async () => {
+    // v0.8.0. Where 0027 had to keep every table, this one exists to remove
+    // them -- which makes the list the thing to pin: one name too many here is
+    // a `_1d` or `_15m` table the dashboard reads, gone with its rows.
+    const file = (await migrationFiles()).find(
+      (entry) => entry.name === '0029_drop_hour_tables.sql',
+    )
+    expect(file).toBeDefined()
+    const statements = splitStatements((file as { sql: string }).sql)
+    expect(statements).toEqual([
+      'DROP TABLE IF EXISTS metrics_1h',
+      'DROP TABLE IF EXISTS pages_1h',
+      'DROP TABLE IF EXISTS sources_1h',
+      'DROP TABLE IF EXISTS geography_1h',
+      'DROP TABLE IF EXISTS devices_1h',
+      'DROP TABLE IF EXISTS custom_events_1h',
+      'DROP TABLE IF EXISTS performance_1h',
+      'DROP TABLE IF EXISTS custom_event_samples_1h',
+      'DROP TABLE IF EXISTS session_rollups_1h',
+      'DROP TABLE IF EXISTS revenue_1h',
+    ])
+    for (const statement of statements) {
+      expect(statement).toMatch(/_1h$/u)
+      expect(statement).not.toMatch(/_1d\b|_15m\b/u)
     }
   })
 })

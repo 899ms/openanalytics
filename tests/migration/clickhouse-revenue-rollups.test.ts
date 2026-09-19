@@ -224,10 +224,10 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
       }>(
         `SELECT name, engine_full, partition_key, sorting_key
            FROM system.tables
-          WHERE database = '${database}' AND name IN ('revenue_1h', 'revenue_1d')
+          WHERE database = '${database}' AND name IN ('revenue_15m', 'revenue_1d')
           ORDER BY name`,
       )
-      expect(rows.map((row) => row.name)).toEqual(['revenue_1d', 'revenue_1h'])
+      expect(rows.map((row) => row.name)).toEqual(['revenue_15m', 'revenue_1d'])
       for (const row of rows) {
         // The generation IS the replacing column; without it a swap would be an
         // append and every recompute would double the totals.
@@ -243,7 +243,7 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
     it('stores every money column as Int64 and every count as UInt64', async () => {
       const rows = await queryRows<{ name: string; type: string }>(
         `SELECT name, type FROM system.columns
-          WHERE database = '${database}' AND table = 'revenue_1h'
+          WHERE database = '${database}' AND table = 'revenue_15m'
           ORDER BY name`,
       )
       const types = new Map(rows.map((row) => [row.name, row.type]))
@@ -285,7 +285,7 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
 
       const engines = await queryRows<{ name: string; engine: string }>(
         `SELECT name, engine FROM system.tables
-          WHERE database = '${database}' AND name IN ('revenue_1h', 'revenue_1d')`,
+          WHERE database = '${database}' AND name IN ('revenue_15m', 'revenue_1d')`,
       )
       for (const row of engines) expect(row.engine).toBe('ReplacingMergeTree')
     })
@@ -418,9 +418,6 @@ describeIfClickHouse('ClickHouse migration 0018 — the revenue rollups', () => 
       // Non-trivially: a site whose quarters were all zero would pass the two
       // lines above and prove nothing.
       expect(days[0]?.charge).toBeGreaterThan(0)
-
-      // And nothing reached the frozen hour table (migration 0027).
-      expect(await currentBuckets('revenue_1h', siteId)).toHaveLength(0)
     })
 
     it('excludes an unconverted fact from the money and counts it separately', async () => {

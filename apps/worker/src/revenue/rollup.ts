@@ -84,7 +84,7 @@ const MS_PER_DAY = 86_400_000
 
 // Two grains since ADR-0079 step 4: nothing has read `revenue_1h` since step 3
 // moved every composition to the quarter, so the hour swap was a third of this
-// job's writes for no reader. The table is frozen, not dropped.
+// job's writes for no reader. Migration 0029 dropped the table (v0.8.0).
 const UNITS: readonly RevenueRollupUnit[] = ['15m', '1d']
 
 export interface RevenueRollupDeps {

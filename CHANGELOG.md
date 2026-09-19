@@ -8,6 +8,43 @@ taking.
 Releases before 0.6.0 have their notes on the
 [GitHub releases page](https://github.com/OpenLabs-so/openanalytics/releases).
 
+## [0.8.0] - 2026-09-19
+
+**Upgrade notes: nothing by hand — and going back is a restore.**
+`./upgrade.sh` as always. ClickHouse migration 0029 drops the ten hourly
+rollup tables 0.7.0 stopped writing, so **returning to 0.7.0 is not a matter
+of changing the image tag**: the older images would find those tables gone.
+Go back with `./rollback.sh` to the snapshot the upgrade took. Skipping 0.7.0
+(0.6.0 → 0.8.0) is supported: migrations 0025–0029 run in one pass and the
+migrate container fills the fifteen-minute rollups from your raw events
+afterwards, exactly as in 0.7.0. Details in `SELF-HOSTING.md`, "Upgrades and
+going back".
+
+### Fixed
+
+- **No more false "history fill failed".** The fill that builds the
+  fifteen-minute rollups from history now checks its result against the raw
+  events instead of the frozen hourly tables. In 0.7.0, an event the worker
+  delivered from its queue after the switch — with a timestamp inside the
+  filled history — reached the new tables and the raw events but not the
+  hourly ones, and the first start logged `history fill backfill-15m failed`
+  with `additive_mismatch` over data that was correct. The check now fails
+  only when the filled history disagrees with the raw events, and still
+  allows the one quarter hour per site that the views had already started
+  writing when the fill ran. The session rollups are checked against the
+  session facts in the same way.
+- **A site deletion started before an upgrade finishes after it.** A deletion
+  records its list of tables when it starts; a table dropped by a later
+  migration is now settled as empty instead of being retried forever.
+
+### Removed
+
+- **The hourly rollup tables.** `metrics_1h`, `pages_1h`, `sources_1h`,
+  `geography_1h`, `devices_1h`, `custom_events_1h`, `performance_1h`,
+  `custom_event_samples_1h`, `session_rollups_1h` and `revenue_1h`
+  (ClickHouse migration 0029), with their ClickHouse grants and their entries
+  in site deletion. Nothing has read them since 0.7.0; the daily tables stay.
+
 ## [0.7.0] - 2026-09-18
 
 **Upgrade notes: nothing by hand, but the first start takes longer.**
@@ -22,7 +59,8 @@ views are created counts only the events that arrived after that moment, and
 the first start can log one `history fill backfill-15m failed` with
 `additive_mismatch` (late events reach the new tables but not the frozen
 hourly ones the fill checks against; the history is complete and the line
-does not repeat). The new rollups take up to four rows for every hourly one.
+does not repeat; fixed in 0.8.0). The new rollups take up to four rows for
+every hourly one.
 The new ClickHouse grants arrive with the new image. Details in `SELF-HOSTING.md`, "Upgrades and
 going back".
 

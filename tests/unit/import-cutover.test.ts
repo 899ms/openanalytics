@@ -225,7 +225,25 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     // 70 -> 72. Written by the worker rather than by a materialized view, which
     // changes how they are granted and filled and changes nothing about how
     // they are purged.
-    expect(DELETION_CLICKHOUSE_TARGETS).toHaveLength(44)
+    // ClickHouse migration 0029 (v0.8.0) dropped the ten hour tables — the
+    // eight `*_1h` view targets, `session_rollups_1h` and `revenue_1h` —
+    // taking ClickHouse 44 -> 34 and the total 72 -> 62. Nothing had written
+    // them since 0027, and the 15m backfill's gate reads `events_raw` now.
+    expect(DELETION_CLICKHOUSE_TARGETS).toHaveLength(34)
+    for (const dropped of [
+      'metrics_1h',
+      'pages_1h',
+      'sources_1h',
+      'geography_1h',
+      'devices_1h',
+      'custom_events_1h',
+      'performance_1h',
+      'custom_event_samples_1h',
+      'session_rollups_1h',
+      'revenue_1h',
+    ]) {
+      expect(DELETION_CLICKHOUSE_TARGETS).not.toContain(dropped)
+    }
     for (const family of [
       'metrics',
       'pages',
@@ -240,7 +258,6 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     }
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_events')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_attributions')
-    expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_1h')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_1d')
     expect(DELETION_POSTGRES_TARGETS).toContain('export_runs')
     expect(DELETION_POSTGRES_TARGETS).toContain('revenue_credentials')
@@ -260,7 +277,6 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     // migration 0021), taking ClickHouse 33 -> 35 and the total 60 -> 62. An
     // aggregate outlives the rows it came from, so these are targets in their
     // own right rather than something purging `events_raw` handles.
-    expect(DELETION_CLICKHOUSE_TARGETS).toContain('custom_event_samples_1h')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('custom_event_samples_1d')
     // ADR-0045 D8 books the widget configuration table (Postgres migration
     // 0048), taking Postgres 21 -> 22 and the total 62 -> 63. One table and not
@@ -271,7 +287,7 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     // the `sites` cascade.
     expect(DELETION_POSTGRES_TARGETS).toContain('widgets')
     expect(DELETION_POSTGRES_TARGETS).toHaveLength(22)
-    expect(SITE_DELETION_TARGETS).toHaveLength(72)
+    expect(SITE_DELETION_TARGETS).toHaveLength(62)
   })
 })
 

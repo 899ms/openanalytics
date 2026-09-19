@@ -158,8 +158,8 @@ and its order is fixed (ADR-0079 D3):
 3. `node packages/clickhouse/dist/cli.js backfill-15m` — same credential, same
    env. It refuses (exit 2, nothing written) if any 15m table already holds a
    row or if `events_raw` moves between two readings ten seconds apart, and
-   exits 3 if the additive sums it reports disagree with the hour twins per
-   site. `--dry-run` runs both guards and prints the partition plan;
+   exits 3 if a filled pair disagrees with `events_raw` (the hour twins until
+   v0.8.0). `--dry-run` runs both guards and prints the partition plan;
    `--accept-site <uuid>` excludes a site whose raw rows were purged by hand
    from the equality gate (it is still listed);
 4. **start the worker** on the image that carries 0025.
@@ -199,8 +199,9 @@ land. Verify with `SHOW GRANTS FOR oa_ingest` before migrating.
 4. `node packages/clickhouse/dist/cli.js backfill-15m --sessions` for the
    session half. Same credential and env as the 0025 backfill. It refuses
    (exit 2, nothing written) if `session_rollups_15m` already holds a row, and
-   exits 3 if any site's hour rollup does not equal the sum of its four
-   quarters. `--dry-run` prints the per-site plan. It writes `generation = 0`,
+   exits 3 if a filled quarter disagrees with a fresh recompute from
+   `session_facts_versions` (until v0.8.0: if an hour rollup did not equal the
+   sum of its four quarters). `--dry-run` prints the per-site plan. It writes `generation = 0`,
    which the finalizer's `max + 1` overwrites the first time it touches a
    bucket (as run on the hosted deployment on 2026-09-03 it wrote generation 1
    behind a stopped-worker guard; the gap-fill rework below moved it to 0 and
@@ -235,8 +236,7 @@ directly for every UTC day and week.
 - the deletion workflow's targets do not change (docs snapshot 05, D-210) — a
   site erased tomorrow must still be erased from rows written yesterday.
 
-Dropping the tables is a later, separate patch, tracked in
-`docs/OPEN-THREADS.md`.
+Both reasons lapsed in v0.8.0 and 0029 drops the tables — see below.
 
 The two swap rollups are not in this file because they are not DDL: the session
 finalizer and the revenue attribution job stop writing `session_rollups_1h` and
@@ -250,8 +250,9 @@ compares against — and the answer is that it does not matter, in either order:
 
 1. the backfill reads `events_raw`, never a rollup, so nothing it writes comes
    from a view;
-2. its equality gate reads the hour tables, which this migration does not
-   touch — they hold every row their views ever wrote;
+2. its equality gate read the hour tables, which this migration does not
+   touch — they held every row their views ever wrote (since v0.8.0 the gate
+   reads `events_raw` instead, which settles the question for good);
 3. the worker is stopped for the whole backfill (D3), so the hour tables were
    already frozen at the moment the run started, with or without 0027.
 
@@ -294,11 +295,25 @@ The live quarter hour is filled only when `events_raw` is still across two
 readings `--settle-seconds` apart (taken only when that quarter hour has a gap),
 so the fill and a running view never meet in one pair.
 
-The equality gate against the hour twins still runs, over the hours wholly
-below each site's first pre-existing row — the hours the run filled — and still
-exits 3 on a disagreement. The self-hosted migrate container treats every
-history-fill exit as non-fatal (logged, retried on the next start), because a
-report is never worth keeping the collector down for.
+The equality gate compares every family with `events_raw`, pair by pair below
+the live quarter hour, and exits 3 on a disagreement. It allows exactly one
+difference: a pair the site already held before the run may hold fewer events
+than raw — the seam above. A pair short below the site's first pre-existing row,
+a pair over raw, a raw pair with no row, a row with no raw pair: all exit 3. A
+failing family is read once more after a short pause first, so an insert caught
+between its raw part and its view's part never fails a run.
+
+Until v0.8.0 the gate compared with the hour twins instead, and that was wrong
+in one ordinary case: 0027 froze the hour tables, so an event the worker drained
+from its queue after 0027 (a late event, with an `occurred_at` in the filled
+history) landed in the 15m row and in `events_raw`, and not in the reference.
+The run then exited 3 — "history fill failed" — over data that was right. Raw is
+the table every view reads, so it cannot fall behind a view.
+
+The self-hosted migrate container treats every history-fill exit as non-fatal
+(logged, retried on the next start), because a report is never worth keeping
+the collector down for. Since the gate reads raw, a non-zero exit there is a real
+disagreement and worth reading.
 
 `--sessions --if-needed` is the same gap fill for `session_rollups_15m`, written
 at **generation 0** — below anything the finalizer mints — so a bucket the
@@ -321,11 +336,43 @@ One row per fill (`rollups_15m`, `session_rollups_15m`, `revenue_15m_reroll`),
 `ReplacingMergeTree(completed_at)`, `detail` = the run's own report as JSON. A
 fill records itself when it wrote something, or on the first run that found
 nothing. **Nothing reads it to decide** — every fill computes its gap from the
-tables — so a lost ledger changes no fill. It exists for the operator, and for
-the v0.8 migration that drops the frozen `*_1h` tables, which should not run on
-a database whose 15m history was never filled.
+tables — so a lost ledger changes no fill. It exists for the operator. (It was
+once meant to hold back the v0.8 drop of the hour tables on a database whose 15m
+history was never filled. That turned out unnecessary: the fill reads
+`events_raw` and its gate does too, so neither needs an hour table — see 0029.)
 
 The migration writes no row itself: on a self-hosted install a row must mean "a
 fill ran here". A database whose fills ran before 0028 existed (the hosted one)
 records them by hand: `node packages/clickhouse/dist/cli.js ledger record <name>
 '<detail-json>'`; `ledger` alone prints the table.
+
+### 0029 — the hour tables go (v0.8.0)
+
+| Version | Subject                                                                       |
+| ------- | ----------------------------------------------------------------------------- |
+| 0029    | drops the ten `*_1h` tables — eight view targets + two swap targets; no `_1d` |
+
+0027 kept the tables for two reasons, and v0.8.0 retires both: the 15m backfill's
+equality gate reads `events_raw` now, and the deletion registry stops naming
+the ten tables in the same release (`packages/domain/src/deletion.ts`, 44 → 34
+ClickHouse targets). A target naming a dropped table would fail every
+deletion, which is why the two cannot ship apart. `_1d` stays: every UTC day and
+week reads it directly.
+
+The migration deletes rows, so it is not undone by running an older image: an
+older image would find none of these tables. Going back means restoring the
+pre-upgrade backup (`./rollback.sh` on a self-hosted install), or — to get the
+hour grain back on purpose — a new migration that re-creates 0006–0012, 0014,
+0018 and 0021 and a replay from `events_raw` and the session and revenue facts,
+all of which are kept.
+
+**An install that skips 0.7 (0.6 → 0.8) needs nothing by hand.** The runner
+applies 0025 through 0029 in one run, so the hour tables are dropped **before**
+the 15m history is filled — the migrate container runs the fills after the
+migrations. That order is safe only because of the gate change above: the fill
+reads `events_raw`, and its proof reads `events_raw`, so no step of it looks at
+an hour table. (Under the v0.7 gate it would have had no reference left and
+compared nothing.) The one thing the hour tables held that raw does not is rows
+whose raw events were purged by hand after they were rolled up — the hosted
+deployment's 2026-08-25 cleanup, the reason `--accept-site` exists; the `_1d`
+twins keep those days.

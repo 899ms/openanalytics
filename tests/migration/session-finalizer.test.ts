@@ -457,8 +457,6 @@ describeIfClickHouse('session finalizer behaviour', () => {
         ),
       ),
     ).toBe(1)
-    // And nothing at all reached the frozen hour table (migration 0027).
-    expect(await scalar(`SELECT count() FROM session_rollups_1h WHERE site_id = '${site}'`)).toBe(0)
 
     const [quarters] = await current('session_rollups_15m')
     const [day] = await current('session_rollups_1d')
@@ -533,45 +531,6 @@ describeIfClickHouse('session finalizer behaviour', () => {
     const written = await quarterRows()
     expect(written.length).toBeGreaterThan(0)
 
-    // The hour rollup this site would have carried into the upgrade.
-    //
-    // ADR-0079 step 4 stopped the finalizer writing `session_rollups_1h`, so a
-    // site finalized by THIS code has no hour rows at all — and the backfill's
-    // equality gate ("every stored hour equals the sum of its four quarters")
-    // would compare nothing and pass vacuously. The install the gate exists for
-    // is the upgrading one, which holds exactly the hour rows its pre-step-4
-    // finalizer wrote, so they are written here: folded up from the quarters
-    // the finalizer just produced, which is what the hour swap computed from
-    // the same facts.
-    await client.command({
-      query: `INSERT INTO session_rollups_1h
-        SELECT q.site_id                     AS site_id,
-               toStartOfHour(q.bucket_start) AS bucket_start,
-               toUInt64(1)                   AS generation,
-               sum(q.sessions)                   AS sessions,
-               sum(q.engaged_sessions)           AS engaged_sessions,
-               sum(q.bounced_sessions)           AS bounced_sessions,
-               sum(q.pageviews)                  AS pageviews,
-               sum(q.total_session_duration_ms)  AS total_session_duration_ms,
-               sum(q.total_active_duration_ms)   AS total_active_duration_ms,
-               max(q.computed_at)                AS computed_at
-          FROM (
-            SELECT sr.site_id                                          AS site_id,
-                   sr.bucket_start                                     AS bucket_start,
-                   argMax(sr.sessions, sr.generation)                  AS sessions,
-                   argMax(sr.engaged_sessions, sr.generation)          AS engaged_sessions,
-                   argMax(sr.bounced_sessions, sr.generation)          AS bounced_sessions,
-                   argMax(sr.pageviews, sr.generation)                 AS pageviews,
-                   argMax(sr.total_session_duration_ms, sr.generation) AS total_session_duration_ms,
-                   argMax(sr.total_active_duration_ms, sr.generation)  AS total_active_duration_ms,
-                   argMax(sr.computed_at, sr.generation)               AS computed_at
-              FROM session_rollups_15m AS sr
-             WHERE sr.site_id = '${site}'
-             GROUP BY sr.site_id, sr.bucket_start
-          ) AS q
-         GROUP BY q.site_id, bucket_start`,
-    })
-
     const options = {
       url,
       username: USERNAME,
@@ -644,11 +603,14 @@ describeIfClickHouse('session finalizer behaviour', () => {
     // finalizer's next write supersedes it whichever of the two lands first.
     expect(rebuilt.map((row) => Number(row.generation))).toEqual(rebuilt.map(() => 0))
 
-    // And the equality gate it reports on is satisfied for this site.
+    // And the equality gate — every filled quarter against a fresh recompute
+    // from the facts (v0.8.0; it compared hours with `session_rollups_1h`
+    // before migration 0029 dropped that table) — is satisfied for this site,
+    // over every quarter it wrote.
     const report = result.reports.find((entry) => entry.siteId === site)
     expect(report).toBeDefined()
-    expect(report!.mismatchedHours).toEqual([])
-    expect(report!.comparedHours).toBeGreaterThan(0)
+    expect(report!.mismatchedBuckets).toEqual([])
+    expect(report!.comparedBuckets).toBe(written.length)
 
     // A second run finds no gap: nothing written, nothing moved.
     const again = await backfillSessionRollups15m({ ...options, ifNeeded: true })
@@ -667,5 +629,40 @@ describeIfClickHouse('session finalizer behaviour', () => {
     const after = await quarterRows()
     expect(Number(after[0]!.generation)).toBeGreaterThan(0)
     expect(Number(after[0]!.pageviews)).toBe(3)
+
+    // The gate bites. A writer that stores something the facts do not say —
+    // here a row at a generation above the backfill's, with one session too
+    // many, landing between the fill and the proof — fails the run with exit 3
+    // rather than being reported as a clean fill.
+    await client.command({ query: 'TRUNCATE TABLE session_rollups_15m' })
+    await expect(
+      backfillSessionRollups15m({
+        ...options,
+        ifNeeded: true,
+        afterFill: async () => {
+          const [first] = await queryRows<{ b: string }>(
+            `SELECT formatDateTime(min(bucket_start), '%F %T') AS b FROM session_rollups_15m WHERE site_id = '${site}'`,
+          )
+          await client.insert({
+            table: 'session_rollups_15m',
+            format: 'JSONEachRow',
+            values: [
+              {
+                site_id: site,
+                bucket_start: first!.b,
+                generation: 7,
+                sessions: 99,
+                engaged_sessions: 0,
+                bounced_sessions: 0,
+                pageviews: 0,
+                total_session_duration_ms: 0,
+                total_active_duration_ms: 0,
+                computed_at: '2026-05-05 12:00:00.000',
+              },
+            ],
+          })
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'BackfillRefusedError', reason: 'additive_mismatch' })
   })
 })

@@ -192,8 +192,8 @@ export async function finalizeSite(
     let rollupSwaps = 0
     // Two grains since ADR-0079 step 4 (migration 0027): the hour rollup was
     // read by nothing after step 3 moved every composition to the quarter, so
-    // writing it was a third of this loop's work for nobody. `session_rollups_1h`
-    // still exists and still holds what it held -- it is simply frozen.
+    // writing it was a third of this loop's work for nobody. Migration 0029
+    // (v0.8.0) then dropped `session_rollups_1h` itself.
     const unitBuckets: Record<SessionRollupUnit, readonly number[]> = {
       '15m': plan.affectedQuarterBucketsMs,
       '1d': plan.affectedDayBucketsMs,

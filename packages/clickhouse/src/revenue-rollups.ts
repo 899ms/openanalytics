@@ -40,12 +40,6 @@ import { createClient, type ClickHouseClient } from '@clickhouse/client'
  */
 
 export const REVENUE_ROLLUP_15M_TABLE = 'revenue_15m'
-/**
- * Frozen since ADR-0079 step 4: the attribution job stopped writing it when
- * `'1h'` left `RevenueRollupUnit`. Kept because the deletion workflow's targets
- * do not change and the rows it already holds are real history.
- */
-export const REVENUE_ROLLUP_1H_TABLE = 'revenue_1h'
 export const REVENUE_ROLLUP_1D_TABLE = 'revenue_1d'
 
 /**
@@ -53,8 +47,8 @@ export const REVENUE_ROLLUP_1D_TABLE = 'revenue_1d'
  *
  * Two, not three, since ADR-0079 step 4 retired the hour grain: every read had
  * already moved to the fifteen-minute family in step 3, so the hour swap was
- * pure cost. The narrowing is the enforcement — a write to `revenue_1h` does
- * not type-check any more.
+ * pure cost. The narrowing is the enforcement — a write to `revenue_1h` did
+ * not type-check any more — and migration 0029 (v0.8.0) dropped the table.
  */
 export type RevenueRollupUnit = '15m' | '1d'
 

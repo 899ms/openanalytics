@@ -801,6 +801,38 @@ describe('site_deletion executor — clickhouse_purge', () => {
     expect(target?.mutationId).toBeNull()
     expect(target?.lastError).toContain('7 rows remaining')
   })
+
+  it('settles a snapshotted target whose table a migration dropped, without submitting it', async () => {
+    // A deletion started before ClickHouse migration 0029 (v0.8.0) snapshotted
+    // the ten hour tables; the worker that finishes it no longer names them,
+    // and ClickHouse would refuse a mutation on a dropped table forever.
+    state.targets.push({
+      id: 't-retired',
+      store: 'clickhouse',
+      target: 'metrics_1h',
+      phase: 'pending',
+      attempts: 0,
+      verified: false,
+      mutationId: null,
+      lastError: null,
+      verification: null,
+    })
+    const clickhouse = fakeClickhouse()
+    const h = harness({
+      resources: { queue: fakeRedis(), realtime: fakeRedis(), clickhouse },
+    })
+
+    await executeSiteDeletion(h.context)
+
+    expect(clickhouse.submitted).not.toContain('metrics_1h')
+    expect(clickhouse.submitted).toHaveLength(DELETION_CLICKHOUSE_TARGETS.length)
+    const retired = state.targets.find((t) => t.id === 't-retired')
+    expect(retired).toMatchObject({ phase: 'completed', verified: true, mutationId: null })
+    expect(retired?.verification).toMatchObject({ count: 0, retired: expect.any(String) })
+    // And the deletion finishes rather than waiting on it.
+    expect(calls.finalized).toHaveLength(1)
+    expect(h.find('site_deletion_target_retired')).toHaveLength(1)
+  })
 })
 
 describe('site_deletion executor — resumability', () => {

@@ -37,7 +37,7 @@ import type { SanitizedUrl } from './event-sanitize.ts'
  * ## Why the mapped value goes through `canonicalReferrerHost`
  *
  * `referrer_domain` is a **grouping key** — the ORDER BY prefix of
- * `sources_1h`/`sources_1d`, the first-touch dimension of a session fact, a
+ * `sources_15m`/`sources_1d`, the first-touch dimension of a session fact, a
  * column of the visitor trail (ADR-0028's module header states the rule). A
  * second spelling of one host silently splits one acquisition source into two
  * rollup rows that no reader can merge back, and the rollups are additive and

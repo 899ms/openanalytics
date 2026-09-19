@@ -84,11 +84,9 @@ cat >"$TARGET" <<XML
       <grants>
         <query>GRANT INSERT ON analytics.events_raw</query>
         <query>GRANT INSERT ON analytics.session_facts_versions</query>
-        <query>GRANT INSERT ON analytics.session_rollups_1h</query>
         <query>GRANT INSERT ON analytics.session_rollups_1d</query>
         <query>GRANT SELECT ON analytics.events_raw</query>
         <query>GRANT SELECT ON analytics.session_facts_versions</query>
-        <query>GRANT SELECT ON analytics.session_rollups_1h</query>
         <query>GRANT SELECT ON analytics.session_rollups_1d</query>
 
         <!-- Import staging targets the prepare job writes. -->
@@ -111,8 +109,6 @@ cat >"$TARGET" <<XML
         <query>GRANT SELECT ON analytics.revenue_events</query>
         <query>GRANT INSERT ON analytics.revenue_attributions</query>
         <query>GRANT SELECT ON analytics.revenue_attributions</query>
-        <query>GRANT INSERT ON analytics.revenue_1h</query>
-        <query>GRANT SELECT ON analytics.revenue_1h</query>
         <query>GRANT INSERT ON analytics.revenue_1d</query>
         <query>GRANT SELECT ON analytics.revenue_1d</query>
 

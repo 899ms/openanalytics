@@ -134,14 +134,11 @@ describeIfClickHouse('analytics schema bootstrap', () => {
       )
     }
 
-    // The hour family, after ADR-0079 step 4 (migration 0027): the eight TABLES
-    // are still here, with their engine and their rows, and not one of them has
-    // a view any more. Both halves matter and they pull in opposite directions,
-    // which is why they are asserted together. A migration that dropped the
-    // tables would take the 15m backfill's only equality gate and the deletion
-    // workflow's targets with it; a view left behind would go on writing a
-    // grain nothing reads, which is the cost step 4 exists to remove.
-    const frozenHourFamily = [
+    // The hour family is gone: 0027 (ADR-0079 step 4) dropped the eight views,
+    // and 0029 (v0.8.0) the ten tables, once the 15m backfill's equality gate
+    // compared with `events_raw` instead and the deletion registry stopped
+    // naming them. Neither a table nor a view may come back by accident.
+    const droppedHourFamily = [
       'metrics_1h',
       'pages_1h',
       'sources_1h',
@@ -151,10 +148,8 @@ describeIfClickHouse('analytics schema bootstrap', () => {
       'custom_event_samples_1h',
       'performance_1h',
     ]
-    for (const table of frozenHourFamily) {
-      expect(byName.get(table), `${table} must survive 0027 as frozen history`).toBe(
-        'AggregatingMergeTree',
-      )
+    for (const table of [...droppedHourFamily, 'session_rollups_1h', 'revenue_1h']) {
+      expect(byName.has(table), `${table} must be dropped by 0029`).toBe(false)
       expect(byName.has(`${table}_mv`), `${table}_mv must be dropped by 0027`).toBe(false)
     }
 
@@ -164,9 +159,6 @@ describeIfClickHouse('analytics schema bootstrap', () => {
     // None of these is a materialized view — that is the whole point of D-211,
     // so their *_mv counterparts must NOT exist.
     expect(byName.get('session_facts_versions')).toBe('ReplacingMergeTree')
-    // Frozen rather than gone since step 4, exactly like the eight additive
-    // hour tables above — nothing writes it, everything that read it still can.
-    expect(byName.get('session_rollups_1h')).toBe('ReplacingMergeTree')
     expect(byName.get('session_rollups_1d')).toBe('ReplacingMergeTree')
     // ADR-0079 step 2 (migration 0026). The same engine and the same absence of
     // a view, and the second half matters more here than anywhere: 0025 gave
@@ -197,7 +189,6 @@ describeIfClickHouse('analytics schema bootstrap', () => {
     // the 0016 canonical fact, which is D-212's ordering demand. Like the
     // session layer they are recompute/swap ReplacingMergeTrees, never MVs;
     // tests/unit/revenue-migration-order.test.ts pins the version ordering.
-    expect(byName.get('revenue_1h')).toBe('ReplacingMergeTree')
     expect(byName.get('revenue_1d')).toBe('ReplacingMergeTree')
     // ADR-0079 step 2 (migration 0026), on the same terms: a swap target, never
     // a view, because a refund has to be able to leave a bucket it once
@@ -216,7 +207,7 @@ describeIfClickHouse('analytics schema bootstrap', () => {
     // A column typed AggregateFunction(uniq, ...) can only be read with
     // uniqMerge, so its presence is the structural guarantee that a query cannot
     // accidentally sum per-bucket uniques. metrics_1m gained it by ALTER in 0005
-    // and every 1h/1d metric/dimension rollup carries it from creation.
+    // and every 15m/1d metric/dimension rollup carries it from creation.
     const rows = await queryRows<{ table: string; type: string }>(
       `SELECT table, type FROM system.columns
         WHERE database = '${database}' AND name = 'visitors' ORDER BY table`,
@@ -224,17 +215,11 @@ describeIfClickHouse('analytics schema bootstrap', () => {
     const byTable = new Map(rows.map((row) => [row.table, row.type]))
     const visitorTables = [
       'metrics_1m',
-      'metrics_1h',
       'metrics_1d',
-      'pages_1h',
       'pages_1d',
-      'sources_1h',
       'sources_1d',
-      'geography_1h',
       'geography_1d',
-      'devices_1h',
       'devices_1d',
-      'custom_events_1h',
       'custom_events_1d',
       'metrics_15m',
       'pages_15m',
