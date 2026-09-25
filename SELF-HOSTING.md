@@ -35,6 +35,12 @@ Stores: **Postgres** (control plane), **ClickHouse** (events and rollups),
 rather than two databases on one, because they need opposite eviction policies
 and one process cannot have both.
 
+**Postgres: bundled, or on Neon.** The stack runs its own Postgres container by
+default. For a managed database we recommend [Neon](https://neon.com), which is
+what getopen.so runs on; see [Using Neon](#using-neon) below and the
+step-by-step [infra/selfhost/NEON.md](infra/selfhost/NEON.md). ClickHouse and
+Valkey stay on the host either way.
+
 ### Four names, and why it is four
 
 | Name           | Serves              | Also                                |
@@ -421,6 +427,53 @@ removals and an overlay cannot remove: `infra/selfhost/docker-compose.coolify.ym
 with [infra/selfhost/COOLIFY.md](infra/selfhost/COOLIFY.md) for what that install
 looks like and what has been verified on it.
 
+### Using Neon
+
+[Neon](https://neon.com) is the managed Postgres we recommend, and the one the
+hosted service runs on. Postgres is the control plane only — users, sites, keys,
+settings — so moving it is small, and it takes the one store whose loss locks
+you out of everything else off your disk. The full walkthrough, including moving
+an existing install's data across, is
+**[infra/selfhost/NEON.md](infra/selfhost/NEON.md)**. The shape of it:
+
+1. Create a Neon project in the region nearest your server. Neon's default
+   Postgres version is fine (the schema was built on its Postgres 18).
+2. Copy its connection string **with pooling off** — the host must not contain
+   `-pooler`. The migration runner holds a session-level advisory lock, and
+   session state does not survive Neon's transaction-mode pooler.
+3. Put that string in four places, all the same:
+
+   | File                | Variable                 |
+   | ------------------- | ------------------------ |
+   | `env/api.env`       | `DATABASE_URL`           |
+   | `env/collector.env` | `DATABASE_URL`           |
+   | `env/worker.env`    | `DATABASE_URL`           |
+   | `env/migrate.env`   | `POSTGRES_MIGRATION_URL` |
+
+   ```sh
+   DATABASE_URL=postgresql://neondb_owner:<password>@ep-example-123456.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+   ```
+
+4. Add `docker-compose.neon.yml` to the files compose reads, through `.env`
+   (not `-f`, which would drop the key-pair override):
+
+   ```sh
+   echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.neon.yml' >> .env
+   ```
+
+   It moves the `postgres` service behind a profile and stops `migrate` waiting
+   for it. `env/postgres.env` is then unused.
+
+5. `docker compose up -d`. The `migrate` container builds the schema on Neon.
+
+Two things change afterwards. The `pg_dump` line under [Backups](#backups) talks
+to the local container; with Neon, restore is point-in-time on the branch, and
+`pg_dump "$DATABASE_URL"` works from anywhere with a `pg_dump` at least as new
+as Neon's Postgres (the NEON.md backups note has the one-liner). And `./upgrade.sh`'s snapshot then
+holds ClickHouse only: it prints the instant the stack stopped, and
+`./rollback.sh` stops before starting so you can restore the Neon branch to that
+instant first.
+
 ### The Valkey URLs are IP addresses on purpose
 
 The connection factory refuses a plaintext `redis://` URL whose host it cannot
@@ -619,6 +672,11 @@ What needs backing up off this machine, in order of how much it hurts to lose:
    ```sh
    docker compose exec -T postgres pg_dump -U openanalytics openanalytics | gzip > oa-pg-$(date +%F).sql.gz
    ```
+   On [Neon](#using-neon) there is no local container to ask. Neon keeps the
+   history and restores to a point in time, and `pg_dump "$DATABASE_URL"` from
+   any machine gives you a copy that lives off Neon as well, provided that
+   `pg_dump` is at least as new as the server (see
+   [NEON.md](infra/selfhost/NEON.md#running-it)).
 3. **ClickHouse** — the events. Large and append-mostly. ClickHouse's own
    `BACKUP DATABASE analytics TO S3(...)` writes straight from the server to a
    bucket; run it from a timer on the host and keep the object off this machine.

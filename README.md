@@ -7,6 +7,12 @@ own hardware under AGPL-3.0.
 A hosted instance runs at **[getopen.so](https://getopen.so)**, operated by the
 authors: the same code, someone else's servers.
 
+<a href="https://neon.com"><img src="docs/images/neon-logo.svg" alt="Neon" width="180"></a>
+
+**Sponsored by the [Neon Open Source Program](https://neon.com).** Neon is the
+managed Postgres behind getopen.so and the one we recommend for self-hosting —
+see [Deploying with Neon](infra/selfhost/NEON.md).
+
 ![The Overview screen: visitors, pageviews, bounce rate, average visit and
 revenue across a day, with top pages, referrers and revenue
 underneath](docs/images/dashboard.png)
@@ -104,6 +110,13 @@ at that release's images, printing which it picked and why; on a branch, on
 a convenience — the compose file, the env templates and the migrations ship
 _with_ the images, so a release's images against another tree is a configuration
 nobody has tested.
+
+**Postgres can live on Neon instead of on the host.** The stack bundles a
+Postgres container, and [Neon](https://neon.com) is the managed option we
+recommend: four environment variables and one line in `.env`, and Postgres
+backups and point-in-time restore become Neon's job.
+**[infra/selfhost/NEON.md](infra/selfhost/NEON.md)** walks through it, including
+moving an existing install across.
 
 Images are amd64. On arm64, or to run a branch, build the ten here instead:
 same compose file, one flag, about ten minutes and swap on a 4 GB box. Later,

@@ -118,6 +118,11 @@ SNAP_TAG="$(manifest_value image_tag)"
 SNAP_TREE="$(manifest_value git_describe)"
 NOW_TAG="$(env_value OA_IMAGE_TAG)"
 HERE="$(git -C ../.. describe --tags --always --dirty 2>/dev/null || echo unknown)"
+# `external`: the snapshot holds ClickHouse only, because Postgres is a managed
+# service this stack does not host (see snapshot.sh). Older snapshots have no
+# such line and held both volumes.
+SNAP_PG="$(manifest_value postgres)"
+SNAP_STOPPED_AT="$(manifest_value stack_stopped_at)"
 
 cat <<PLAN
 
@@ -139,6 +144,16 @@ partial or merged outcome available. There are no down migrations to run instead
 — this is the whole of the way back, by design.
 
 PLAN
+
+if [ "$SNAP_PG" = external ]; then
+	cat <<EXTERNAL
+POSTGRES IS NOT IN THIS SNAPSHOT. It lives with your provider, and this script
+cannot roll it back. It restores ClickHouse and the configuration, then STOPS
+with the stack down. You then restore Postgres to ${SNAP_STOPPED_AT} (Neon: the
+branch's point-in-time restore) and start the stack yourself.
+
+EXTERNAL
+fi
 
 # The checkout has to match the images being restored, for the same reason the
 # upgrade insists on it: the compose file, the env templates and the migration
@@ -217,6 +232,21 @@ if [ "$SNAP_REPO" != "unknown" ] && [ "$SNAP_TAG" != "unknown" ]; then
 	fi
 else
 	echo "rollback: the snapshot did not record an image tag; leaving .env as it is" >&2
+fi
+
+if [ "$SNAP_PG" = external ]; then
+	cat <<NEXT
+
+rollback: ClickHouse, the configuration and the image tag are back. The stack
+          is STOPPED on purpose, because Postgres has not moved yet:
+
+  1. restore your provider's Postgres to ${SNAP_STOPPED_AT}
+     (Neon: Console -> your branch -> Restore, to that timestamp)
+  2. docker compose up -d
+
+Starting before step 1 runs the old images against a newer schema.
+NEXT
+	exit 0
 fi
 
 echo "rollback: starting"

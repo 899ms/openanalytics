@@ -455,6 +455,7 @@ jobs:
           test -s "$snapshot/docker-compose.override.yml"
           grep -qx 'oa_snapshot_version=1' "$snapshot/manifest"
           grep -q '^pg_volume=openanalytics_pg-data$' "$snapshot/manifest"
+          grep -qx 'postgres=volume' "$snapshot/manifest"
           grep -q '^ch_volume=openanalytics_ch-data$' "$snapshot/manifest"
           echo "--- manifest"; cat "$snapshot/manifest"
 

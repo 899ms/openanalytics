@@ -35,6 +35,17 @@
 # Not in a snapshot: the tracker bundle and the Caddy certificate store, both of
 # which rebuild themselves, and the Valkey queue — seconds of in-flight events,
 # which /SELF-HOSTING.md covers.
+#
+# ## When Postgres is not in this stack
+#
+# With a managed Postgres (`docker-compose.neon.yml`, or any external
+# DATABASE_URL with the `postgres` service taken out) there is no volume here to
+# archive, and this script cannot copy a database it does not host. It then
+# snapshots ClickHouse only and records `stack_stopped_at` — the instant the
+# stack went down, after which nothing writes to Postgres until it comes back.
+# That instant is the point-in-time a provider restore must go back to for the
+# two stores to agree again. `restore` never starts the stack in that case:
+# ClickHouse from one moment beside Postgres from another is not a rollback.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -113,6 +124,13 @@ volume_at() {
 	echo "$name"
 }
 
+# True when this compose project runs its own Postgres. Asked of the resolved
+# configuration, so an override that moves `postgres` behind a profile — which
+# is what `docker-compose.neon.yml` does — counts as not running it.
+postgres_in_stack() {
+	compose config --services 2>/dev/null | grep -qx postgres
+}
+
 # --- helpers that run inside the helper image -------------------------------
 volume_bytes() {
 	# `printf "%d"` rather than `print`: several awks render a large product in
@@ -187,12 +205,17 @@ do_create() {
 	*[!a-zA-Z0-9._-]*) die "--label may only contain letters, digits, dot, underscore and dash" ;;
 	esac
 
-	local pg_volume ch_volume
-	pg_volume="$(volume_at postgres /var/lib/postgresql/data)"
+	local pg_volume ch_volume pg_mode=volume
+	if postgres_in_stack; then
+		pg_volume="$(volume_at postgres /var/lib/postgresql/data)"
+	else
+		pg_mode=external
+		pg_volume=external
+	fi
 	ch_volume="$(volume_at clickhouse /var/lib/clickhouse)"
 
-	local pg_bytes ch_bytes needed available
-	pg_bytes="$(volume_bytes "$pg_volume")"
+	local pg_bytes=0 ch_bytes needed available
+	[ "$pg_mode" = volume ] && pg_bytes="$(volume_bytes "$pg_volume")"
 	ch_bytes="$(volume_bytes "$ch_volume")"
 	needed=$((pg_bytes + ch_bytes))
 
@@ -219,9 +242,17 @@ do_create() {
 	echo "snapshot: stopping the stack — this is downtime, and it is what makes the copy consistent"
 	STACK_STOPPED=1
 	compose stop
+	local stopped_at
+	stopped_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-	echo "snapshot: archiving $pg_volume ($(human "$pg_bytes"))"
-	archive_volume "$pg_volume" "$PWD/$dir" pg-data.tar.gz
+	if [ "$pg_mode" = volume ]; then
+		echo "snapshot: archiving $pg_volume ($(human "$pg_bytes"))"
+		archive_volume "$pg_volume" "$PWD/$dir" pg-data.tar.gz
+	else
+		echo "snapshot: Postgres is not part of this stack — it is NOT in this snapshot"
+		echo "          nothing writes to it from now until the stack starts again;"
+		echo "          to go back, restore your provider's Postgres to $stopped_at"
+	fi
 	echo "snapshot: archiving $ch_volume ($(human "$ch_bytes"))"
 	archive_volume "$ch_volume" "$PWD/$dir" ch-data.tar.gz
 
@@ -240,6 +271,8 @@ do_create() {
 		echo "git_describe=$(git -C ../.. describe --tags --always --dirty 2>/dev/null || echo unknown)"
 		echo "image_repo=$(env_value OA_IMAGE_REPO)"
 		echo "image_tag=$(env_value OA_IMAGE_TAG)"
+		echo "stack_stopped_at=$stopped_at"
+		echo "postgres=$pg_mode"
 		echo "pg_volume=$pg_volume"
 		echo "ch_volume=$ch_volume"
 		echo "pg_bytes=$pg_bytes"
@@ -288,21 +321,41 @@ do_restore() {
 	done
 	[ -n "$from" ] || die "restore needs --from <snapshot directory>"
 	[ -f "$from/manifest" ] || die "$from is not a snapshot (no manifest)"
-	[ -f "$from/pg-data.tar.gz" ] || die "$from/pg-data.tar.gz is missing"
+	# A snapshot taken before this field existed held a Postgres volume.
+	local pg_mode
+	pg_mode="$(manifest_value "$from" postgres)"
+	[ "$pg_mode" = unknown ] && pg_mode=volume
+	[ "$pg_mode" = external ] || [ -f "$from/pg-data.tar.gz" ] || die "$from/pg-data.tar.gz is missing"
 	[ -f "$from/ch-data.tar.gz" ] || die "$from/ch-data.tar.gz is missing"
+	if [ "$pg_mode" = volume ] && ! postgres_in_stack; then
+		die "$from holds a Postgres volume, but this stack runs no postgres service — restore it into a stack that does, or restore the database by hand"
+	fi
 
-	local pg_volume ch_volume
-	pg_volume="$(volume_at postgres /var/lib/postgresql/data)"
+	local pg_volume="" ch_volume
+	[ "$pg_mode" = volume ] && pg_volume="$(volume_at postgres /var/lib/postgresql/data)"
 	ch_volume="$(volume_at clickhouse /var/lib/clickhouse)"
 
 	echo "snapshot: stopping the stack"
 	STACK_STOPPED=1
 	compose stop
 
-	echo "snapshot: replacing the contents of $pg_volume"
-	restore_volume "$pg_volume" "$PWD/$from" pg-data.tar.gz
+	if [ "$pg_mode" = volume ]; then
+		echo "snapshot: replacing the contents of $pg_volume"
+		restore_volume "$pg_volume" "$PWD/$from" pg-data.tar.gz
+	fi
 	echo "snapshot: replacing the contents of $ch_volume"
 	restore_volume "$ch_volume" "$PWD/$from" ch-data.tar.gz
+
+	if [ "$pg_mode" = external ]; then
+		# Not an error, so the exit trap must not say "FAILED" — the stack is
+		# down on purpose and the message below is the instruction.
+		STACK_STOPPED=0
+		echo
+		echo "snapshot: ClickHouse is restored. POSTGRES IS NOT, and the stack is left STOPPED."
+		echo "          Restore your provider's Postgres to $(manifest_value "$from" stack_stopped_at)"
+		echo "          (Neon: the branch's point-in-time restore), then: docker compose up -d"
+		return 0
+	fi
 
 	if [ "$start" -eq 1 ]; then
 		echo "snapshot: starting the stack"

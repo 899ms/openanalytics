@@ -1,0 +1,35 @@
+# Postgres on Neon instead of in this stack.
+#
+# The walkthrough is infra/selfhost/NEON.md. In short: point DATABASE_URL (api,
+# collector, worker) and POSTGRES_MIGRATION_URL (migrate) at Neon, then add this
+# file to the ones compose reads by putting ONE line in `.env`:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.neon.yml
+#
+# Through `.env` rather than `-f` on purpose. Passing `-f` turns off compose's
+# automatic pickup of `docker-compose.override.yml`, which is where the
+# generator put the three signing key pairs — forget it once and the api starts
+# without them. `.env` is read by every `docker compose` command, including the
+# ones `upgrade.sh`, `snapshot.sh` and `rollback.sh` run for you.
+#
+# What it changes, and nothing else:
+#
+#   * `postgres` moves behind a profile, so it is not started and its volume is
+#     not created. `docker compose --profile local-postgres up -d postgres`
+#     still starts it, which is how you would copy an existing install's data
+#     across (NEON.md, "Moving an existing install").
+#   * `migrate` and `create-admin` stop waiting for it. Compose refuses to start
+#     a service whose dependency is not in the project, so without these two
+#     lines nothing would come up at all.
+#
+# `!override` / `!reset` need Docker Compose 2.24.4 or newer (January 2024).
+services:
+  postgres:
+    profiles: ['local-postgres']
+
+  migrate:
+    depends_on: !override
+      clickhouse: { condition: service_healthy }
+
+  create-admin:
+    depends_on: !reset []
